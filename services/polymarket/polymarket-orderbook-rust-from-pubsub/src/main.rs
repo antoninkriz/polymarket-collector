@@ -1,0 +1,168 @@
+//! Polymarket orderbook → ClickHouse writer fed from Redis pub/sub.
+//!
+//! Subscribes to the channel published by `polymarket-orderbook-rust-pubsub`,
+//! deserializes each `Event` and feeds it into the existing ClickHouse `Sink`
+//! from `polymarket-orderbook-rust`. No WS pool, no market lifecycle stream,
+//! no trade-events polling.
+//!
+//! ```text
+//!   Redis pub/sub channel ──► subscriber ──► mpsc<Event> ──► Sink ──► ClickHouse
+//! ```
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
+
+use polymarket_orderbook_rust::events::Event;
+use polymarket_orderbook_rust::sink::{Sink, SinkConfig, SinkSchema};
+
+use polymarket_orderbook_rust_from_pubsub::config::Config;
+use polymarket_orderbook_rust_from_pubsub::pubsub_subscriber::{
+    self, PubSubSubscriberConfig, SubscriberStats,
+};
+
+#[derive(Debug, Parser)]
+#[command(name = "polymarket-orderbook-rust-from-pubsub")]
+#[command(about = "Polymarket orderbook → ClickHouse writer fed from Redis pub/sub")]
+struct Cli {}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let _ = dotenvy::dotenv();
+    init_tracing();
+    let _ = Cli::parse();
+    let cfg = Config::from_env().context("load config from env")?;
+
+    info!(
+        redis_url = %cfg.redis_url,
+        pubsub_channel = %cfg.redis_pubsub_channel,
+        clickhouse_url = %cfg.clickhouse_url,
+        clickhouse_database = %cfg.clickhouse_database,
+        clickhouse_table = %cfg.clickhouse_table,
+        flush_batch_size = cfg.flush_batch_size,
+        flush_interval_ms = cfg.flush_interval.as_millis() as u64,
+        ttl_minutes = cfg.ttl_minutes,
+        queue_size = cfg.queue_size,
+        "starting polymarket-orderbook-rust-from-pubsub",
+    );
+
+    let (event_tx, event_rx) = mpsc::channel::<Event>(cfg.queue_size);
+    let sink = Sink::connect(SinkConfig {
+        url: cfg.clickhouse_url.clone(),
+        user: cfg.clickhouse_user.clone(),
+        password: cfg.clickhouse_password.clone(),
+        database: cfg.clickhouse_database.clone(),
+        table: cfg.clickhouse_table.clone(),
+        drop_table_on_start: cfg.drop_table_on_start,
+        exclude_hash: cfg.exclude_hash,
+        batch_size: cfg.flush_batch_size,
+        flush_interval: cfg.flush_interval,
+        ttl_minutes: cfg.ttl_minutes,
+        schema: SinkSchema::Raw,
+    })
+    .await
+    .context("connect Polymarket ClickHouse sink")?;
+    let mut sink_handle: JoinHandle<Result<()>> = tokio::spawn(sink.run(event_rx));
+
+    let stats = SubscriberStats::new();
+    let subscriber_cfg = PubSubSubscriberConfig {
+        redis_url: cfg.redis_url.clone(),
+        channel: cfg.redis_pubsub_channel.clone(),
+        reconnect_delay: cfg.pubsub_reconnect_delay,
+    };
+    let subscriber_handle = tokio::spawn(pubsub_subscriber::run(
+        subscriber_cfg,
+        event_tx.clone(),
+        Arc::clone(&stats),
+    ));
+
+    let stats_handle = tokio::spawn(stats_loop(event_tx.clone(), Arc::clone(&stats)));
+
+    wait_for_shutdown().await;
+    info!("shutdown signal received");
+
+    subscriber_handle.abort();
+    let _ = subscriber_handle.await;
+    stats_handle.abort();
+    let _ = stats_handle.await;
+    drop(event_tx);
+    match tokio::time::timeout(Duration::from_secs(10), &mut sink_handle).await {
+        Ok(Ok(Ok(()))) => info!("polymarket ClickHouse sink shut down cleanly"),
+        Ok(Ok(Err(err))) => warn!(error = %err, "polymarket ClickHouse sink exited with error"),
+        Ok(Err(err)) => warn!(error = %err, "polymarket ClickHouse sink task failed"),
+        Err(_) => {
+            warn!("polymarket ClickHouse sink did not drain before shutdown timeout");
+            sink_handle.abort();
+            let _ = sink_handle.await;
+        }
+    }
+    info!("shutdown complete");
+    Ok(())
+}
+
+async fn stats_loop(event_tx: mpsc::Sender<Event>, stats: Arc<SubscriberStats>) {
+    use std::sync::atomic::Ordering;
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let queue_max = event_tx.max_capacity();
+        let queue_used = queue_max.saturating_sub(event_tx.capacity());
+        let queue_pct = if queue_max > 0 {
+            (queue_used as f64 / queue_max as f64) * 100.0
+        } else {
+            0.0
+        };
+        info!(
+            queue_size = queue_used,
+            queue_max,
+            queue_pct = format!("{queue_pct:.1}"),
+            events_received = stats.events_received.load(Ordering::Relaxed),
+            events_forwarded = stats.events_forwarded.load(Ordering::Relaxed),
+            parse_failures = stats.parse_failures.load(Ordering::Relaxed),
+            reconnects = stats.reconnects.load(Ordering::Relaxed),
+            "[POLYMARKET-FROM-PUBSUB-STATS]",
+        );
+        if queue_pct > 50.0 {
+            warn!(
+                queue_size = queue_used,
+                queue_max,
+                queue_pct = format!("{queue_pct:.1}"),
+                "polymarket from-pubsub queue above 50%",
+            );
+        }
+    }
+}
+
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .json()
+        .init();
+}
+
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!("received SIGINT"),
+            _ = sigterm.recv() => info!("received SIGTERM"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("received SIGINT");
+    }
+}

@@ -1,0 +1,54 @@
+name: obdata-infra
+
+services:
+
+  dozzle:
+    image: amir20/dozzle:v9.0.3
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      - DOZZLE_ENABLE_ACTIONS=true
+      - DOZZLE_BASE=/
+
+  obdata-clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    container_name: obdata-clickhouse
+    restart: unless-stopped
+    networks:
+      - obdata
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      TZ: UTC
+    volumes:
+      - .data/clickhouse-data/lib:/var/lib/clickhouse
+      - .data/clickhouse-data/log:/var/log/clickhouse-server
+    ports:
+      # Bound to loopback by default. Only expose publicly behind a firewall
+      # allowlist — the `default` user has full access management below.
+      - "127.0.0.1:8124:8123"
+      - "127.0.0.1:9003:9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  obdata-redis:
+    image: redis:7-alpine
+    container_name: obdata-redis
+    restart: unless-stopped
+    networks:
+      - obdata
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - .data/redis-data:/data
+    command: redis-server --appendonly yes
+
+networks:
+  obdata:
+    name: obdata

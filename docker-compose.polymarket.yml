@@ -1,0 +1,144 @@
+name: obdata-polymarket
+
+# Polymarket orderbook stack — obdata-side, full pipeline.
+#
+#   obdata-polymarket-active-markets
+#     Polls the Polymarket Gamma REST API, maintains the Redis active_markets
+#     cache and lifecycle event stream that the pubsub publisher consumes.
+#
+#   obdata-polymarket-orderbook-rust-pubsub
+#     Subscribes to the Polymarket WS, publishes all 4 event variants
+#     (book/price_change/last_trade_price/tick_size_change) as tagged JSON on
+#     Redis pub/sub channel `polymarket:events`. Only service holding a
+#     Polymarket WS connection.
+#
+#   obdata-polymarket-orderbook-rust-from-pubsub
+#     Subscribes to `polymarket:events`, deserializes each Event variant and
+#     feeds the existing polymarket ClickHouse sink — writing all 4 event
+#     types to `polymarket_orderbook_rust` with full fidelity.
+#
+#   obdata-polymarket-r2-archive-exporter
+#     Reads obdata-clickhouse `polymarket_orderbook_rust` and exports hourly
+#     Parquet snapshots to the polymarket v2 bucket. Uses the generic
+#     r2-archive exporter image with EXPORTER_PROFILE=polymarket.
+#
+# All services use `network_mode: host` so they reach the host-local
+# Redis (localhost:6380) and ClickHouse (localhost:8124).
+
+services:
+
+  obdata-polymarket-active-markets:
+    build:
+      context: .
+      dockerfile: services/polymarket/polymarket-active-markets/Dockerfile
+    container_name: obdata-polymarket-active-markets
+    command: ["python", "run.py"]
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      REDIS_URL: redis://localhost:6380
+      REDIS_STREAM_MARKET_EVENTS: polymarket:market_events
+      REDIS_KEY_ACTIVE_MARKETS: polymarket:active_markets
+      REDIS_KEY_ACTIVE_MARKETS_COUNT: polymarket:active_markets:count
+
+  obdata-polymarket-orderbook-rust-pubsub:
+    build:
+      context: .
+      dockerfile: services/polymarket/polymarket-orderbook-rust-pubsub/Dockerfile
+    container_name: obdata-polymarket-orderbook-rust-pubsub
+    # Optional flags: --new-only (skip pre-loading active markets),
+    #                 --skip-backlog (skip unprocessed Redis stream messages)
+    command: ["/app/polymarket-orderbook-rust-pubsub"]
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - obdata-polymarket-active-markets
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    environment:
+      # Redis (host-local)
+      REDIS_URL: redis://localhost:6380
+      REDIS_STREAM_MARKET_EVENTS: polymarket:market_events
+      REDIS_KEY_ACTIVE_MARKETS: polymarket:active_markets
+      REDIS_KEY_ACTIVE_MARKETS_COUNT: polymarket:active_markets:count
+      # Pub/sub publish channel — consumed by obdata-polymarket-orderbook-rust-from-pubsub
+      REDIS_PUBSUB_CHANNEL: polymarket:events
+      # WS pool
+      EXCLUDE_HASH: "true"
+      SKIP_ACTIVE_MARKETS_CACHE: "false"
+      QUEUE_SIZE: "5000000"
+      MAX_ASSETS_PER_CONN: "500"
+      DEDUP_TTL_SECONDS: "10"
+      # Pub/sub publisher batching
+      MAX_BATCH: "200"
+      LINGER_MS: "2"
+      # Independent consumer group from the from-pubsub side
+      ORDERBOOK_CONSUMER_GROUP: polymarket-orderbook-pubsub
+      ORDERBOOK_CONSUMER_NAME: polymarket-orderbook-pubsub-1
+      RUST_LOG: info,polymarket_orderbook_rust_pubsub=info,polymarket_orderbook_rust=info
+
+  obdata-polymarket-orderbook-rust-from-pubsub:
+    build:
+      context: .
+      dockerfile: services/polymarket/polymarket-orderbook-rust-from-pubsub/Dockerfile
+    container_name: obdata-polymarket-orderbook-rust-from-pubsub
+    command: ["/app/polymarket-orderbook-rust-from-pubsub"]
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - obdata-polymarket-orderbook-rust-pubsub
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    environment:
+      # Redis (host-local) — same pub/sub channel as the publisher
+      REDIS_URL: redis://localhost:6380
+      REDIS_PUBSUB_CHANNEL: polymarket:events
+      PUBSUB_RECONNECT_DELAY_MS: "2000"
+      # ClickHouse (host-local)
+      CLICKHOUSE_HOST: localhost
+      CLICKHOUSE_PORT: "8124"
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DATABASE: default
+      CLICKHOUSE_TABLE: polymarket_orderbook_rust
+      DROP_TABLE_ON_START: "false"
+      EXCLUDE_HASH: "true"
+      FLUSH_BATCH_SIZE: "5000"
+      FLUSH_INTERVAL_MS: "500"
+      QUEUE_SIZE: "5000000"
+      RUST_LOG: info,polymarket_orderbook_rust_from_pubsub=info,polymarket_orderbook_rust=info
+
+  obdata-polymarket-r2-archive-exporter:
+    build:
+      context: .
+      dockerfile: services/r2-archive/exporter/Dockerfile
+    container_name: obdata-polymarket-r2-archive-exporter
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      EXPORTER_PROFILE: polymarket
+      CLICKHOUSE_HOST: localhost
+      CLICKHOUSE_PORT: "8124"
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_TABLE: polymarket_orderbook_rust
+      R2_ENDPOINT: ${R2_ENDPOINT:-}
+      R2_BUCKET: ${R2_BUCKET:-}
+      R2_ACCESS_KEY: ${R2_ACCESS_KEY:-}
+      R2_SECRET_KEY: ${R2_SECRET_KEY:-}
