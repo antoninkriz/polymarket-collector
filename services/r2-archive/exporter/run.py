@@ -1,8 +1,8 @@
-"""Export compact Polymarket v3 ClickHouse rows to hourly Parquet in R2.
+"""Export compact Polymarket v3 rows to hourly, event-specific Parquet files.
 
-The query applies ``FINAL`` to collapse collector-owned retries, projects the
-normalized JSON into typed columns, and orders rows by ``(market, sequence)``.
-PyArrow writes ZSTD level 1 with delta encoding on integer columns.
+Each query applies ``FINAL`` to collapse collector-owned retries, projects one
+event type into its own schema, and orders rows by the shared collector
+sequence. PyArrow writes ZSTD level 1 with delta encoding on integer columns.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
@@ -42,143 +43,165 @@ R2_BUCKET = os.environ.get("R2_BUCKET", "")
 # Export format
 PARQUET_COMPRESSION = "zstd"
 PARQUET_COMPRESSION_LEVEL = 1
-FILENAME_PREFIX = os.environ.get("FILENAME_PREFIX", "polymarket_orderbook_v3_")
 DELTA_ENCODED_COLUMNS = (
     "timestamp",
     "timestamp_received",
     "sequence",
     "fee_rate_bps",
 )
-SELECT_ORDER_BY = ("market", "sequence")
+SELECT_ORDER_BY = ("sequence",)
 EXPORT_DELAY_MINUTES = int(os.environ.get("EXPORT_DELAY_MINUTES", "5"))
 EXPORT_LAG_HOURS = int(os.environ.get("EXPORT_LAG_HOURS", "1"))
 LOOP_CHECK_INTERVAL_SECONDS = int(os.environ.get("LOOP_CHECK_INTERVAL_SECONDS", "60"))
 QUERY_MAX_RETRIES = 10
 QUERY_RETRY_DELAY_SECONDS = 10
 
-SELECT_TEMPLATE = """
-WITH
-    JSONExtractString(data, 'market') AS market_text,
-    JSONExtractString(data, 'event_type') AS event_type,
-    JSONExtractString(data, 'asset_id') AS asset_id_text,
-    JSONExtract(data, 'assets_ids', 'Array(String)') AS assets_ids_text,
-    JSONExtractString(data, 'transaction_hash') AS transaction_hash_text,
-    JSONExtractString(data, 'winning_asset_id') AS winning_asset_id_text
-SELECT
-    timestamp_received,
-    sequence,
-    fromUnixTimestamp64Milli(
-        toInt64OrZero(JSONExtractString(data, 'timestamp')),
-        'UTC'
-    ) AS timestamp,
-    toFixedString(
-        unhex(substring(market_text, 3)),
+
+@dataclass(frozen=True)
+class EventProjection:
+    """Event-owned SQL columns and validation for one Parquet schema."""
+
+    aliases: tuple[str, ...]
+    columns: tuple[str, ...]
+    validations: tuple[str, ...]
+
+
+ASSET_ID_ALIAS = "JSONExtractString(data, 'asset_id') AS asset_id_text"
+ASSET_ID_COLUMN = """toFixedString(
+    unhex(leftPad(hex(toUInt256OrZero(asset_id_text)), 64, '0')),
+    32
+) AS asset_id"""
+ASSET_ID_VALIDATION = """throwIf(
+    NOT match(asset_id_text, '^(0|[1-9][0-9]{0,77})$')
+        OR toString(toUInt256OrZero(asset_id_text)) != asset_id_text,
+    'invalid Polymarket asset ID'
+) = 0"""
+ASSETS_IDS_ALIAS = "JSONExtract(data, 'assets_ids', 'Array(String)') AS assets_ids_text"
+ASSETS_IDS_COLUMN = """arrayMap(
+    value -> toFixedString(
+        unhex(leftPad(hex(toUInt256OrZero(value)), 64, '0')),
         32
-    ) AS market,
-    event_type,
-    if(
-        empty(asset_id_text),
-        NULL,
-        toFixedString(
-            unhex(leftPad(hex(toUInt256OrZero(asset_id_text)), 64, '0')),
-            32
-        )
-    ) AS asset_id,
-
-    arrayMap(
-        value -> toFixedString(
-            unhex(leftPad(hex(toUInt256OrZero(value)), 64, '0')),
-            32
-        ),
+    ),
+    assets_ids_text
+) AS assets_ids"""
+ASSETS_IDS_VALIDATION = """throwIf(
+    arrayExists(
+        value -> NOT match(value, '^(0|[1-9][0-9]{0,77})$')
+            OR toString(toUInt256OrZero(value)) != value,
         assets_ids_text
-    ) AS assets_ids,
-    JSONExtract(data, 'outcomes', 'Array(String)') AS outcomes,
+    ),
+    'invalid Polymarket lifecycle asset ID'
+) = 0"""
 
-    if(event_type = 'book', JSONExtractRaw(data, 'bids'), NULL) AS bids,
-    if(event_type = 'book', JSONExtractRaw(data, 'asks'), NULL) AS asks,
-
-    if(event_type IN ('price_change', 'last_trade_price'),
-       toDecimal32OrZero(JSONExtractString(data, 'price'), 4), NULL) AS price,
-    if(event_type IN ('price_change', 'last_trade_price'),
-       toDecimal64OrZero(JSONExtractString(data, 'size'), 6), NULL) AS size,
-    if(event_type IN ('price_change', 'last_trade_price'),
-       JSONExtractString(data, 'side'), NULL) AS side,
-
-    if(event_type IN ('price_change', 'best_bid_ask'),
-       toDecimal32OrNull(JSONExtractString(data, 'best_bid'), 4), NULL) AS best_bid,
-    if(event_type IN ('price_change', 'best_bid_ask'),
-       toDecimal32OrNull(JSONExtractString(data, 'best_ask'), 4), NULL) AS best_ask,
-    if(event_type = 'best_bid_ask',
-       toDecimal32OrNull(JSONExtractString(data, 'spread'), 4), NULL) AS spread,
-
-    if(event_type = 'last_trade_price',
-       toUInt16OrZero(JSONExtractString(data, 'fee_rate_bps')), NULL) AS fee_rate_bps,
-    if(event_type = 'last_trade_price',
-       toFixedString(
-           unhex(substring(transaction_hash_text, 3)),
-           32
-       ), NULL) AS transaction_hash,
-
-    if(event_type = 'tick_size_change',
-       toDecimal32OrZero(JSONExtractString(data, 'old_tick_size'), 4), NULL)
-       AS old_tick_size,
-    if(event_type = 'tick_size_change',
-       toDecimal32OrZero(JSONExtractString(data, 'new_tick_size'), 4), NULL)
-       AS new_tick_size,
-
-    if(
-        empty(winning_asset_id_text),
-        NULL,
-        toFixedString(
-            unhex(leftPad(hex(toUInt256OrZero(winning_asset_id_text)), 64, '0')),
-            32
-        )
-    ) AS winning_asset_id,
-    if(event_type = 'market_resolved',
-       JSONExtractString(data, 'winning_outcome'), NULL) AS winning_outcome
-FROM {source_table} FINAL
-WHERE timestamp_received >= toDateTime64('{target}', 9, 'UTC')
-  AND timestamp_received <  toDateTime64('{target}', 9, 'UTC') + INTERVAL 1 HOUR
-  AND throwIf(
-      NOT match(market_text, '^0[xX][0-9a-fA-F]{{64}}$'),
-      'invalid Polymarket condition ID'
-  ) = 0
-  AND throwIf(
-      event_type IN (
-          'book', 'price_change', 'last_trade_price',
-          'tick_size_change', 'best_bid_ask'
-      )
-      AND (
-          NOT match(asset_id_text, '^(0|[1-9][0-9]{{0,77}})$')
-          OR toString(toUInt256OrZero(asset_id_text)) != asset_id_text
-      ),
-      'invalid Polymarket asset ID'
-  ) = 0
-  AND throwIf(
-      arrayExists(
-          value -> NOT match(value, '^(0|[1-9][0-9]{{0,77}})$')
-              OR toString(toUInt256OrZero(value)) != value,
-          assets_ids_text
-      ),
-      'invalid Polymarket lifecycle asset ID'
-  ) = 0
-  AND throwIf(
-      NOT empty(winning_asset_id_text)
-      AND (
-          NOT match(winning_asset_id_text, '^(0|[1-9][0-9]{{0,77}})$')
-          OR toString(toUInt256OrZero(winning_asset_id_text))
-              != winning_asset_id_text
-      ),
-      'invalid Polymarket winning asset ID'
-  ) = 0
-  AND throwIf(
-      event_type = 'last_trade_price'
-          AND NOT match(transaction_hash_text, '^0[xX][0-9a-fA-F]{{64}}$'),
-      'invalid Polymarket transaction hash'
-  ) = 0
-ORDER BY {order_by}
-FORMAT ArrowStream
-"""
+EVENT_PROJECTIONS: dict[str, EventProjection] = {
+    "book": EventProjection(
+        aliases=(ASSET_ID_ALIAS,),
+        columns=(
+            ASSET_ID_COLUMN,
+            "JSONExtractRaw(data, 'bids') AS bids",
+            "JSONExtractRaw(data, 'asks') AS asks",
+        ),
+        validations=(ASSET_ID_VALIDATION,),
+    ),
+    "price_change": EventProjection(
+        aliases=(ASSET_ID_ALIAS,),
+        columns=(
+            ASSET_ID_COLUMN,
+            "toDecimal32OrZero(JSONExtractString(data, 'price'), 4) AS price",
+            "toDecimal64OrZero(JSONExtractString(data, 'size'), 6) AS size",
+            "JSONExtractString(data, 'side') AS side",
+            "toDecimal32OrNull(JSONExtractString(data, 'best_bid'), 4) AS best_bid",
+            "toDecimal32OrNull(JSONExtractString(data, 'best_ask'), 4) AS best_ask",
+        ),
+        validations=(ASSET_ID_VALIDATION,),
+    ),
+    "last_trade_price": EventProjection(
+        aliases=(
+            ASSET_ID_ALIAS,
+            "JSONExtractString(data, 'transaction_hash') AS transaction_hash_text",
+        ),
+        columns=(
+            ASSET_ID_COLUMN,
+            "toDecimal32OrZero(JSONExtractString(data, 'price'), 4) AS price",
+            "toDecimal64OrZero(JSONExtractString(data, 'size'), 6) AS size",
+            "JSONExtractString(data, 'side') AS side",
+            "toUInt16OrZero(JSONExtractString(data, 'fee_rate_bps')) AS fee_rate_bps",
+            "toFixedString(unhex(substring(transaction_hash_text, 3)), 32) AS transaction_hash",
+        ),
+        validations=(
+            ASSET_ID_VALIDATION,
+            """throwIf(
+    NOT match(transaction_hash_text, '^0[xX][0-9a-fA-F]{64}$'),
+    'invalid Polymarket transaction hash'
+) = 0""",
+        ),
+    ),
+    "tick_size_change": EventProjection(
+        aliases=(ASSET_ID_ALIAS,),
+        columns=(
+            ASSET_ID_COLUMN,
+            "toDecimal32OrZero(JSONExtractString(data, 'old_tick_size'), 4) AS old_tick_size",
+            "toDecimal32OrZero(JSONExtractString(data, 'new_tick_size'), 4) AS new_tick_size",
+        ),
+        validations=(ASSET_ID_VALIDATION,),
+    ),
+    "best_bid_ask": EventProjection(
+        aliases=(ASSET_ID_ALIAS,),
+        columns=(
+            ASSET_ID_COLUMN,
+            "toDecimal32OrNull(JSONExtractString(data, 'best_bid'), 4) AS best_bid",
+            "toDecimal32OrNull(JSONExtractString(data, 'best_ask'), 4) AS best_ask",
+            "toDecimal32OrNull(JSONExtractString(data, 'spread'), 4) AS spread",
+        ),
+        validations=(ASSET_ID_VALIDATION,),
+    ),
+    "new_market": EventProjection(
+        aliases=(ASSETS_IDS_ALIAS,),
+        columns=(
+            "JSONExtractString(data, 'id') AS id",
+            ASSETS_IDS_COLUMN,
+            "JSONExtract(data, 'outcomes', 'Array(String)') AS outcomes",
+            "if(JSONHas(data, 'question'), JSONExtractString(data, 'question'), NULL) AS question",
+            "if(JSONHas(data, 'slug'), JSONExtractString(data, 'slug'), NULL) AS slug",
+        ),
+        validations=(ASSETS_IDS_VALIDATION,),
+    ),
+    "market_resolved": EventProjection(
+        aliases=(
+            ASSETS_IDS_ALIAS,
+            "JSONExtractString(data, 'winning_asset_id') AS winning_asset_id_text",
+        ),
+        columns=(
+            "JSONExtractString(data, 'id') AS id",
+            ASSETS_IDS_COLUMN,
+            """if(
+    JSONHas(data, 'winning_asset_id'),
+    toFixedString(
+        unhex(leftPad(hex(toUInt256OrZero(winning_asset_id_text)), 64, '0')),
+        32
+    ),
+    NULL
+) AS winning_asset_id""",
+            """if(
+    JSONHas(data, 'winning_outcome'),
+    JSONExtractString(data, 'winning_outcome'),
+    NULL
+) AS winning_outcome""",
+        ),
+        validations=(
+            ASSETS_IDS_VALIDATION,
+            """throwIf(
+    JSONHas(data, 'winning_asset_id')
+        AND (
+            NOT match(winning_asset_id_text, '^(0|[1-9][0-9]{0,77})$')
+            OR toString(toUInt256OrZero(winning_asset_id_text))
+                != winning_asset_id_text
+        ),
+    'invalid Polymarket winning asset ID'
+) = 0""",
+        ),
+    ),
+}
 
 
 # ClickHouse
@@ -254,23 +277,52 @@ def query_latest_received_hour() -> datetime | None:
     return None
 
 
-def fetch_hour_parquet(hour: datetime) -> bytes | None:
-    """Return one logical receive-time hour as typed Parquet bytes."""
-    target = hour.strftime("%Y-%m-%d %H:00:00")
-    select_order_by = ", ".join(SELECT_ORDER_BY)
-    query = SELECT_TEMPLATE.format(
-        source_table=CLICKHOUSE_TABLE,
-        target=target,
-        order_by=select_order_by,
+def build_event_query(hour: datetime, event_type: str) -> str:
+    """Build the typed ClickHouse projection for one event type and hour."""
+    projection = EVENT_PROJECTIONS[event_type]
+    target = hour.astimezone(timezone.utc).strftime("%Y-%m-%d %H:00:00")
+    aliases = "".join(f",\n    {alias}" for alias in projection.aliases)
+    columns = ",\n    ".join(projection.columns)
+    validations = "".join(
+        f"\n  AND {validation}" for validation in projection.validations
     )
+    order_by = ", ".join(SELECT_ORDER_BY)
+    return f"""
+WITH
+    JSONExtractString(data, 'market') AS market_text{aliases}
+SELECT
+    timestamp_received,
+    sequence,
+    fromUnixTimestamp64Milli(
+        toInt64OrZero(JSONExtractString(data, 'timestamp')),
+        'UTC'
+    ) AS timestamp,
+    toFixedString(unhex(substring(market_text, 3)), 32) AS market,
+    {columns}
+FROM {CLICKHOUSE_TABLE} FINAL
+WHERE timestamp_received >= toDateTime64('{target}', 9, 'UTC')
+  AND timestamp_received <  toDateTime64('{target}', 9, 'UTC') + INTERVAL 1 HOUR
+  AND JSONExtractString(data, 'event_type') = '{event_type}'
+  AND throwIf(
+      NOT match(market_text, '^0[xX][0-9a-fA-F]{{64}}$'),
+      'invalid Polymarket condition ID'
+  ) = 0{validations}
+ORDER BY {order_by}
+FORMAT ArrowStream
+"""
+
+
+def fetch_event_table(hour: datetime, event_type: str) -> pa.Table:
+    """Return one event type for one receive-time hour as a typed Arrow table."""
+    query = build_event_query(hour, event_type)
     arrow_bytes = _ch_query(query, timeout=600).content
 
     with pa.ipc.open_stream(pa.BufferReader(arrow_bytes)) as reader:
-        table = reader.read_all()
+        return reader.read_all()
 
-    if table.num_rows == 0:
-        return None
 
+def table_to_parquet(table: pa.Table) -> bytes:
+    """Encode a typed event table as ZSTD level 1 Parquet."""
     delta_cols = [c for c in DELTA_ENCODED_COLUMNS if c in table.column_names]
     dict_cols = [c for c in table.column_names if c not in delta_cols]
 
@@ -319,7 +371,7 @@ class R2Client:
     def list_keys(self) -> set[str]:
         """Return the set of exported object keys."""
         keys: set[str] = set()
-        kwargs: dict[str, str] = {"Bucket": self._bucket, "Prefix": FILENAME_PREFIX}
+        kwargs: dict[str, str] = {"Bucket": self._bucket, "Prefix": ""}
         while True:
             resp = self._client.list_objects_v2(**kwargs)
             keys.update(obj["Key"] for obj in resp.get("Contents", []))
@@ -345,14 +397,21 @@ class R2Client:
 # Export orchestration
 
 
-def hour_to_filename(hour: datetime) -> str:
-    """Convert a datetime to the standard snapshot filename."""
-    return f"{FILENAME_PREFIX}{hour.strftime('%Y-%m-%dT%H')}.parquet"
+def hour_to_prefix(hour: datetime) -> str:
+    """Return the sortable UTC object prefix for one receive-time hour."""
+    return hour.astimezone(timezone.utc).strftime("%Y-%m-%d/%H")
+
+
+def event_to_key(hour: datetime, event_type: str) -> str:
+    """Return the Parquet object key for one event type and UTC hour."""
+    if event_type not in EVENT_PROJECTIONS:
+        raise ValueError(f"unsupported event type: {event_type}")
+    return f"{hour_to_prefix(hour)}/{event_type}.parquet"
 
 
 def hour_to_completion_key(hour: datetime) -> str:
     """Return the object whose presence means an hour was fully published."""
-    return f"{hour_to_filename(hour)}.manifest.json"
+    return f"{hour_to_prefix(hour)}/manifest.json"
 
 
 def latest_exportable_hour() -> datetime | None:
@@ -372,25 +431,60 @@ def latest_exportable_hour() -> datetime | None:
     return min(wall_bound, watermark_bound)
 
 
-def export_hour(client: R2Client, hour: datetime) -> bool:
-    """Fetch one hour from ClickHouse and upload it to R2.
+def export_hour(client: R2Client, hour: datetime) -> None:
+    """Upload every event-specific file, then atomically complete the hour."""
+    prefix = hour_to_prefix(hour)
+    log.info("Exporting %s", prefix)
+    files: dict[str, dict[str, object]] = {}
+    total_rows = 0
+    hour_min_sequence: int | None = None
+    hour_max_sequence: int | None = None
 
-    Returns True if an object was uploaded, False if the hour has no rows
-    (the caller should keep polling until data appears).
-    """
-    filename = hour_to_filename(hour)
-    log.info("Exporting %s", filename)
-    data = fetch_hour_parquet(hour)
-    if data is None:
-        log.info("Skipping %s: 0 rows, will retry next tick", filename)
-        return False
-    client.upload(filename, data)
+    for event_type in EVENT_PROJECTIONS:
+        table = fetch_event_table(hour, event_type)
+        data = table_to_parquet(table)
+        key = event_to_key(hour, event_type)
+        row_count = table.num_rows
+        min_sequence = int(table.column("sequence")[0].as_py()) if row_count else None
+        max_sequence = (
+            int(table.column("sequence")[row_count - 1].as_py()) if row_count else None
+        )
+        client.upload(key, data)
+        files[event_type] = {
+            "file": key,
+            "row_count": row_count,
+            "byte_size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "min_sequence": min_sequence,
+            "max_sequence": max_sequence,
+            "columns": table.column_names,
+        }
+        total_rows += row_count
+        if min_sequence is not None:
+            assert max_sequence is not None
+            hour_min_sequence = (
+                min_sequence
+                if hour_min_sequence is None
+                else min(hour_min_sequence, min_sequence)
+            )
+            hour_max_sequence = (
+                max_sequence
+                if hour_max_sequence is None
+                else max(hour_max_sequence, max_sequence)
+            )
+        log.info(
+            "Uploaded %s: rows=%d size=%.2f MB",
+            key,
+            row_count,
+            len(data) / (1024 * 1024),
+        )
+
     manifest = {
-        "file": filename,
-        "hour_utc": hour.isoformat(),
-        "row_count": pq.read_metadata(BytesIO(data)).num_rows,
-        "byte_size": len(data),
-        "sha256": hashlib.sha256(data).hexdigest(),
+        "hour_utc": hour.astimezone(timezone.utc).isoformat(),
+        "row_count": total_rows,
+        "min_sequence": hour_min_sequence,
+        "max_sequence": hour_max_sequence,
+        "files": files,
         "source_table": CLICKHOUSE_TABLE,
         "order_by": SELECT_ORDER_BY,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -401,8 +495,13 @@ def export_hour(client: R2Client, hour: datetime) -> bool:
         separators=(",", ":"),
     ).encode()
     client.upload(hour_to_completion_key(hour), manifest_data)
-    log.info("Uploaded %s (%.2f MB)", filename, len(data) / (1024 * 1024))
-    return True
+    log.info(
+        "Completed %s: rows=%d sequence=%s..%s",
+        prefix,
+        total_rows,
+        hour_min_sequence,
+        hour_max_sequence,
+    )
 
 
 def backfill(client: R2Client) -> datetime | None:
@@ -430,13 +529,12 @@ def backfill(client: R2Client) -> datetime | None:
         len(missing),
         earliest.isoformat(),
         latest.isoformat(),
-        len(existing),
+        sum(key.endswith("/manifest.json") for key in existing),
     )
 
     for i, hour in enumerate(missing, 1):
         try:
-            if not export_hour(client, hour):
-                return hour
+            export_hour(client, hour)
             log.info("Backfill progress: %d/%d", i, len(missing))
         except Exception as e:
             log.error("Failed to export %s: %s", hour.isoformat(), e)
@@ -447,8 +545,8 @@ def backfill(client: R2Client) -> datetime | None:
 def run_loop(client: R2Client, next_hour: datetime | None) -> None:
     """Steady-state loop: export each new hour shortly after it completes.
 
-    Advances only on successful upload — empty hours are re-polled on the
-    next tick so gaps never produce zero-row objects in R2.
+    The manifest is uploaded only after all seven typed Parquet files. Empty
+    event types and entirely empty hours are valid completed exports.
     """
     log.info(
         "Entering steady-state loop (check every %ds)", LOOP_CHECK_INTERVAL_SECONDS
@@ -472,8 +570,7 @@ def run_loop(client: R2Client, next_hour: datetime | None) -> None:
                 if client.exists(completion_key):
                     next_hour += timedelta(hours=1)
                     continue
-                if not export_hour(client, next_hour):
-                    break
+                export_hour(client, next_hour)
                 next_hour += timedelta(hours=1)
             except Exception as e:
                 log.error("Failed to export %s: %s", next_hour.isoformat(), e)
@@ -497,11 +594,10 @@ def main() -> None:
     client = R2Client(R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET)
     client.ensure_bucket()
     log.info(
-        "Connected to R2 at %s, bucket=%s, source_table=%s, filename_prefix=%s, order_by=%s",
+        "Connected to R2 at %s, bucket=%s, source_table=%s, order_by=%s",
         R2_ENDPOINT,
         R2_BUCKET,
         CLICKHOUSE_TABLE,
-        FILENAME_PREFIX,
         SELECT_ORDER_BY,
     )
 
