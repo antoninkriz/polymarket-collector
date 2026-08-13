@@ -136,10 +136,69 @@ impl Pool {
             "MAX_ASSETS_PER_CONN must be at least 2 so a market stays atomic"
         );
 
-        let new_markets: Vec<Market> = markets
-            .into_iter()
-            .filter(|market| !self.markets.contains_key(&market.hash))
-            .collect();
+        // Validate and deduplicate the whole input before mutating pool state.
+        // Checking only `self.markets` is insufficient: the same hash can
+        // occur twice in one preload batch and, at a capacity boundary, end
+        // up subscribed on two different sockets.
+        let mut new_markets = Vec::new();
+        let mut batch_markets: HashMap<String, [String; 2]> = HashMap::new();
+        let mut batch_assets: HashMap<String, String> = HashMap::new();
+        for market in markets {
+            ensure!(!market.hash.is_empty(), "market hash must not be empty");
+            ensure!(
+                market.assets.iter().all(|asset| !asset.is_empty()),
+                "market {} has an empty asset id",
+                market.hash,
+            );
+            ensure!(
+                market.assets[0] != market.assets[1],
+                "market {} assigns both outcomes to asset {}",
+                market.hash,
+                market.assets[0],
+            );
+
+            if let Some(existing) = self.markets.get(&market.hash) {
+                ensure!(
+                    existing.assets == market.assets,
+                    "market {} changed assets from {:?} to {:?}",
+                    market.hash,
+                    existing.assets,
+                    market.assets,
+                );
+                continue;
+            }
+            if let Some(existing_assets) = batch_markets.get(&market.hash) {
+                ensure!(
+                    existing_assets == &market.assets,
+                    "market {} has conflicting assets {:?} and {:?} in one batch",
+                    market.hash,
+                    existing_assets,
+                    market.assets,
+                );
+                continue;
+            }
+
+            for asset in &market.assets {
+                ensure!(
+                    !self.asset_to_conn.contains_key(asset),
+                    "asset {} is already assigned to another subscribed market",
+                    asset,
+                );
+                if let Some(owner) = batch_assets.get(asset) {
+                    ensure!(
+                        owner == &market.hash,
+                        "asset {} is shared by markets {} and {} in one batch",
+                        asset,
+                        owner,
+                        market.hash,
+                    );
+                } else {
+                    batch_assets.insert(asset.clone(), market.hash.clone());
+                }
+            }
+            batch_markets.insert(market.hash.clone(), market.assets.clone());
+            new_markets.push(market);
+        }
         if new_markets.is_empty() {
             return Ok(());
         }
@@ -473,6 +532,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pool.connection_count(), before);
+        assert_eq!(pool.subscribed_market_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_market_in_one_capacity_sized_batch_has_one_route() {
+        let mut pool = pool(2);
+        let duplicate = market("m1", "a1y", "a1n");
+        pool.subscribe_markets(vec![duplicate.clone(), duplicate])
+            .await
+            .unwrap();
+
+        assert_eq!(pool.connection_count(), 1);
+        assert_eq!(pool.subscribed_market_count(), 1);
+        assert_eq!(pool.connections[0].assets.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn conflicting_market_or_asset_identity_is_rejected_before_mutation() {
+        let mut pool = pool(4);
+        let result = pool
+            .subscribe_markets(vec![
+                market("m1", "shared", "a1n"),
+                market("m2", "shared", "a2n"),
+            ])
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(pool.connection_count(), 0);
+        assert_eq!(pool.subscribed_market_count(), 0);
+
+        pool.subscribe_markets(vec![market("m1", "a1y", "a1n")])
+            .await
+            .unwrap();
+        let result = pool
+            .subscribe_markets(vec![market("m1", "different-y", "different-n")])
+            .await;
+        assert!(result.is_err());
+        assert_eq!(pool.connection_count(), 1);
         assert_eq!(pool.subscribed_market_count(), 1);
     }
 
