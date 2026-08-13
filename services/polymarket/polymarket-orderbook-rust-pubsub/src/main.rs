@@ -105,6 +105,7 @@ async fn main() -> Result<()> {
         event_tx.clone(),
         publisher_fence,
     )));
+    pool.lock().await.start().await;
 
     if !cli.new_only {
         let markets = preload_markets(&cfg).await?;

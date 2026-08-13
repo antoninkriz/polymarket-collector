@@ -56,6 +56,9 @@ pub struct Pool {
     market_to_conn: HashMap<String, usize>,
     asset_to_conn: HashMap<String, usize>,
     next_conn_id: usize,
+    /// Stable ID of the one socket allowed to emit connection-wide market
+    /// lifecycle events. The leader remains alive even with no data assets.
+    lifecycle_conn_id: Option<usize>,
     health_counters: Arc<HealthCounters>,
     monitor_join: Option<JoinHandle<()>>,
     status_event_tx: mpsc::UnboundedSender<(usize, ConnStatus)>,
@@ -94,6 +97,7 @@ impl Pool {
             market_to_conn: HashMap::new(),
             asset_to_conn: HashMap::new(),
             next_conn_id: 0,
+            lifecycle_conn_id: None,
             health_counters,
             monitor_join,
             status_event_tx,
@@ -103,6 +107,14 @@ impl Pool {
 
     pub fn subscribed_market_count(&self) -> usize {
         self.markets.len()
+    }
+
+    /// Ensure the lifecycle leader exists. This is required even with no
+    /// preloaded assets so `--new-only` can receive `new_market` events.
+    pub async fn start(&mut self) {
+        if self.lifecycle_conn_id.is_none() {
+            self.spawn_connection().await;
+        }
     }
 
     #[cfg(test)]
@@ -282,7 +294,9 @@ impl Pool {
 
         let mut index = 0;
         while index < self.connections.len() {
-            if self.connections[index].assets.is_empty() {
+            if self.connections[index].assets.is_empty()
+                && Some(self.connections[index].conn_id) != self.lifecycle_conn_id
+            {
                 let handle = self.connections.swap_remove(index);
                 let conn_id = handle.conn_id;
                 drop(handle.cmd_tx);
@@ -347,12 +361,17 @@ impl Pool {
     async fn spawn_connection(&mut self) {
         let conn_id = self.next_conn_id;
         self.next_conn_id += 1;
+        let lifecycle_leader = self.lifecycle_conn_id.is_none();
+        if lifecycle_leader {
+            self.lifecycle_conn_id = Some(conn_id);
+        }
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_SIZE);
         let connection = Connection::new(
             conn_id,
             self.event_tx.clone(),
             Arc::clone(&self.collector),
             self.status_event_tx.clone(),
+            lifecycle_leader,
         );
         let join = tokio::spawn(connection.run(cmd_rx));
         self.connections.push(ConnHandle {
@@ -363,6 +382,7 @@ impl Pool {
         });
         info!(
             conn = conn_id,
+            lifecycle_leader,
             total = self.connections.len(),
             "spawned connection"
         );
@@ -560,7 +580,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsubscribe_removes_market_and_empty_connection() {
+    async fn unsubscribe_keeps_empty_lifecycle_leader() {
         let mut pool = pool(200);
         pool.subscribe_markets(vec![market("m1", "a1y", "a1n")])
             .await
@@ -568,6 +588,19 @@ mod tests {
         pool.unsubscribe_markets(vec!["m1".into()]).await.unwrap();
         assert_eq!(pool.subscribed_market_count(), 0);
         assert!(pool.asset_to_conn.is_empty());
-        assert_eq!(pool.connection_count(), 0);
+        assert_eq!(pool.connection_count(), 1);
+        assert!(pool.connections[0].assets.is_empty());
+        assert_eq!(pool.lifecycle_conn_id, Some(pool.connections[0].conn_id));
+    }
+
+    #[tokio::test]
+    async fn start_creates_one_empty_lifecycle_leader() {
+        let mut pool = pool(200);
+        pool.start().await;
+        pool.start().await;
+
+        assert_eq!(pool.connection_count(), 1);
+        assert!(pool.connections[0].assets.is_empty());
+        assert_eq!(pool.lifecycle_conn_id, Some(pool.connections[0].conn_id));
     }
 }

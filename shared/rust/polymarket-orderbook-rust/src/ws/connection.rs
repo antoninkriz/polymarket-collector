@@ -23,8 +23,8 @@
 //!
 //! ## Wire protocol
 //!
-//! - First subscription on a fresh socket: `{"assets_ids": [...], "type": "market"}`
-//! - Subsequent subscribes:                 `{"assets_ids": [...], "operation": "subscribe"}`
+//! - First subscription on a fresh socket: `{"assets_ids": [...], "type": "market", "custom_feature_enabled": true}`
+//! - Subsequent subscribes:                 `{"assets_ids": [...], "operation": "subscribe", "custom_feature_enabled": true}`
 //! - Unsubscribes:                          `{"assets_ids": [...], "operation": "unsubscribe"}`
 //!
 //! Messages can arrive as a single JSON object or as a JSON array of objects;
@@ -86,6 +86,9 @@ pub struct Connection {
     pub event_tx: mpsc::Sender<EventRecord>,
     pub collector: Arc<CollectorContext>,
     pub status_tx: mpsc::UnboundedSender<(usize, ConnStatus)>,
+    /// Lifecycle messages are broadcast to every custom-enabled socket. Only
+    /// the pool's designated leader admits them to storage.
+    pub lifecycle_leader: bool,
 }
 
 impl Connection {
@@ -94,12 +97,14 @@ impl Connection {
         event_tx: mpsc::Sender<EventRecord>,
         collector: Arc<CollectorContext>,
         status_tx: mpsc::UnboundedSender<(usize, ConnStatus)>,
+        lifecycle_leader: bool,
     ) -> Self {
         Self {
             index,
             event_tx,
             collector,
             status_tx,
+            lifecycle_leader,
         }
     }
 
@@ -118,6 +123,7 @@ impl Connection {
             event_tx,
             collector,
             status_tx,
+            lifecycle_leader,
         } = self;
         let mut sub = SubState::default();
         let mut backoff = Duration::from_secs(1);
@@ -191,6 +197,7 @@ impl Connection {
                 index,
                 event_tx: &event_tx,
                 collector: &collector,
+                lifecycle_leader,
             };
             let outcome = run_session(
                 ws_stream,
@@ -270,6 +277,7 @@ struct SessionContext<'a> {
     index: usize,
     event_tx: &'a mpsc::Sender<EventRecord>,
     collector: &'a CollectorContext,
+    lifecycle_leader: bool,
 }
 
 /// Run a single connected WebSocket session: send the initial subscription,
@@ -288,7 +296,7 @@ async fn run_session(
     let (mut write, mut read) = ws_stream.split();
 
     // (Re-)subscribe everything we want.
-    if !sub.desired.is_empty() {
+    if !sub.desired.is_empty() || context.lifecycle_leader {
         let assets: Vec<String> = sub.desired.iter().cloned().collect();
         if let Err(e) = send_subscribe(&mut write, sub, &assets, index).await {
             return SessionOutcome::Error(e);
@@ -497,26 +505,28 @@ fn handle_text(
         let mut staged: Vec<Event> = Vec::new();
         explode(msg, &mut staged);
         for ev in staged {
-            let Some(asset_id) = ev.asset_id() else {
-                // Market-scoped lifecycle events are enabled and routed in a
-                // later layer; do not pretend they belong to one token.
-                continue;
-            };
-            if !sub.desired.contains(asset_id) {
-                continue;
-            }
-            match &ev {
-                Event::Book { .. } => {
-                    sub.initialized.insert(asset_id.to_owned());
-                }
-                Event::PriceChange { .. } if !sub.initialized.contains(asset_id) => {
-                    debug!(
-                        conn = context.index,
-                        asset_id, "dropping price delta before fresh book snapshot"
-                    );
+            if let Some(asset_id) = ev.asset_id() {
+                if !sub.desired.contains(asset_id) {
                     continue;
                 }
-                _ => {}
+                match &ev {
+                    Event::Book { .. } => {
+                        sub.initialized.insert(asset_id.to_owned());
+                    }
+                    Event::PriceChange { .. } if !sub.initialized.contains(asset_id) => {
+                        debug!(
+                            conn = context.index,
+                            asset_id, "dropping price delta before fresh book snapshot"
+                        );
+                        continue;
+                    }
+                    _ => {}
+                }
+            } else if !context.lifecycle_leader {
+                // Lifecycle events are connection-wide when the custom
+                // feature is enabled. Admitting them on every data socket
+                // would duplicate one upstream notification N times.
+                continue;
             }
             events_buf.push(context.collector.record(ev, timestamp_received_ns));
         }
@@ -534,12 +544,7 @@ where
     S: SinkExt<Message> + Unpin,
     <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
 {
-    let payload = if !sub.initial_sent {
-        sub.initial_sent = true;
-        serde_json::json!({"assets_ids": assets, "type": "market"})
-    } else {
-        serde_json::json!({"assets_ids": assets, "operation": "subscribe"})
-    };
+    let payload = subscribe_payload(sub, assets);
     let text = payload.to_string();
     write
         .send(Message::Text(text.into()))
@@ -547,6 +552,23 @@ where
         .map_err(|e| anyhow::anyhow!("ws send: {e}"))?;
     info!(conn = index, count = assets.len(), "subscribed assets");
     Ok(())
+}
+
+fn subscribe_payload(sub: &mut SubState, assets: &[String]) -> serde_json::Value {
+    if !sub.initial_sent {
+        sub.initial_sent = true;
+        serde_json::json!({
+            "assets_ids": assets,
+            "type": "market",
+            "custom_feature_enabled": true,
+        })
+    } else {
+        serde_json::json!({
+            "assets_ids": assets,
+            "operation": "subscribe",
+            "custom_feature_enabled": true,
+        })
+    }
 }
 
 async fn send_unsubscribe<S>(write: &mut S, assets: &[String], index: usize) -> Result<()>
@@ -575,6 +597,7 @@ mod tests {
             index: 0,
             event_tx: &event_tx,
             collector: &collector,
+            lifecycle_leader: false,
         };
         handle_text(text, sub, events, &context, 123)
     }
@@ -694,6 +717,68 @@ mod tests {
 
         assert_eq!(buf.len(), 2);
         assert_eq!(buf[1].sequence, buf[0].sequence + 1);
+    }
+
+    #[test]
+    fn handle_text_keeps_best_bid_ask_for_desired_asset() {
+        let mut buf = Vec::new();
+        let mut sub = sub_state(&["a"]);
+        let raw = r#"{
+            "event_type": "best_bid_ask", "asset_id": "a", "market": "m",
+            "best_bid": "0.4", "best_ask": "0.5", "spread": "0.1",
+            "timestamp": "1"
+        }"#;
+
+        handle(raw, &mut sub, &mut buf).unwrap();
+
+        assert_eq!(buf.len(), 1);
+        assert!(matches!(buf[0].event, Event::BestBidAsk { .. }));
+    }
+
+    #[test]
+    fn only_lifecycle_leader_keeps_connection_wide_events() {
+        let raw = r#"{
+            "event_type": "new_market", "id": "1", "market": "m",
+            "assets_ids": ["yes", "no"], "outcomes": ["Yes", "No"],
+            "timestamp": "1"
+        }"#;
+        let mut sub = sub_state(&[]);
+        let mut buf = Vec::new();
+        handle(raw, &mut sub, &mut buf).unwrap();
+        assert!(buf.is_empty());
+
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let collector = CollectorContext::new();
+        let context = SessionContext {
+            index: 0,
+            event_tx: &event_tx,
+            collector: &collector,
+            lifecycle_leader: true,
+        };
+        handle_text(raw, &mut sub, &mut buf, &context, 123).unwrap();
+        assert_eq!(buf.len(), 1);
+        assert!(matches!(buf[0].event, Event::NewMarket { .. }));
+    }
+
+    #[test]
+    fn every_subscription_enables_custom_market_events() {
+        let mut sub = SubState::default();
+        let initial = subscribe_payload(&mut sub, &["a".into()]);
+        assert_eq!(initial["type"], "market");
+        assert_eq!(initial["custom_feature_enabled"], true);
+
+        let dynamic = subscribe_payload(&mut sub, &["b".into()]);
+        assert_eq!(dynamic["operation"], "subscribe");
+        assert_eq!(dynamic["custom_feature_enabled"], true);
+    }
+
+    #[test]
+    fn lifecycle_leader_can_subscribe_without_assets() {
+        let mut sub = SubState::default();
+        let initial = subscribe_payload(&mut sub, &[]);
+        assert_eq!(initial["assets_ids"], serde_json::json!([]));
+        assert_eq!(initial["type"], "market");
+        assert_eq!(initial["custom_feature_enabled"], true);
     }
 
     #[tokio::test]
