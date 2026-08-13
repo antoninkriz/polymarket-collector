@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use redis::streams::{StreamReadOptions, StreamReadReply};
-use redis::AsyncCommands;
+use redis::{AsyncCommands, AsyncConnectionConfig};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -20,6 +20,7 @@ use polymarket_orderbook_rust::sink::SinkItem;
 
 const READ_COUNT: usize = 1_000;
 const READ_BLOCK_MS: usize = 1_000;
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 
 // XACK and XDEL must be one operation: after ClickHouse commits, either the
 // entry remains pending and replayable or it is both acknowledged and removed.
@@ -101,8 +102,12 @@ async fn consume_once(
 ) -> Result<()> {
     let client = redis::Client::open(cfg.redis_url.as_str())
         .with_context(|| format!("invalid REDIS_URL: {}", cfg.redis_url))?;
+    // redis-rs 1.5 defaults to a 500 ms response timeout, which is shorter
+    // than this consumer's intentional one-second blocking stream read.
+    let connection_config =
+        AsyncConnectionConfig::new().set_response_timeout(Some(RESPONSE_TIMEOUT));
     let mut conn = client
-        .get_multiplexed_async_connection()
+        .get_multiplexed_async_connection_with_config(&connection_config)
         .await
         .context("open Redis stream connection")?;
     ensure_consumer_group(&mut conn, cfg).await?;

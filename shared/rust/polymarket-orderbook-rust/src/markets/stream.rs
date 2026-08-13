@@ -15,11 +15,12 @@
 //! switches to `">"` for new messages.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use redis::aio::MultiplexedConnection;
 use redis::streams::{StreamReadOptions, StreamReadReply};
-use redis::AsyncCommands;
+use redis::{AsyncCommands, AsyncConnectionConfig};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -29,6 +30,7 @@ use crate::ws::pool::Pool;
 
 const READ_COUNT: usize = 10;
 const READ_BLOCK_MS: usize = 1000;
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct StreamConfig {
     pub redis_url: String,
@@ -42,8 +44,12 @@ pub struct StreamConfig {
 /// pool to dispatch subscribe / unsubscribe calls.
 pub async fn run(cfg: StreamConfig, pool: Arc<Mutex<Pool>>) -> Result<()> {
     let client = redis::Client::open(cfg.redis_url.as_str()).context("open redis client")?;
+    // redis-rs 1.5 defaults to a 500 ms response timeout, which is shorter
+    // than this consumer's intentional one-second blocking stream read.
+    let connection_config =
+        AsyncConnectionConfig::new().set_response_timeout(Some(RESPONSE_TIMEOUT));
     let mut conn = client
-        .get_multiplexed_async_connection()
+        .get_multiplexed_async_connection_with_config(&connection_config)
         .await
         .context("connect redis")?;
 
