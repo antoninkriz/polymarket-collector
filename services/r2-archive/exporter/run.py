@@ -389,7 +389,7 @@ def query_latest_received_hour() -> datetime | None:
 
 def fetch_hour_parquet(hour: datetime) -> bytes | None:
     """Fetch one hour of rows via the active profile's SELECT template,
-    encode as Parquet with DELTA on integer timestamps + ZSTD(9) dict
+    encode as Parquet with DELTA on integer timestamps + ZSTD(1) dict
     elsewhere, and return the bytes (or ``None`` for an empty hour).
     """
     target = hour.strftime("%Y-%m-%d %H:00:00")
@@ -525,7 +525,6 @@ def export_hour(client: R2Client, hour: datetime) -> bool:
     if PROFILE.name == "polymarket_v3":
         row_count = pq.read_metadata(BytesIO(data)).num_rows
         manifest = {
-            "schema_version": 3,
             "file": filename,
             "hour_utc": hour.isoformat(),
             "row_count": row_count,
