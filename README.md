@@ -25,7 +25,7 @@ Polymarket WS ──▶ polymarket-orderbook-rust-pubsub ──▶ Redis Stream 
 - `services/polymarket/polymarket-orderbook-rust-from-pubsub` — Rust; consumes the
   stream and acknowledges rows only after the compact raw v3 ClickHouse insert.
   Logical ad-hoc reads use `FINAL` to collapse same-sequence transport retries.
-- `services/r2-archive/exporter` — projects typed hourly Parquet to the bucket
+- `services/r2-archive/exporter` — projects one typed Parquet per event/hour
   named by `R2_BUCKET`.
 - `shared/rust/polymarket-orderbook-rust` — shared library crate (WS pool, REST
   client, ClickHouse sink, event types) used by both Rust binaries.

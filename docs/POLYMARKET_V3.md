@@ -89,47 +89,75 @@ acknowledges and removes a Redis Stream entry only after ClickHouse commits it.
 
 ## Parquet export
 
-The exporter reads the raw table with `FINAL`, projects JSON into typed columns,
-orders by `(market, sequence)`, and writes ZSTD level 1 Parquet:
+The exporter reads the raw table with `FINAL` and writes one ZSTD level 1
+Parquet file per event type and UTC receive-time hour:
 
-| Column | Arrow/Parquet type | Nullable |
-|---|---|---:|
-| `timestamp_received` | `timestamp[ns, UTC]` | no |
-| `sequence` | `uint64` | no |
-| `timestamp` | `timestamp[ms, UTC]` | no |
-| `market` | `fixed_size_binary[32]` | no |
-| `event_type` | `string` | no |
-| `asset_id` | `fixed_size_binary[32]` | yes |
-| `assets_ids` | `list<fixed_size_binary[32]>` | no |
-| `outcomes` | `list<string>` | no |
-| `bids`, `asks` | JSON `string` | yes |
-| `price`, `best_bid`, `best_ask`, `spread` | `decimal(9, 4)` | yes |
-| `size` | `decimal(18, 6)` | yes |
-| `side` | `string` | yes |
-| `fee_rate_bps` | `uint16` | yes |
-| `transaction_hash` | `fixed_size_binary[32]` | yes |
-| `old_tick_size`, `new_tick_size` | `decimal(9, 4)` | yes |
-| `winning_asset_id` | `fixed_size_binary[32]` | yes |
-| `winning_outcome` | `string` | yes |
+```text
+2026-08-13/14/
+├── best_bid_ask.parquet
+├── book.parquet
+├── last_trade_price.parquet
+├── market_resolved.parquet
+├── new_market.parquet
+├── price_change.parquet
+├── tick_size_change.parquet
+└── manifest.json
+```
+
+The date is ISO ordered and the hour is always zero-padded from `00` through
+`23`. The directory and filename encode the hour and event type, so neither is
+repeated as a Parquet column.
+
+Every file has these non-null common columns:
+
+| Column | Arrow/Parquet type |
+|---|---|
+| `timestamp_received` | `timestamp[ns, UTC]` |
+| `sequence` | `uint64` |
+| `timestamp` | `timestamp[ms, UTC]` |
+| `market` | `fixed_size_binary[32]` |
+
+The remaining columns are specific to the file:
+
+| File | Event-owned columns |
+|---|---|
+| `book.parquet` | `asset_id`, `bids`, `asks` |
+| `price_change.parquet` | `asset_id`, `price`, `size`, `side`, `best_bid?`, `best_ask?` |
+| `last_trade_price.parquet` | `asset_id`, `price`, `size`, `side`, `fee_rate_bps`, `transaction_hash` |
+| `tick_size_change.parquet` | `asset_id`, `old_tick_size`, `new_tick_size` |
+| `best_bid_ask.parquet` | `asset_id`, `best_bid?`, `best_ask?`, `spread?` |
+| `new_market.parquet` | `id`, `assets_ids`, `outcomes`, `question?`, `slug?` |
+| `market_resolved.parquet` | `id`, `assets_ids`, `winning_asset_id?`, `winning_outcome?` |
+
+`asset_id`, `winning_asset_id`, and entries in `assets_ids` are
+`fixed_size_binary[32]`; transaction hashes and market condition IDs use the
+same width. Prices and tick sizes are `decimal(9, 4)`, sizes are
+`decimal(18, 6)`, and `fee_rate_bps` is `uint16`. `bids` and `asks` retain the
+compact JSON array representation. A `?` marks genuine source nullability, not
+an unrelated column made nullable by combining different event schemas.
 
 Market condition IDs and transaction hashes are decoded from hexadecimal;
 every singular or list-valued token ID is decoded as an unsigned 256-bit
 integer. These identifier columns therefore use the same 32-byte big-endian
 representation as `pmxtdata`'s processed identifier columns.
 The export aborts rather than padding malformed hexadecimal IDs or wrapping an
-out-of-range decimal token ID. `assets_ids` and `outcomes` are empty lists for
-non-lifecycle events; scalar event-specific columns are null when they do not
-apply. A missing side of `best_bid_ask` remains null rather than being changed
-to a zero price.
+out-of-range decimal token ID. A missing optional price remains null rather
+than being changed to zero.
 
-The sidecar manifest is only an upload-completion marker with row count, byte
-size, digest, source table, and sort order. It is not inserted into the data.
+Each event file is ordered by `sequence`. The exporter writes all seven files,
+including correctly typed zero-row files, before uploading `manifest.json`.
+The manifest lists every file's columns, row count, byte size, digest, and
+minimum/maximum sequence, plus the hour-wide row count and sequence range. Its
+presence is the sole completion marker; data objects left by an interrupted
+attempt are overwritten on retry and are not considered a completed hour.
 
 ## Replay
 
+To replay the complete observed stream, open the seven files for an hour and
+k-way merge their rows by `sequence`; a sequence belongs to exactly one file.
 For one market:
 
-1. Read logical rows (`FINAL`) in ascending `sequence`.
+1. Filter or merge the event files for that market in ascending `sequence`.
 2. For each asset, begin at its first `book`; the snapshot replaces all depth.
 3. Apply each `price_change` by assigning `size` at `(side, price)`; zero size
    removes the level.
