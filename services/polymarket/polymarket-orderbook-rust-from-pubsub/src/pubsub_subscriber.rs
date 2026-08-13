@@ -200,6 +200,21 @@ fn preview(payload: &str) -> String {
     if payload.len() <= MAX {
         payload.to_string()
     } else {
-        format!("{}…", &payload[..payload.floor_char_boundary(MAX)])
+        let mut end = MAX;
+        while !payload.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &payload[..end])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preview;
+
+    #[test]
+    fn preview_does_not_split_a_utf8_character() {
+        let payload = format!("{}é-tail", "a".repeat(199));
+        assert_eq!(preview(&payload), format!("{}…", "a".repeat(199)));
     }
 }
