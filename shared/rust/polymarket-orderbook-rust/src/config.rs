@@ -42,13 +42,6 @@ pub struct Config {
     pub flush_batch_size: usize,
     pub flush_interval: Duration,
 
-    // -- Redundant connections ------------------------------------------------
-    /// Time-to-live for the global dedup cache. Entries survive at least
-    /// `dedup_ttl / 2` and at most `dedup_ttl`. Must be comfortably larger
-    /// than the expected inter-arrival skew between two connections
-    /// receiving the same event (sub-second typically).
-    pub dedup_ttl: Duration,
-
     // -- ClickHouse TTL ------------------------------------------------------
     /// Optional row-level TTL in minutes applied to `timestamp_received`.
     /// When set, ClickHouse automatically drops rows older than this.
@@ -100,9 +93,6 @@ impl Config {
             max_assets_per_conn: env_parse("MAX_ASSETS_PER_CONN", 200)?,
             flush_batch_size: DEFAULT_FLUSH_BATCH_SIZE,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
-
-            // Redundant connections
-            dedup_ttl: Duration::from_secs(env_parse("DEDUP_TTL_SECONDS", 10_u64)?),
 
             // ClickHouse TTL
             ttl_minutes: env_parse("TTL_MINUTES", 0_u64)?,

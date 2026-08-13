@@ -31,13 +31,6 @@ const CH_TABLE: &str = "polymarket_orderbook_rust_test_typed_cli";
 const CH_V3_TABLE: &str = "polymarket_orderbook_rust_test_v3_cli";
 
 async fn drop_v3_objects(http: &Client) -> Result<()> {
-    for suffix in ["_final", "_ingestion_health", "_publisher_sessions"] {
-        query(
-            http,
-            &format!("DROP VIEW IF EXISTS {CH_DATABASE}.{CH_V3_TABLE}{suffix}"),
-        )
-        .await?;
-    }
     query(
         http,
         &format!("DROP TABLE IF EXISTS {CH_DATABASE}.{CH_V3_TABLE}"),
@@ -252,7 +245,7 @@ async fn typed_sink_writes_to_clickhouse_end_to_end() -> Result<()> {
 
 #[tokio::test]
 #[ignore]
-async fn v3_sink_deduplicates_only_transport_retries() -> Result<()> {
+async fn v3_sink_collapses_only_same_sequence_retry() -> Result<()> {
     let http = Client::new();
     drop_v3_objects(&http).await?;
 

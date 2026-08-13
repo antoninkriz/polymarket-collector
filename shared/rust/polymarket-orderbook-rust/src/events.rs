@@ -83,8 +83,8 @@ pub struct WireBook {
     pub timestamp: String,
     pub bids: Vec<WireLevel>,
     pub asks: Vec<WireLevel>,
-    /// Polymarket content hash. Always present in real frames; required so the
-    /// dedup path in the wrapper layer can rely on it without a fallback.
+    /// Polymarket content hash. Parsed for legacy sinks; compact v3 storage
+    /// deliberately strips it because it is not a unique event identifier.
     pub hash: String,
 }
 
@@ -107,8 +107,8 @@ pub struct WirePriceChangeEntry {
     pub best_bid: Option<Decimal>,
     #[serde(default, with = "rust_decimal::serde::str_option")]
     pub best_ask: Option<Decimal>,
-    /// Polymarket content hash. Always present in real frames; required so the
-    /// dedup path in the wrapper layer can rely on it without a fallback.
+    /// Polymarket content hash. Parsed for legacy sinks; compact v3 storage
+    /// deliberately strips it because it is not a unique event identifier.
     pub hash: String,
 }
 
