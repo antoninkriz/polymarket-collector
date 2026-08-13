@@ -517,7 +517,7 @@ impl Sink {
                 PARTITION BY toStartOfHour(timestamp_received)
                 ORDER BY (
                     market, asset_id, collector_session_id,
-                    receive_sequence, row_index
+                    message_id, row_index, receive_sequence
                 ){ttl_clause}",
                 self.cfg.table
             ),

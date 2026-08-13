@@ -66,7 +66,8 @@ The `polymarket_orderbook_v3` table contains:
 - nullable typed price, size, side, BBO, fee, transaction, and tick-size fields;
 - the raw parent message for audit and forward-compatible reparsing.
 
-The table uses `ReplacingMergeTree`. Its key retains every distinct collector
+The table uses `ReplacingMergeTree`. Its key includes the collector-generated
+`message_id, row_index` identity, retaining every distinct collector
 observation while collapsing retries of the same collector row. Hourly export
 queries use `FINAL`, so Parquet never depends on background merge timing.
 
