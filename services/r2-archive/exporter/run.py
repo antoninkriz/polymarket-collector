@@ -1,17 +1,17 @@
 """Hourly orderbook → Cloudflare R2 exporter.
 
 Reads one hour of orderbook rows from ClickHouse, re-encodes to Parquet
-with DELTA_BINARY_PACKED on integer timestamp columns and ZSTD(9)
+with DELTA_BINARY_PACKED on integer timestamp columns and ZSTD(1)
 dictionary encoding elsewhere, and uploads to R2. ClickHouse's own
 FORMAT Parquet writer never emits DELTA, so we fetch FORMAT ArrowStream
 and re-encode client-side (pass 6 in docs/data-dump-optimizations.md).
 
 Profiles, selected via ``EXPORTER_PROFILE`` env (default ``polymarket_v3``):
 
-* ``polymarket_v3`` — exports the replayable typed
-  ``polymarket_orderbook_v3`` table. ``FINAL`` removes only collector-owned
-  transport retries, and rows are ordered by collector session and receive
-  sequence without regrouping the two market assets.
+* ``polymarket_v3`` — projects the compact raw
+  ``polymarket_orderbook_v3`` table into typed Parquet. ``FINAL`` removes
+  collector-owned retries by sequence. Market, asset, and transaction IDs are
+  emitted as 32-byte fixed-size binary values.
 
 * ``polymarket`` — legacy v2 compatibility profile. Rewrites the raw-JSON
   ``polymarket_orderbook_rust``
@@ -69,7 +69,7 @@ R2_BUCKET = os.environ.get("R2_BUCKET", "")
 
 # Export
 PARQUET_COMPRESSION = "zstd"
-PARQUET_COMPRESSION_LEVEL = 9
+PARQUET_COMPRESSION_LEVEL = 1
 EXPORT_DELAY_MINUTES = int(os.environ.get("EXPORT_DELAY_MINUTES", "5"))
 EXPORT_LAG_HOURS = int(os.environ.get("EXPORT_LAG_HOURS", "1"))
 LOOP_CHECK_INTERVAL_SECONDS = int(os.environ.get("LOOP_CHECK_INTERVAL_SECONDS", "60"))
@@ -166,7 +166,53 @@ FORMAT ArrowStream
 """
 
 POLYMARKET_V3_SELECT_TEMPLATE = """
-SELECT * FROM {source_table} FINAL
+SELECT
+    timestamp_received,
+    sequence,
+    fromUnixTimestamp64Milli(
+        toInt64OrZero(JSONExtractString(data, 'timestamp')),
+        'UTC'
+    ) AS timestamp,
+    toFixedString(
+        unhex(substring(JSONExtractString(data, 'market'), 3)),
+        32
+    ) AS market,
+    JSONExtractString(data, 'event_type') AS event_type,
+    toFixedString(
+        unhex(leftPad(hex(toUInt256(JSONExtractString(data, 'asset_id'))), 64, '0')),
+        32
+    ) AS asset_id,
+
+    if(event_type = 'book', JSONExtractRaw(data, 'bids'), NULL) AS bids,
+    if(event_type = 'book', JSONExtractRaw(data, 'asks'), NULL) AS asks,
+
+    if(event_type IN ('price_change', 'last_trade_price'),
+       toDecimal32OrZero(JSONExtractString(data, 'price'), 4), NULL) AS price,
+    if(event_type IN ('price_change', 'last_trade_price'),
+       toDecimal64OrZero(JSONExtractString(data, 'size'), 6), NULL) AS size,
+    if(event_type IN ('price_change', 'last_trade_price'),
+       JSONExtractString(data, 'side'), NULL) AS side,
+
+    if(event_type = 'price_change',
+       toDecimal32OrZero(JSONExtractString(data, 'best_bid'), 4), NULL) AS best_bid,
+    if(event_type = 'price_change',
+       toDecimal32OrZero(JSONExtractString(data, 'best_ask'), 4), NULL) AS best_ask,
+
+    if(event_type = 'last_trade_price',
+       toUInt16OrZero(JSONExtractString(data, 'fee_rate_bps')), NULL) AS fee_rate_bps,
+    if(event_type = 'last_trade_price',
+       toFixedString(
+           unhex(substring(JSONExtractString(data, 'transaction_hash'), 3)),
+           32
+       ), NULL) AS transaction_hash,
+
+    if(event_type = 'tick_size_change',
+       toDecimal32OrZero(JSONExtractString(data, 'old_tick_size'), 4), NULL)
+       AS old_tick_size,
+    if(event_type = 'tick_size_change',
+       toDecimal32OrZero(JSONExtractString(data, 'new_tick_size'), 4), NULL)
+       AS new_tick_size
+FROM {source_table} FINAL
 WHERE timestamp_received >= toDateTime64('{target}', 9, 'UTC')
   AND timestamp_received <  toDateTime64('{target}', 9, 'UTC') + INTERVAL 1 HOUR
 ORDER BY {order_by}
@@ -180,24 +226,12 @@ PROFILES: dict[str, Profile] = {
         delta_encoded_columns=(
             "timestamp",
             "timestamp_received",
-            "collector_session_started_at",
-            "publisher_fence",
-            "connection_id",
-            "connection_epoch",
-            "frame_sequence",
-            "receive_sequence",
-            "message_index",
-            "message_count",
-            "row_index",
-            "row_count",
+            "sequence",
             "fee_rate_bps",
         ),
         default_select_order_by=(
-            "collector_session_started_at",
-            "collector_session_id",
-            "receive_sequence",
-            "message_index",
-            "row_index",
+            "market",
+            "sequence",
         ),
         select_template=POLYMARKET_V3_SELECT_TEMPLATE,
     ),
