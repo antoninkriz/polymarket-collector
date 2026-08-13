@@ -5,13 +5,11 @@
 //! instead of inserting into ClickHouse.
 //!
 //! ```text
-//!   Redis cache / Gamma API ──┐
-//!                             │
-//!                             v
-//!   WS pool ── (mpsc) ──> Redis XADD (durable stream)
-//!     ^
-//!     │
-//!   Redis stream listener (market lifecycle)
+//!   Redis cache / Gamma API ──> initial market set ──┐
+//!   Redis lifecycle stream ──> reconciliation ───────┤
+//!   WS lifecycle leader ──> immediate updates ───────┤
+//!                                                   v
+//!   Polymarket WS pool ── (mpsc) ──> Redis XADD (durable event stream)
 //! ```
 
 use std::sync::Arc;
