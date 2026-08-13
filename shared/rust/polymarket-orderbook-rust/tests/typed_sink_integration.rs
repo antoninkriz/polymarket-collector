@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use polymarket_orderbook_rust::events::{Event, Level};
-use polymarket_orderbook_rust::sink::{Sink, SinkConfig, SinkSchema};
+use polymarket_orderbook_rust::sink::{Sink, SinkConfig, SinkItem, SinkSchema};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use tokio::sync::mpsc;
@@ -70,8 +70,8 @@ async fn typed_sink_writes_to_clickhouse_end_to_end() -> Result<()> {
     })
     .await?;
 
-    let (tx, rx) = mpsc::channel::<Event>(16);
-    let handle = tokio::spawn(sink.run(rx));
+    let (tx, rx) = mpsc::channel::<SinkItem>(16);
+    let handle = tokio::spawn(sink.run(rx, None));
 
     // One event of each variant — covers every column-population pattern
     // from docs/data-dump-optimizations.md.
@@ -114,7 +114,7 @@ async fn typed_sink_writes_to_clickhouse_end_to_end() -> Result<()> {
         },
     ];
     for ev in events {
-        tx.send(ev).await?;
+        tx.send(ev.into()).await?;
     }
     // Dropping the tx closes the channel — sink drains and exits.
     drop(tx);

@@ -17,9 +17,9 @@
 //! - Wire `bids`/`asks` come in as `[{"price": "0.41", "size": "100"}, ...]`
 //!   but the storage shape is `[["0.41", "100"], ...]`. [`Level`]'s custom
 //!   `Serialize` impl emits the array form; [`WireLevel`] parses the object form.
-//! - The storage JSON intentionally **omits `timestamp`** — `timestamp` is
-//!   promoted to its own ClickHouse column. The `timestamp` field on each
-//!   [`Event`] variant is therefore `#[serde(skip_serializing)]`.
+//! - `Event` includes the source `timestamp` so the durable v3 Redis record
+//!   is self-contained. ClickHouse v3 also promotes its parsed value and
+//!   retains the original string as `timestamp_raw`.
 //! - Field order on each variant matches Python's dict insertion order in
 //!   `sink.py::_serialize_event`.
 //!
@@ -577,7 +577,7 @@ mod tests {
 
     /// Round-trip via `serde_json::Value` to compare structurally rather
     /// than by byte order; we still assert specific keys are present /
-    /// absent and that decimal formatting matches Python.
+    /// present and that decimal formatting matches the wire representation.
     fn to_value(ev: &Event) -> Value {
         serde_json::to_value(ev).unwrap()
     }
@@ -600,8 +600,7 @@ mod tests {
         assert_eq!(v["bids"], serde_json::json!([["0.41", "100"]]));
         assert_eq!(v["asks"], serde_json::json!([["0.42", "200"]]));
         assert_eq!(v["hash"], "h");
-        // timestamp must NOT appear in the data JSON.
-        assert!(v.get("timestamp").is_none(), "timestamp leaked into data column");
+        assert_eq!(v["timestamp"], "1757908892351");
     }
 
     #[test]
@@ -639,7 +638,7 @@ mod tests {
         assert_eq!(v["size"], "100");
         assert_eq!(v["side"], "BUY");
         assert_eq!(v["hash"], "h");
-        assert!(v.get("timestamp").is_none());
+        assert_eq!(v["timestamp"], "1");
     }
 
     #[test]
@@ -680,7 +679,7 @@ mod tests {
         assert_eq!(v["side"], "BUY");
         assert_eq!(v["fee_rate_bps"], "10");
         assert_eq!(v["transaction_hash"], "0xtx");
-        assert!(v.get("timestamp").is_none());
+        assert_eq!(v["timestamp"], "1");
     }
 
     #[test]
@@ -696,7 +695,7 @@ mod tests {
         assert_eq!(v["event_type"], "tick_size_change");
         assert_eq!(v["old_tick_size"], "0.01");
         assert_eq!(v["new_tick_size"], "0.001");
-        assert!(v.get("timestamp").is_none());
+        assert_eq!(v["timestamp"], "1");
     }
 
     // ---- strip_hash -----------------------------------------------------

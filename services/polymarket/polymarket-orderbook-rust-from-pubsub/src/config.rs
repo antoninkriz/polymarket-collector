@@ -13,7 +13,9 @@ pub const DEFAULT_FLUSH_INTERVAL_MS: u64 = 500;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub redis_url: String,
-    pub redis_pubsub_channel: String,
+    pub redis_event_stream: String,
+    pub stream_consumer_group: String,
+    pub stream_consumer_name: String,
     pub pubsub_reconnect_delay: Duration,
     pub clickhouse_url: String,
     pub clickhouse_user: String,
@@ -35,7 +37,9 @@ impl Config {
 
         Ok(Self {
             redis_url: require_env("REDIS_URL")?,
-            redis_pubsub_channel: env_or("REDIS_PUBSUB_CHANNEL", "polymarket:events"),
+            redis_event_stream: env_or("REDIS_EVENT_STREAM", "polymarket:events:v3"),
+            stream_consumer_group: env_or("EVENT_CONSUMER_GROUP", "polymarket-clickhouse-v3"),
+            stream_consumer_name: env_or("EVENT_CONSUMER_NAME", "polymarket-clickhouse-v3-1"),
             pubsub_reconnect_delay: Duration::from_millis(env_u64_or(
                 "PUBSUB_RECONNECT_DELAY_MS",
                 2_000,
@@ -44,7 +48,7 @@ impl Config {
             clickhouse_user: env_or("CLICKHOUSE_USER", "default"),
             clickhouse_password: env_or("CLICKHOUSE_PASSWORD", ""),
             clickhouse_database: env_or("CLICKHOUSE_DATABASE", "default"),
-            clickhouse_table: env_or("CLICKHOUSE_TABLE", "polymarket_orderbook_rust"),
+            clickhouse_table: env_or("CLICKHOUSE_TABLE", "polymarket_orderbook_v3"),
             drop_table_on_start: env_bool("DROP_TABLE_ON_START"),
             exclude_hash: env_bool_default("EXCLUDE_HASH", true),
             flush_batch_size: env_usize_or("FLUSH_BATCH_SIZE", DEFAULT_FLUSH_BATCH_SIZE)?,

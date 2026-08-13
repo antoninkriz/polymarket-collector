@@ -18,8 +18,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use polymarket_orderbook_rust::events::Event;
-use polymarket_orderbook_rust::sink::{Sink, SinkConfig, SinkSchema};
+use polymarket_orderbook_rust::sink::{Sink, SinkConfig, SinkItem, SinkSchema};
 
 use polymarket_orderbook_rust_from_pubsub::config::Config;
 use polymarket_orderbook_rust_from_pubsub::pubsub_subscriber::{
@@ -40,7 +39,7 @@ async fn main() -> Result<()> {
 
     info!(
         redis_url = %cfg.redis_url,
-        pubsub_channel = %cfg.redis_pubsub_channel,
+        event_stream = %cfg.redis_event_stream,
         clickhouse_url = %cfg.clickhouse_url,
         clickhouse_database = %cfg.clickhouse_database,
         clickhouse_table = %cfg.clickhouse_table,
@@ -51,7 +50,8 @@ async fn main() -> Result<()> {
         "starting polymarket-orderbook-rust-from-pubsub",
     );
 
-    let (event_tx, event_rx) = mpsc::channel::<Event>(cfg.queue_size);
+    let (event_tx, event_rx) = mpsc::channel::<SinkItem>(cfg.queue_size);
+    let (ack_tx, ack_rx) = mpsc::channel::<Vec<String>>(1_000);
     let sink = Sink::connect(SinkConfig {
         url: cfg.clickhouse_url.clone(),
         user: cfg.clickhouse_user.clone(),
@@ -63,21 +63,24 @@ async fn main() -> Result<()> {
         batch_size: cfg.flush_batch_size,
         flush_interval: cfg.flush_interval,
         ttl_minutes: cfg.ttl_minutes,
-        schema: SinkSchema::Raw,
+        schema: SinkSchema::V3,
     })
     .await
     .context("connect Polymarket ClickHouse sink")?;
-    let mut sink_handle: JoinHandle<Result<()>> = tokio::spawn(sink.run(event_rx));
+    let mut sink_handle: JoinHandle<Result<()>> = tokio::spawn(sink.run(event_rx, Some(ack_tx)));
 
     let stats = SubscriberStats::new();
     let subscriber_cfg = PubSubSubscriberConfig {
         redis_url: cfg.redis_url.clone(),
-        channel: cfg.redis_pubsub_channel.clone(),
+        stream: cfg.redis_event_stream.clone(),
+        group: cfg.stream_consumer_group.clone(),
+        consumer: cfg.stream_consumer_name.clone(),
         reconnect_delay: cfg.pubsub_reconnect_delay,
     };
     let subscriber_handle = tokio::spawn(pubsub_subscriber::run(
         subscriber_cfg,
         event_tx.clone(),
+        ack_rx,
         Arc::clone(&stats),
     ));
 
@@ -105,7 +108,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn stats_loop(event_tx: mpsc::Sender<Event>, stats: Arc<SubscriberStats>) {
+async fn stats_loop(event_tx: mpsc::Sender<SinkItem>, stats: Arc<SubscriberStats>) {
     use std::sync::atomic::Ordering;
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -125,6 +128,7 @@ async fn stats_loop(event_tx: mpsc::Sender<Event>, stats: Arc<SubscriberStats>) 
             queue_pct = format!("{queue_pct:.1}"),
             events_received = stats.events_received.load(Ordering::Relaxed),
             events_forwarded = stats.events_forwarded.load(Ordering::Relaxed),
+            events_acked = stats.events_acked.load(Ordering::Relaxed),
             parse_failures = stats.parse_failures.load(Ordering::Relaxed),
             reconnects = stats.reconnects.load(Ordering::Relaxed),
             "[POLYMARKET-FROM-PUBSUB-STATS]",
