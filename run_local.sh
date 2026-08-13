@@ -144,7 +144,10 @@ start_stack() {
         obdata-clickhouse sh -ec \
         'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --query "SELECT 1"'
 
-    "${LOCAL_COMPOSE[@]}" up -d --build "${APPLICATION_SERVICES[@]}"
+    # podman-compose does not consistently replace containers after rebuilding
+    # their images, so make the deployment of freshly built code explicit.
+    "${LOCAL_COMPOSE[@]}" up -d --build --force-recreate \
+        "${APPLICATION_SERVICES[@]}"
 
     cat <<EOF
 
