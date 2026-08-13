@@ -3,7 +3,7 @@ name: obdata-infra
 services:
 
   dozzle:
-    image: amir20/dozzle:v9.0.3
+    image: amir20/dozzle:v10.7.1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
@@ -13,7 +13,7 @@ services:
       - DOZZLE_BASE=/
 
   obdata-clickhouse:
-    image: clickhouse/clickhouse-server:25.8
+    image: clickhouse/clickhouse-server:26.7.3.19
     container_name: obdata-clickhouse
     restart: unless-stopped
     networks:
@@ -38,7 +38,7 @@ services:
         hard: 262144
 
   obdata-redis:
-    image: redis:7-alpine
+    image: redis:8.10.0-trixie
     container_name: obdata-redis
     restart: unless-stopped
     networks:

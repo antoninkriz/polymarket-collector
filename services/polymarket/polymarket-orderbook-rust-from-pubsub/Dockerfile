@@ -4,7 +4,7 @@
 #
 #   docker build -f services/polymarket/polymarket-orderbook-rust-from-pubsub/Dockerfile .
 
-FROM rust:1.94-slim-bookworm AS builder
+FROM rust:1.97.1-slim-trixie AS builder
 
 WORKDIR /build
 
@@ -27,7 +27,7 @@ RUN cargo build --release --locked \
     && strip target/release/polymarket-orderbook-rust-from-pubsub
 
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
