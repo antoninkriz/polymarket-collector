@@ -41,13 +41,6 @@ class RedisStreamPublisher:
             self._redis = None
         log.info("RedisStreamPublisher closed")
 
-    async def __aenter__(self) -> RedisStreamPublisher:
-        await self.connect()
-        return self
-
-    async def __aexit__(self, *args: object) -> None:
-        await self.close()
-
     async def publish(self, data: dict[str, str]) -> str:
         """Publish a message to the stream.
 

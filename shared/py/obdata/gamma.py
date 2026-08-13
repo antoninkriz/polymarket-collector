@@ -88,17 +88,11 @@ def parse_markets(raw_markets: list[dict]) -> ActiveMarkets:
     )
 
 
-async def fetch_active_markets_from_gamma(
-    since: Optional[datetime] = None,
-) -> ActiveMarkets:
+async def fetch_active_markets_from_gamma() -> ActiveMarkets:
     """Fetch all active binary markets from the Gamma API via keyset pagination.
 
     Uses the /markets/keyset endpoint, which is cursor-based and has no
     offset cap (the legacy /markets endpoint rejects offsets above ~10,000).
-
-    Args:
-        since: Only return markets started after this UTC datetime.
-              When None, fetches all active markets.
 
     Returns:
         ActiveMarkets with binary subscriptions and the min/max startDate
@@ -109,9 +103,6 @@ async def fetch_active_markets_from_gamma(
         "closed": "false",
         "limit": FETCH_BATCH_SIZE,
     }
-    if since is not None:
-        base_params["start_date_min"] = since.strftime("%Y-%m-%dT%H:%M:%SZ")
-
     raw_markets: list[dict] = []
     cursor: Optional[str] = None
 

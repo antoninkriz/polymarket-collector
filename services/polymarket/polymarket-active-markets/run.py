@@ -1,14 +1,7 @@
-"""Simplified Polymarket active markets tracker with resolution polling.
+"""Polymarket active-markets tracker with lifecycle polling.
 
-Fetches all active binary markets from the Gamma API (no Redis cache),
-then polls for resolved markets and publishes market_resolved events
-to Redis streams.
-
-Resolution poller strategy:
-  Track a `closed_time_min` watermark initialized to poller start time.
-  Each cycle queries closed markets with closed_time_min = watermark - 30m
-  overlap (to absorb Gamma API propagation delay), then advances the
-  watermark to the max closedTime observed.
+Fetches all active binary markets from Gamma, maintains their Redis cache,
+and publishes new/resolved market events to a Redis Stream.
 
 Usage:
     python run.py
@@ -368,10 +361,6 @@ async def _new_markets_poller(
       endDate                  → scheduled market close / resolution deadline
       closedTime               → market actually resolved and closed
 
-    Legacy fields (always null on current CLOB markets):
-      fundedTimestamp          → was: initial AMM liquidity deposited
-      readyTimestamp           → was: AMM market infrastructure ready
-
     Most markets have automaticallyActive=true, meaning the system flips them
     active once the deploy → acceptingOrders → start pipeline completes.
     """
@@ -423,7 +412,7 @@ async def _log_stats(active_markets: dict[str, MarketSubscription]) -> None:
 
 
 async def _run(poll_interval: int) -> None:
-    """Run the simplified active markets tracker."""
+    """Run the active-markets tracker."""
     redis_url = require_redis_url()
 
     cache = RedisMarketCache(redis_url)
@@ -492,7 +481,7 @@ async def _run(poll_interval: int) -> None:
     help="Seconds between Gamma API resolution polls.",
 )
 def main(poll_interval: int) -> None:
-    """Simplified Polymarket active markets tracker with resolution polling."""
+    """Track active Polymarket markets and publish lifecycle events."""
     load_dotenv()
     logging.basicConfig(
         level=logging.INFO,
