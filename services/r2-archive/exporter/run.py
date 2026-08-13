@@ -49,6 +49,15 @@ DELTA_ENCODED_COLUMNS = (
     "sequence",
     "fee_rate_bps",
 )
+PARQUET_DECIMAL_TYPES: dict[str, pa.DataType] = {
+    "price": pa.decimal32(9, 4),
+    "best_bid": pa.decimal32(9, 4),
+    "best_ask": pa.decimal32(9, 4),
+    "spread": pa.decimal32(9, 4),
+    "old_tick_size": pa.decimal32(9, 4),
+    "new_tick_size": pa.decimal32(9, 4),
+    "size": pa.decimal64(18, 6),
+}
 SELECT_ORDER_BY = ("sequence",)
 EXPORT_DELAY_MINUTES = int(os.environ.get("EXPORT_DELAY_MINUTES", "5"))
 EXPORT_LAG_HOURS = int(os.environ.get("EXPORT_LAG_HOURS", "1"))
@@ -323,6 +332,22 @@ def fetch_event_table(hour: datetime, event_type: str) -> pa.Table:
 
 def table_to_parquet(table: pa.Table) -> bytes:
     """Encode a typed event table as ZSTD level 1 Parquet."""
+    fields = [
+        pa.field(
+            field.name,
+            PARQUET_DECIMAL_TYPES.get(field.name, field.type),
+            nullable=field.nullable,
+            metadata=field.metadata,
+        )
+        for field in table.schema
+    ]
+    target_schema = pa.schema(fields, metadata=table.schema.metadata)
+    if not table.schema.equals(target_schema):
+        # ClickHouse's Arrow stream exposes Decimal32/Decimal64 as decimal128.
+        # Narrow them losslessly before Parquet serialization so readers see
+        # the intended widths and Parquet can use physical INT32/INT64.
+        table = table.cast(target_schema, safe=True)
+
     delta_cols = [c for c in DELTA_ENCODED_COLUMNS if c in table.column_names]
     dict_cols = [c for c in table.column_names if c not in delta_cols]
 
@@ -335,6 +360,7 @@ def table_to_parquet(table: pa.Table) -> bytes:
         use_dictionary=dict_cols,  # pyright: ignore[reportArgumentType]
         column_encoding={c: "DELTA_BINARY_PACKED" for c in delta_cols},
         data_page_version="2.0",
+        store_decimal_as_integer=True,
     )
     return out.getvalue()
 

@@ -149,10 +149,11 @@ The remaining columns are specific to the file:
 
 `asset_id`, `winning_asset_id`, and entries in `assets_ids` are
 `fixed_size_binary[32]`; transaction hashes and market condition IDs use the
-same width. Prices and tick sizes are `decimal(9, 4)`, sizes are
-`decimal(18, 6)`, and `fee_rate_bps` is `uint16`. `bids` and `asks` retain the
-compact JSON array representation. A `?` marks genuine source nullability, not
-an unrelated column made nullable by combining different event schemas.
+same width. Prices and tick sizes are Arrow `decimal32(9, 4)` backed by Parquet
+`INT32`; sizes are Arrow `decimal64(18, 6)` backed by Parquet `INT64`; and
+`fee_rate_bps` is `uint16`. `bids` and `asks` retain the compact JSON array
+representation. A `?` marks genuine source nullability, not an unrelated column
+made nullable by combining different event schemas.
 
 Market condition IDs and transaction hashes are decoded from hexadecimal;
 every singular or list-valued token ID is decoded as an unsigned 256-bit

@@ -47,8 +47,8 @@ Other types used below are:
 |---|---|
 | `asset_id`, `winning_asset_id` | Unsigned decimal token ID encoded as exactly 32 big-endian bytes (`fixed_size_binary[32]`). |
 | `transaction_hash` | Raw 32 bytes decoded from the source `0x` hexadecimal transaction hash (`fixed_size_binary[32]`). |
-| price or tick size | `decimal128(9, 4)`. Read as an exact decimal, never as binary floating point. |
-| size | `decimal128(18, 6)`. Read as an exact decimal. |
+| price, best price, spread, or tick size | Arrow `decimal32(9, 4)`, stored as Parquet physical `INT32` with a decimal logical annotation. Read as an exact decimal, never as binary floating point. |
+| size | Arrow `decimal64(18, 6)`, stored as Parquet physical `INT64` with a decimal logical annotation. Read as an exact decimal. |
 | string | Arrow UTF-8 string. |
 | list | Arrow list whose element type is shown in the file schema. |
 
@@ -98,11 +98,11 @@ Columns after the common prefix:
 | Column | Arrow type | Nullable | Meaning |
 |---|---|---:|---|
 | `asset_id` | `fixed_size_binary[32]` | no | Outcome token being changed. |
-| `price` | `decimal128(9, 4)` | no | Affected price level. |
-| `size` | `decimal128(18, 6)` | no | New aggregate size, not a signed size delta. Zero removes the level. |
+| `price` | `decimal32(9, 4)` | no | Affected price level. |
+| `size` | `decimal64(18, 6)` | no | New aggregate size, not a signed size delta. Zero removes the level. |
 | `side` | `string` | no | `BUY` for the bid side or `SELL` for the ask side. |
-| `best_bid` | `decimal128(9, 4)` | yes | Source-provided best bid after the change, when present. |
-| `best_ask` | `decimal128(9, 4)` | yes | Source-provided best ask after the change, when present. |
+| `best_bid` | `decimal32(9, 4)` | yes | Source-provided best bid after the change, when present. |
+| `best_ask` | `decimal32(9, 4)` | yes | Source-provided best ask after the change, when present. |
 
 The upstream per-change `hash` is intentionally omitted. It is not safe for
 deduplication. Orderbook reconstruction uses `price`, `size`, and `side`; the
@@ -119,8 +119,8 @@ Columns after the common prefix:
 | Column | Arrow type | Nullable | Meaning |
 |---|---|---:|---|
 | `asset_id` | `fixed_size_binary[32]` | no | Outcome token that traded. |
-| `price` | `decimal128(9, 4)` | no | Execution price. |
-| `size` | `decimal128(18, 6)` | no | Executed size. |
+| `price` | `decimal32(9, 4)` | no | Execution price. |
+| `size` | `decimal64(18, 6)` | no | Executed size. |
 | `side` | `string` | no | `BUY` or `SELL`, from the taker's perspective. |
 | `fee_rate_bps` | `uint16` | no | Fee rate in basis points. |
 | `transaction_hash` | `fixed_size_binary[32]` | no | Polygon transaction containing the fill. It is metadata, not a unique fill ID. |
@@ -140,8 +140,8 @@ Columns after the common prefix:
 | Column | Arrow type | Nullable | Meaning |
 |---|---|---:|---|
 | `asset_id` | `fixed_size_binary[32]` | no | Outcome token whose tick size changed. |
-| `old_tick_size` | `decimal128(9, 4)` | no | Tick size before the event. |
-| `new_tick_size` | `decimal128(9, 4)` | no | Tick size after the event. |
+| `old_tick_size` | `decimal32(9, 4)` | no | Tick size before the event. |
+| `new_tick_size` | `decimal32(9, 4)` | no | Tick size after the event. |
 
 ## `best_bid_ask.parquet`
 
@@ -155,9 +155,9 @@ Columns after the common prefix:
 | Column | Arrow type | Nullable | Meaning |
 |---|---|---:|---|
 | `asset_id` | `fixed_size_binary[32]` | no | Outcome token whose top of book was reported. |
-| `best_bid` | `decimal128(9, 4)` | yes | Best bid, or null when the source provides no bid. |
-| `best_ask` | `decimal128(9, 4)` | yes | Best ask, or null when the source provides no ask. |
-| `spread` | `decimal128(9, 4)` | yes | Source-provided ask-minus-bid spread, or null when unavailable. |
+| `best_bid` | `decimal32(9, 4)` | yes | Best bid, or null when the source provides no bid. |
+| `best_ask` | `decimal32(9, 4)` | yes | Best ask, or null when the source provides no ask. |
+| `spread` | `decimal32(9, 4)` | yes | Source-provided ask-minus-bid spread, or null when unavailable. |
 
 ## `new_market.parquet`
 

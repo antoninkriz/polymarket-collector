@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import unittest
+from decimal import Decimal
 from datetime import datetime, timezone
+from io import BytesIO
 from unittest.mock import patch
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 import run as exporter
 
@@ -42,6 +45,62 @@ class ExportPathsTest(unittest.TestCase):
         hour = datetime(2026, 8, 13, 4, tzinfo=timezone.utc)
         with self.assertRaises(ValueError):
             exporter.event_to_key(hour, "unknown")
+
+
+class ParquetSchemaTest(unittest.TestCase):
+    def test_decimals_are_narrow_and_integer_backed(self) -> None:
+        decimal32_columns = (
+            "price",
+            "best_bid",
+            "best_ask",
+            "spread",
+            "old_tick_size",
+            "new_tick_size",
+        )
+        fields = [
+            pa.field(
+                name,
+                pa.decimal128(9, 4),
+                nullable=name in {"best_bid", "best_ask", "spread"},
+            )
+            for name in decimal32_columns
+        ]
+        fields.append(pa.field("size", pa.decimal128(18, 6), nullable=False))
+        source_schema = pa.schema(fields)
+        arrays = [
+            pa.array(
+                [None if field.nullable else Decimal("0.1234")],
+                type=field.type,
+            )
+            for field in fields[:-1]
+        ]
+        arrays.append(pa.array([Decimal("123.456789")], type=fields[-1].type))
+        source = pa.Table.from_arrays(arrays, schema=source_schema)
+
+        data = exporter.table_to_parquet(source)
+        parquet_file = pq.ParquetFile(BytesIO(data))
+        arrow_schema = parquet_file.schema_arrow
+        for name in decimal32_columns:
+            self.assertEqual(arrow_schema.field(name).type, pa.decimal32(9, 4))
+        self.assertEqual(arrow_schema.field("size").type, pa.decimal64(18, 6))
+
+        physical_types = {
+            parquet_file.metadata.schema.column(
+                i
+            ).name: parquet_file.metadata.schema.column(i).physical_type
+            for i in range(parquet_file.metadata.num_columns)
+        }
+        for name in decimal32_columns:
+            self.assertEqual(physical_types[name], "INT32")
+        self.assertEqual(physical_types["size"], "INT64")
+
+        round_trip = parquet_file.read()
+        self.assertEqual(round_trip.schema, arrow_schema)
+        self.assertEqual(round_trip.column("price")[0].as_py(), Decimal("0.1234"))
+        self.assertEqual(
+            round_trip.column("size")[0].as_py(),
+            Decimal("123.456789"),
+        )
 
 
 class ExportHourTest(unittest.TestCase):
