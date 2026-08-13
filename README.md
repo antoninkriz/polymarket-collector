@@ -27,8 +27,6 @@ Polymarket WS ──▶ polymarket-orderbook-rust-pubsub ──▶ Redis Stream 
   Logical ad-hoc reads use `FINAL` to collapse same-sequence transport retries.
 - `services/r2-archive/exporter` — projects typed hourly Parquet to the bucket
   named by `R2_BUCKET`.
-- `services/polymarket/orderbook-compare` — ad-hoc comparison script (was untracked
-  on the prod server; preserved here).
 - `shared/rust/polymarket-orderbook-rust` — shared library crate (WS pool, REST
   client, ClickHouse sink, event types) used by both Rust binaries.
 - `shared/py` — shared Python helpers used by the Python services' Dockerfiles.
