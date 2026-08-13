@@ -820,17 +820,10 @@ mod tests {
         cfg
     }
 
-    fn v3_item(event: Event, row_index: u32, row_count: u32) -> SinkItem {
-        let collector = CollectorContext::with_publisher_fence(42);
+    fn v3_item(event: Event) -> SinkItem {
+        let collector = CollectorContext::with_publisher_generation(42);
         SinkItem {
-            record: collector
-                .next_message(4, 2, 9, 0, 1, 1_757_908_892_351_123_456)
-                .record(
-                    event,
-                    row_index,
-                    row_count,
-                    "{\"server\":\"payload\"}".into(),
-                ),
+            record: collector.record(event, 1_757_908_892_351_123_456),
             delivery_id: Some("1757908892351-0".into()),
         }
     }
@@ -1002,20 +995,16 @@ mod tests {
     #[test]
     fn v3_stores_only_receive_time_sequence_and_event_json() {
         let mut sink = empty_sink(v3_cfg());
-        sink.buffer.push(v3_item(
-            Event::LastTradePrice {
-                market: "m".into(),
-                asset_id: "a".into(),
-                timestamp: "1757908892351".into(),
-                price: dec("0.42"),
-                size: dec("75"),
-                side: "BUY".into(),
-                fee_rate_bps: "10".into(),
-                transaction_hash: "0xtx".into(),
-            },
-            0,
-            1,
-        ));
+        sink.buffer.push(v3_item(Event::LastTradePrice {
+            market: "m".into(),
+            asset_id: "a".into(),
+            timestamp: "1757908892351".into(),
+            price: dec("0.42"),
+            size: dec("75"),
+            side: "BUY".into(),
+            fee_rate_bps: "10".into(),
+            transaction_hash: "0xtx".into(),
+        }));
 
         let body = sink.serialize_batch().unwrap();
         let row: serde_json::Value =

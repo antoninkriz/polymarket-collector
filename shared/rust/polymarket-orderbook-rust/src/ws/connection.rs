@@ -169,8 +169,6 @@ impl Connection {
         let mut last_message_time: Option<Instant> = None;
         let mut pong_timed_out = false;
         let mut first_attempt = true;
-        let mut connection_epoch = 0_u64;
-        let mut frame_sequence = 0_u64;
         loop {
             // Reconnect delay (skip on first attempt and on PONG timeout).
             if first_attempt {
@@ -213,8 +211,6 @@ impl Connection {
                     continue;
                 }
             };
-            connection_epoch += 1;
-
             // Reset session state. `desired` survives, `subscribed` does not.
             sub.reset_session();
 
@@ -239,8 +235,6 @@ impl Connection {
             // ended due to a PONG timeout (so we skip the next backoff).
             let context = SessionContext {
                 index,
-                connection_id: index as u32,
-                connection_epoch,
                 event_tx: &event_tx,
                 collector: &collector,
                 stats: &stats,
@@ -251,7 +245,6 @@ impl Connection {
                 &mut sub,
                 &mut commands,
                 &mut last_message_time,
-                &mut frame_sequence,
             )
             .await;
 
@@ -318,8 +311,6 @@ enum SessionOutcome {
 #[derive(Clone, Copy)]
 struct SessionContext<'a> {
     index: usize,
-    connection_id: u32,
-    connection_epoch: u64,
     event_tx: &'a mpsc::Sender<EventRecord>,
     collector: &'a CollectorContext,
     stats: &'a ConnStats,
@@ -336,7 +327,6 @@ async fn run_session(
     sub: &mut SubState,
     commands: &mut mpsc::Receiver<Command>,
     last_message_time: &mut Option<Instant>,
-    frame_sequence: &mut u64,
 ) -> SessionOutcome {
     let index = context.index;
     let (mut write, mut read) = ws_stream.split();
@@ -380,14 +370,11 @@ async fn run_session(
                         debug!(conn = index, "PONG received");
                         continue;
                     }
-                    let this_frame_sequence = *frame_sequence;
-                    *frame_sequence = frame_sequence.wrapping_add(1);
                     match handle_text(
                         stripped,
                         sub,
                         &mut events_buf,
                         &context,
-                        this_frame_sequence,
                         timestamp_received_ns,
                     ) {
                         Ok(()) => {
@@ -534,7 +521,6 @@ fn handle_text(
     sub: &SubState,
     events_buf: &mut Vec<EventRecord>,
     context: &SessionContext<'_>,
-    frame_sequence: u64,
     timestamp_received_ns: i64,
 ) -> Result<()> {
     let frame: serde_json::Value = serde_json::from_str(text).context("parse wire frame")?;
@@ -542,24 +528,7 @@ fn handle_text(
         serde_json::Value::Array(messages) => messages,
         message => vec![message],
     };
-    let message_count = u32::try_from(messages.len()).context("too many messages in frame")?;
-
     for (message_index, raw_value) in messages.into_iter().enumerate() {
-        // Serialize from Value rather than from the typed struct so fields a
-        // newer server adds remain available in raw_message.
-        let raw_message = serde_json::to_string(&raw_value).context("serialize raw message")?;
-        // Allocate the collector merge order before typed parsing or event
-        // expansion. Parsing failures therefore leave an observable sequence
-        // gap in the process logs rather than allowing a later message to take
-        // this parent's position.
-        let message = context.collector.next_message(
-            context.connection_id,
-            context.connection_epoch,
-            frame_sequence,
-            message_index as u32,
-            message_count,
-            timestamp_received_ns,
-        );
         let msg: WireMessage = match serde_json::from_value(raw_value) {
             Ok(message) => message,
             Err(error) => {
@@ -567,8 +536,7 @@ fn handle_text(
                     conn = context.index,
                     message_index,
                     %error,
-                    raw_message,
-                    "wire parent rejected; receive_sequence gap retained",
+                    "wire parent rejected",
                 );
                 continue;
             }
@@ -595,18 +563,9 @@ fn handle_text(
         }
         let mut staged: Vec<Event> = Vec::new();
         explode(msg, &mut staged);
-        let row_count = u32::try_from(staged.len()).context("too many rows in message")?;
-
-        // Preserve the original exploded index even when an unexpected asset
-        // is filtered. A non-contiguous row_index then exposes the omission.
-        for (row_index, ev) in staged.into_iter().enumerate() {
+        for ev in staged {
             if sub.desired.contains(ev.asset_id()) {
-                events_buf.push(message.record(
-                    ev,
-                    row_index as u32,
-                    row_count,
-                    raw_message.clone(),
-                ));
+                events_buf.push(context.collector.record(ev, timestamp_received_ns));
             }
         }
     }
@@ -667,13 +626,11 @@ mod tests {
         let collector = CollectorContext::new();
         let context = SessionContext {
             index: 0,
-            connection_id: 0,
-            connection_epoch: 1,
             event_tx: &event_tx,
             collector: &collector,
             stats,
         };
-        handle_text(text, sub, events, &context, 0, 123)
+        handle_text(text, sub, events, &context, 123)
     }
 
     fn sub_state(desired: &[&str]) -> SubState {
@@ -769,10 +726,7 @@ mod tests {
         handle(raw, &sub, &stats, &mut buf).unwrap();
 
         assert_eq!(buf.len(), 2);
-        assert_eq!(buf[0].message_index, 0);
-        assert_eq!(buf[1].message_index, 2);
-        assert_eq!(buf[0].message_count, 3);
-        assert_eq!(buf[1].receive_sequence, buf[0].receive_sequence + 2);
+        assert_eq!(buf[1].sequence, buf[0].sequence + 1);
     }
 
     #[tokio::test]

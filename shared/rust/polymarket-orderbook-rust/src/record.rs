@@ -1,82 +1,58 @@
-//! Collector metadata attached at the WebSocket receive boundary.
+//! Minimal metadata attached at the WebSocket receive boundary.
 //!
 //! Polymarket does not publish a sequence number or a unique public fill ID.
-//! The collector therefore records the order it actually observes.  A
-//! [`CollectorContext`] is shared by all WebSocket tasks in one process and
-//! assigns a process-wide `receive_sequence` to each parent market message.
-//! Children produced by `price_changes[]` share `message_id` and are ordered
-//! by `row_index`.
-//!
-//! `timestamp_received_ns` is sampled as soon as tungstenite yields a text
-//! frame.  It is a wall-clock observation, not an ordering key; system clocks
-//! can step, while `receive_sequence` is monotonic for the collector session.
+//! The collector therefore stores the order it actually observes. One compact
+//! [`EventRecord::sequence`] is both the replay order and the idempotency key
+//! for collector-owned Redis/ClickHouse retries.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::events::Event;
 
-pub const SCHEMA_VERSION: u8 = 3;
 const SEQUENCE_LOCAL_BITS: u32 = 48;
 const SEQUENCE_LOCAL_MASK: u64 = (1_u64 << SEQUENCE_LOCAL_BITS) - 1;
 const SEQUENCE_GENERATION_MAX: u64 = u64::MAX >> SEQUENCE_LOCAL_BITS;
 
-/// Process-scoped identity and sequencer shared by all WebSocket connections.
+/// Process-scoped sequencer. The Redis-issued publisher generation occupies
+/// the high bits, so a restarted authoritative collector continues after the
+/// previous process without storing a separate session or generation field.
 #[derive(Debug)]
 pub struct CollectorContext {
-    session_id: Uuid,
-    session_started_at_ns: i64,
-    publisher_fence: u64,
-    next_receive_sequence: AtomicU64,
-    next_event_sequence: AtomicU64,
+    sequence_prefix: u64,
+    next_local_sequence: AtomicU64,
 }
 
 impl CollectorContext {
     pub fn new() -> Self {
-        Self::with_publisher_fence(0)
+        Self::with_publisher_generation(0)
     }
 
-    /// Create a collector bound to an externally acquired publisher fence.
-    pub fn with_publisher_fence(publisher_fence: u64) -> Self {
+    pub fn with_publisher_generation(generation: u64) -> Self {
         assert!(
-            publisher_fence <= SEQUENCE_GENERATION_MAX,
-            "publisher generation {publisher_fence} exceeds compact sequence capacity",
+            generation <= SEQUENCE_GENERATION_MAX,
+            "publisher generation {generation} exceeds compact sequence capacity",
         );
         Self {
-            session_id: Uuid::new_v4(),
-            session_started_at_ns: now_ns(),
-            publisher_fence,
-            next_receive_sequence: AtomicU64::new(0),
-            next_event_sequence: AtomicU64::new(0),
+            sequence_prefix: generation << SEQUENCE_LOCAL_BITS,
+            next_local_sequence: AtomicU64::new(0),
         }
     }
 
-    /// Allocate metadata for one parent message from a WebSocket frame.
-    pub fn next_message(
-        &self,
-        connection_id: u32,
-        connection_epoch: u64,
-        frame_sequence: u64,
-        message_index: u32,
-        message_count: u32,
-        timestamp_received_ns: i64,
-    ) -> MessageContext<'_> {
-        MessageContext {
-            collector_session_id: self.session_id,
-            collector_session_started_at_ns: self.session_started_at_ns,
-            publisher_fence: self.publisher_fence,
-            sequence_allocator: &self.next_event_sequence,
-            connection_id,
-            connection_epoch,
-            frame_sequence,
-            receive_sequence: self.next_receive_sequence.fetch_add(1, Ordering::SeqCst),
-            message_id: Uuid::new_v4(),
-            message_index,
-            message_count,
+    /// Attach the actual socket receive time and allocate the next observed
+    /// event order. Exploded children call this in their wire array order.
+    pub fn record(&self, event: Event, timestamp_received_ns: i64) -> EventRecord {
+        let local_sequence = self.next_local_sequence.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            local_sequence <= SEQUENCE_LOCAL_MASK,
+            "collector emitted more than 2^48 events in one publisher generation",
+        );
+        EventRecord {
             timestamp_received_ns,
+            sequence: self.sequence_prefix | local_sequence,
+            event,
         }
     }
 }
@@ -87,115 +63,24 @@ impl Default for CollectorContext {
     }
 }
 
-/// Metadata shared by all exploded rows from one parent market message.
-#[derive(Debug)]
-pub struct MessageContext<'a> {
-    collector_session_id: Uuid,
-    collector_session_started_at_ns: i64,
-    publisher_fence: u64,
-    sequence_allocator: &'a AtomicU64,
-    connection_id: u32,
-    connection_epoch: u64,
-    frame_sequence: u64,
-    receive_sequence: u64,
-    message_id: Uuid,
-    message_index: u32,
-    message_count: u32,
-    timestamp_received_ns: i64,
-}
-
-impl MessageContext<'_> {
-    pub fn record(
-        &self,
-        event: Event,
-        row_index: u32,
-        row_count: u32,
-        raw_message: String,
-    ) -> EventRecord {
-        let local_sequence = self.sequence_allocator.fetch_add(1, Ordering::SeqCst);
-        assert!(
-            local_sequence <= SEQUENCE_LOCAL_MASK,
-            "collector emitted more than 2^48 events in one publisher generation",
-        );
-        EventRecord {
-            schema_version: SCHEMA_VERSION,
-            collector_session_id: self.collector_session_id,
-            collector_session_started_at_ns: self.collector_session_started_at_ns,
-            publisher_fence: self.publisher_fence,
-            sequence: (self.publisher_fence << SEQUENCE_LOCAL_BITS) | local_sequence,
-            connection_id: self.connection_id,
-            connection_epoch: self.connection_epoch,
-            frame_sequence: self.frame_sequence,
-            receive_sequence: self.receive_sequence,
-            message_id: self.message_id,
-            message_index: self.message_index,
-            message_count: self.message_count,
-            row_index,
-            row_count,
-            timestamp_received_ns: self.timestamp_received_ns,
-            raw_message,
-            event,
-        }
-    }
-}
-
-/// A normalized event plus the ordering and provenance needed for replay.
+/// One normalized event and the two values needed for correct replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventRecord {
-    pub schema_version: u8,
-    pub collector_session_id: Uuid,
-    pub collector_session_started_at_ns: i64,
-    /// Monotonic Redis-issued generation of the authoritative publisher.
-    pub publisher_fence: u64,
-    /// Monotonic replay order. The high 16 bits are the fenced publisher
-    /// generation and the low 48 bits are the process-local event order.
-    pub sequence: u64,
-    pub connection_id: u32,
-    pub connection_epoch: u64,
-    pub frame_sequence: u64,
-    pub receive_sequence: u64,
-    pub message_id: Uuid,
-    pub message_index: u32,
-    pub message_count: u32,
-    pub row_index: u32,
-    pub row_count: u32,
-    /// UTC Unix epoch nanoseconds sampled at socket receipt.
+    /// UTC Unix epoch nanoseconds sampled when tungstenite yields its frame.
     pub timestamp_received_ns: i64,
-    /// The complete parent JSON object, retained for audit and forward parsing.
-    pub raw_message: String,
+    /// Monotonic observed order and retry identity.
+    pub sequence: u64,
     #[serde(flatten)]
     pub event: Event,
 }
 
 impl EventRecord {
-    /// Stable identity for transport retries.  It intentionally does not use
-    /// any market payload fields: identical payloads can be distinct events.
-    pub fn identity(&self) -> (Uuid, u32) {
-        (self.message_id, self.row_index)
-    }
-
-    /// Build a record for legacy callers and tests that do not originate at
-    /// the WebSocket boundary. Production v3 ingestion uses
-    /// [`CollectorContext`] instead.
+    /// Build a record for legacy raw/typed sink callers. Production v3
+    /// ingestion uses [`CollectorContext::record`].
     pub fn synthetic(event: Event) -> Self {
-        let raw_message = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
         Self {
-            schema_version: SCHEMA_VERSION,
-            collector_session_id: Uuid::nil(),
-            collector_session_started_at_ns: 0,
-            publisher_fence: 0,
-            sequence: 0,
-            connection_id: 0,
-            connection_epoch: 0,
-            frame_sequence: 0,
-            receive_sequence: 0,
-            message_id: Uuid::nil(),
-            message_index: 0,
-            message_count: 1,
-            row_index: 0,
-            row_count: 1,
             timestamp_received_ns: 0,
-            raw_message,
+            sequence: 0,
             event,
         }
     }
@@ -211,7 +96,6 @@ pub fn now_ns() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::Event;
     use rust_decimal::Decimal;
 
     fn tick(timestamp: &str) -> Event {
@@ -225,45 +109,28 @@ mod tests {
     }
 
     #[test]
-    fn parent_rows_share_identity_and_keep_child_order() {
+    fn exploded_rows_keep_allocation_order() {
         let collector = CollectorContext::new();
-        let message = collector.next_message(7, 2, 11, 0, 1, 123);
-        let first = message.record(tick("1"), 0, 2, "{}".into());
-        let second = message.record(tick("1"), 1, 2, "{}".into());
+        let first = collector.record(tick("1"), 123);
+        let second = collector.record(tick("1"), 123);
 
-        assert_eq!(first.message_id, second.message_id);
-        assert_eq!(first.receive_sequence, second.receive_sequence);
         assert_eq!(second.sequence, first.sequence + 1);
-        assert_eq!(first.row_index, 0);
-        assert_eq!(second.row_index, 1);
-        assert_ne!(first.identity(), second.identity());
+        assert_eq!(first.timestamp_received_ns, second.timestamp_received_ns);
     }
 
     #[test]
-    fn identical_payloads_receive_distinct_message_ids() {
+    fn identical_public_events_are_distinct_observations() {
         let collector = CollectorContext::new();
-        let first = collector
-            .next_message(0, 1, 0, 0, 1, 100)
-            .record(tick("1"), 0, 1, "{}".into());
-        let second =
-            collector
-                .next_message(0, 1, 1, 0, 1, 101)
-                .record(tick("1"), 0, 1, "{}".into());
+        let first = collector.record(tick("1"), 100);
+        let second = collector.record(tick("1"), 101);
 
-        assert_ne!(first.message_id, second.message_id);
-        assert_ne!(first.identity(), second.identity());
-        assert!(first.receive_sequence < second.receive_sequence);
-        assert!(first.sequence < second.sequence);
+        assert_ne!(first.sequence, second.sequence);
     }
 
     #[test]
     fn publisher_generation_orders_process_restarts() {
-        let old = CollectorContext::with_publisher_fence(7)
-            .next_message(0, 1, 0, 0, 1, 100)
-            .record(tick("1"), 0, 1, "{}".into());
-        let new = CollectorContext::with_publisher_fence(8)
-            .next_message(0, 1, 0, 0, 1, 90)
-            .record(tick("1"), 0, 1, "{}".into());
+        let old = CollectorContext::with_publisher_generation(7).record(tick("1"), 100);
+        let new = CollectorContext::with_publisher_generation(8).record(tick("1"), 90);
 
         assert!(old.sequence < new.sequence);
         assert_eq!(old.sequence, 7_u64 << SEQUENCE_LOCAL_BITS);

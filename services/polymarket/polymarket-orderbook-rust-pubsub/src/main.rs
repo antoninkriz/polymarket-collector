@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<EventRecord>(cfg.queue_size);
     let mut sink_handle: JoinHandle<Result<()>> = tokio::spawn(sink.run(event_rx));
 
-    let pool = Arc::new(Mutex::new(Pool::new_with_publisher_fence(
+    let pool = Arc::new(Mutex::new(Pool::new_with_publisher_generation(
         cfg.max_assets_per_conn,
         event_tx.clone(),
         publisher_fence,

@@ -25,24 +25,20 @@ fn lease_config(suffix: &str) -> PublisherLeaseConfig {
     }
 }
 
-fn record(fence: u64) -> polymarket_orderbook_rust::record::EventRecord {
-    CollectorContext::with_publisher_fence(fence)
-        .next_message(0, 1, 0, 0, 1, 1_757_908_892_351_123_456)
-        .record(
-            Event::LastTradePrice {
-                market: "m".into(),
-                asset_id: "a".into(),
-                timestamp: "1757908892351".into(),
-                price: "0.42".parse().unwrap(),
-                size: "75".parse().unwrap(),
-                side: "BUY".into(),
-                fee_rate_bps: "10".into(),
-                transaction_hash: "0xtx".into(),
-            },
-            0,
-            1,
-            "{\"event_type\":\"last_trade_price\"}".into(),
-        )
+fn record(generation: u64) -> polymarket_orderbook_rust::record::EventRecord {
+    CollectorContext::with_publisher_generation(generation).record(
+        Event::LastTradePrice {
+            market: "m".into(),
+            asset_id: "a".into(),
+            timestamp: "1757908892351".into(),
+            price: "0.42".parse().unwrap(),
+            size: "75".parse().unwrap(),
+            side: "BUY".into(),
+            fee_rate_bps: "10".into(),
+            transaction_hash: "0xtx".into(),
+        },
+        1_757_908_892_351_123_456,
+    )
 }
 
 #[tokio::test]

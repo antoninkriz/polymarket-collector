@@ -2,8 +2,8 @@
 //!
 //! Records are appended with `XADD`. Failed writes retain the batch and retry
 //! with backoff. An uncertain Redis response can append a record twice, but
-//! both copies carry the same collector `(message_id, row_index)` and the v3
-//! ClickHouse table removes that transport retry by identity.
+//! both copies carry the same collector sequence and the v3 ClickHouse table
+//! removes that transport retry by identity.
 
 use std::time::{Duration, Instant};
 

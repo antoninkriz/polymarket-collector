@@ -280,18 +280,9 @@ async fn v3_sink_deduplicates_only_transport_retries() -> Result<()> {
         fee_rate_bps: "10".into(),
         transaction_hash: "0xsame-transaction".into(),
     };
-    let collector = CollectorContext::with_publisher_fence(7);
-    let first = collector
-        .next_message(4, 1, 10, 0, 1, 1_757_908_892_351_123_456)
-        .record(
-            trade.clone(),
-            0,
-            1,
-            "{\"event_type\":\"last_trade_price\"}".into(),
-        );
-    let second = collector
-        .next_message(4, 1, 11, 0, 1, 1_757_908_892_351_123_457)
-        .record(trade, 0, 1, "{\"event_type\":\"last_trade_price\"}".into());
+    let collector = CollectorContext::with_publisher_generation(7);
+    let first = collector.record(trade.clone(), 1_757_908_892_351_123_456);
+    let second = collector.record(trade, 1_757_908_892_351_123_457);
 
     let (tx, rx) = mpsc::channel::<SinkItem>(8);
     let handle = tokio::spawn(sink.run(rx, None));

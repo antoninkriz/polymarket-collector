@@ -5,8 +5,7 @@
 //! updates for both assets: splitting those assets across redundant sockets
 //! creates two independently delivered copies whose relative order cannot be
 //! merged correctly.  V3 chooses correctness over seamless failover.  A
-//! reconnect starts a new `connection_epoch`; consumers must wait for the
-//! fresh `book` snapshots before applying deltas in that epoch.
+//! after a reconnect, fresh `book` snapshots replace the full local state.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,15 +73,17 @@ pub struct Pool {
 
 impl Pool {
     pub fn new(max_assets_per_conn: usize, event_tx: mpsc::Sender<EventRecord>) -> Self {
-        Self::new_with_publisher_fence(max_assets_per_conn, event_tx, 0)
+        Self::new_with_publisher_generation(max_assets_per_conn, event_tx, 0)
     }
 
-    pub fn new_with_publisher_fence(
+    pub fn new_with_publisher_generation(
         max_assets_per_conn: usize,
         event_tx: mpsc::Sender<EventRecord>,
-        publisher_fence: u64,
+        publisher_generation: u64,
     ) -> Self {
-        let collector = Arc::new(CollectorContext::with_publisher_fence(publisher_fence));
+        let collector = Arc::new(CollectorContext::with_publisher_generation(
+            publisher_generation,
+        ));
         let health_counters = Arc::new(HealthCounters::default());
         let (status_event_tx, status_event_rx) = mpsc::unbounded_channel();
         let (asset_conns_tx, asset_conns_rx) = watch::channel(HashMap::new());
