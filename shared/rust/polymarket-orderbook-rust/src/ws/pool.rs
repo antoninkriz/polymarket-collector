@@ -238,6 +238,12 @@ impl Pool {
             return Ok(());
         }
 
+        // Gamma's cache order can cluster recently created, high-traffic
+        // markets on the same sockets. Condition IDs are cryptographic hashes,
+        // so sorting by them gives a deterministic activity-independent spread
+        // across the fixed-capacity connection chunks.
+        new_markets.sort_unstable_by(|left, right| left.hash.cmp(&right.hash));
+
         info!(
             new_markets = new_markets.len(),
             new_assets = new_markets.len() * 2,
@@ -542,6 +548,23 @@ mod tests {
                 pool.asset_to_conn[&market.assets[1]],
             );
         }
+    }
+
+    #[tokio::test]
+    async fn preload_partition_is_deterministic_by_market_hash() {
+        let mut pool = pool(4);
+        pool.subscribe_markets(vec![
+            market("z", "zy", "zn"),
+            market("a", "ay", "an"),
+            market("y", "yy", "yn"),
+            market("b", "by", "bn"),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(pool.market_to_conn["a"], pool.market_to_conn["b"]);
+        assert_eq!(pool.market_to_conn["y"], pool.market_to_conn["z"]);
+        assert_ne!(pool.market_to_conn["a"], pool.market_to_conn["y"]);
     }
 
     #[tokio::test]
