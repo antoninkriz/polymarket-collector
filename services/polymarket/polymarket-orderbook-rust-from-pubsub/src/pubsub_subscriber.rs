@@ -43,8 +43,23 @@ if group_name ~= ARGV[1] then
   return redis.error_reply('STREAM_GROUP_OWNERSHIP_MISMATCH configured group is not sole owner')
 end
 
-local acknowledged = redis.call('XACK', KEYS[1], ARGV[1], unpack(ARGV, 2))
-local deleted = redis.call('XDEL', KEYS[1], unpack(ARGV, 2))
+-- Lua cannot expand an arbitrarily large ARGV with unpack(). Recovery can
+-- acknowledge several ClickHouse batches at once, so keep each Redis call
+-- comfortably below the Lua stack limit while retaining script atomicity.
+local acknowledged = 0
+local deleted = 0
+local first = 2
+local chunk_size = 256
+while first <= #ARGV do
+  local last = math.min(first + chunk_size - 1, #ARGV)
+  acknowledged = acknowledged + redis.call(
+    'XACK', KEYS[1], ARGV[1], unpack(ARGV, first, last)
+  )
+  deleted = deleted + redis.call(
+    'XDEL', KEYS[1], unpack(ARGV, first, last)
+  )
+  first = last + 1
+end
 return {acknowledged, deleted}
 "#;
 
@@ -208,6 +223,11 @@ async fn flush_acks(
     if pending_acks.is_empty() {
         return Ok(());
     }
+    // A reconnect can replay committed-but-unacknowledged entries while their
+    // previous acknowledgements are still queued. Avoid sending duplicate IDs
+    // to the cleanup script and cap its argument volume during recovery.
+    pending_acks.sort_unstable();
+    pending_acks.dedup();
     let (acknowledged, deleted) = if cfg.delete_acked_entries {
         redis::Script::new(ACK_AND_DELETE_EXCLUSIVE_SCRIPT)
             .key(&cfg.stream)
@@ -256,6 +276,7 @@ fn preview(payload: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use anyhow::Result;
@@ -292,19 +313,24 @@ mod tests {
         let mut conn = client.get_multiplexed_async_connection().await?;
         ensure_consumer_group(&mut conn, &cfg).await?;
 
-        let first_id: String = redis::cmd("XADD")
-            .arg(&cfg.stream)
-            .arg("*")
-            .arg("payload")
-            .arg("{}")
-            .query_async(&mut conn)
-            .await?;
+        const BULK_ENTRY_COUNT: usize = 2_000;
+        let mut first_ids = Vec::with_capacity(BULK_ENTRY_COUNT + 1);
+        for _ in 0..BULK_ENTRY_COUNT {
+            let id: String = redis::cmd("XADD")
+                .arg(&cfg.stream)
+                .arg("*")
+                .arg("payload")
+                .arg("{}")
+                .query_async(&mut conn)
+                .await?;
+            first_ids.push(id);
+        }
         let _: redis::Value = redis::cmd("XREADGROUP")
             .arg("GROUP")
             .arg(&cfg.group)
             .arg(&cfg.consumer)
             .arg("COUNT")
-            .arg(1)
+            .arg(BULK_ENTRY_COUNT)
             .arg("STREAMS")
             .arg(&cfg.stream)
             .arg(">")
@@ -312,7 +338,10 @@ mod tests {
             .await?;
 
         let stats = SubscriberStats::default();
-        let mut pending = vec![first_id];
+        // Include a duplicate to exercise reconnect-time acknowledgement
+        // coalescing as well as Lua chunking above the stack limit.
+        first_ids.push(first_ids[0].clone());
+        let mut pending = first_ids;
         flush_acks(&mut conn, &cfg, &mut pending, &stats).await?;
         assert!(pending.is_empty());
         let length: i64 = redis::cmd("XLEN")
@@ -320,6 +349,14 @@ mod tests {
             .query_async(&mut conn)
             .await?;
         assert_eq!(length, 0);
+        assert_eq!(
+            stats.events_acked.load(Ordering::Relaxed),
+            BULK_ENTRY_COUNT as u64
+        );
+        assert_eq!(
+            stats.events_deleted.load(Ordering::Relaxed),
+            BULK_ENTRY_COUNT as u64
+        );
 
         let _: () = redis::cmd("XGROUP")
             .arg("CREATE")
