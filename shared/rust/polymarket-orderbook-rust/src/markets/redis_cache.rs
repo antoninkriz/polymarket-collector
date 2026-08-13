@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use redis::AsyncCommands;
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::events::Market;
 
@@ -24,9 +24,11 @@ struct CacheEntry {
     no_asset_id: String,
 }
 
-/// Load active markets from the Redis cache. Returns an empty vec if the
-/// key doesn't exist (matching `market_events.py::load_markets_from_redis`).
-pub async fn load(redis_url: &str, key: &str) -> Result<Vec<Market>> {
+/// Load active markets from the Redis cache.
+///
+/// Return `None` when the producer has not written the cache yet. An existing
+/// cache containing zero markets remains distinguishable as `Some(Vec::new())`.
+pub async fn load(redis_url: &str, key: &str) -> Result<Option<Vec<Market>>> {
     let client = redis::Client::open(redis_url).context("open redis client")?;
     let mut conn = client
         .get_multiplexed_async_connection()
@@ -35,8 +37,7 @@ pub async fn load(redis_url: &str, key: &str) -> Result<Vec<Market>> {
 
     let raw: Option<String> = conn.get(key).await.context("redis GET")?;
     let Some(raw) = raw else {
-        warn!(key, "no active markets cache in Redis");
-        return Ok(Vec::new());
+        return Ok(None);
     };
 
     let doc: CacheDocument = serde_json::from_str(&raw).context("parse cache JSON")?;
@@ -50,7 +51,7 @@ pub async fn load(redis_url: &str, key: &str) -> Result<Vec<Market>> {
         count = markets.len(),
         key, "loaded markets from Redis cache"
     );
-    Ok(markets)
+    Ok(Some(markets))
 }
 
 #[cfg(test)]

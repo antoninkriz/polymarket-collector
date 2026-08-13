@@ -249,10 +249,25 @@ async fn preload_markets(cfg: &Config) -> Result<Vec<Market>> {
         return Ok(markets);
     }
 
-    let markets = markets::redis_cache::load(&cfg.redis_url, &cfg.redis_key_active_markets)
-        .await
-        .context("load active markets from redis")?;
-    Ok(markets)
+    let mut waiting_logged = false;
+    loop {
+        match markets::redis_cache::load(&cfg.redis_url, &cfg.redis_key_active_markets)
+            .await
+            .context("load active markets from redis")?
+        {
+            Some(markets) => return Ok(markets),
+            None => {
+                if !waiting_logged {
+                    warn!(
+                        key = cfg.redis_key_active_markets,
+                        "active markets cache not ready; waiting"
+                    );
+                    waiting_logged = true;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
 }
 
 async fn wait_for_shutdown() {
