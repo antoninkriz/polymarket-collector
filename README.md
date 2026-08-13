@@ -19,7 +19,7 @@ Polymarket WS ──▶ polymarket-orderbook-rust-pubsub ──▶ Redis Stream 
   maintains the Redis active-markets cache and lifecycle event stream.
 - `services/polymarket/polymarket-orderbook-rust-pubsub` — Rust; the only service
   holding Polymarket WS connections. Captures receive time plus one compact
-  observed-order sequence and appends all four event variants to a durable
+  observed-order sequence and appends all seven event variants to a durable
   Redis Stream. A renewable Redis lease and fenced `XADD` enforce one
   authoritative publisher.
 - `services/polymarket/polymarket-orderbook-rust-from-pubsub` — Rust; consumes the
@@ -66,4 +66,6 @@ To also record into ClickHouse, set `CLICKHOUSE_PASSWORD`, start
 `obdata-polymarket-orderbook-rust-from-pubsub` to the `up` command.
 
 The v3 data contract and replay rules are documented in
-[`docs/POLYMARKET_V3.md`](docs/POLYMARKET_V3.md).
+[`docs/POLYMARKET_V3.md`](docs/POLYMARKET_V3.md). The exact per-file Parquet
+schemas are documented in
+[`docs/PARQUET_EXPORT.md`](docs/PARQUET_EXPORT.md).

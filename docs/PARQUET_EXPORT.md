@@ -1,0 +1,223 @@
+# Polymarket v3 Parquet export format
+
+This document is the file-level contract for the event-specific v3 archive.
+For collection guarantees, deduplication, restart ordering, and replay rules,
+see [`POLYMARKET_V3.md`](POLYMARKET_V3.md).
+
+## Directory layout
+
+Each completed UTC receive-time hour contains seven Parquet files and one JSON
+manifest:
+
+```text
+2026-08-13/14/
+├── best_bid_ask.parquet
+├── book.parquet
+├── last_trade_price.parquet
+├── market_resolved.parquet
+├── new_market.parquet
+├── price_change.parquet
+├── tick_size_change.parquet
+└── manifest.json
+```
+
+Dates use `YYYY-MM-DD`; hours are zero-padded from `00` through `23`. The
+filename is the event type, so Parquet files do not contain an `event_type`
+column. Every file is present even when it has zero rows. Treat the hour as
+complete only when `manifest.json` exists.
+
+Parquet files use ZSTD level 1 and are sorted by `sequence` ascending. To
+recreate the complete observed stream, k-way merge the seven files on
+`sequence`.
+
+## Type and identifier conventions
+
+All seven files begin with the same non-null columns, in this order:
+
+| Column | Arrow type | Meaning |
+|---|---|---|
+| `timestamp_received` | `timestamp[ns, tz=UTC]` | Collector userspace receive time, sampled as soon as the WebSocket library yields the frame. |
+| `sequence` | `uint64` | Globally ordered collector observation and retry identity. This is the authoritative replay order. |
+| `timestamp` | `timestamp[ms, tz=UTC]` | Millisecond source timestamp supplied by Polymarket. Do not use it to break ordering ties. |
+| `market` | `fixed_size_binary[32]` | Raw 32-byte market condition ID, decoded from the source `0x` hexadecimal string. |
+
+Other types used below are:
+
+| Type | Representation |
+|---|---|
+| `asset_id`, `winning_asset_id` | Unsigned decimal token ID encoded as exactly 32 big-endian bytes (`fixed_size_binary[32]`). |
+| `transaction_hash` | Raw 32 bytes decoded from the source `0x` hexadecimal transaction hash (`fixed_size_binary[32]`). |
+| price or tick size | `decimal128(9, 4)`. Read as an exact decimal, never as binary floating point. |
+| size | `decimal128(18, 6)`. Read as an exact decimal. |
+| string | Arrow UTF-8 string. |
+| list | Arrow list whose element type is shown in the file schema. |
+
+Binary identifiers deliberately match the fixed-width representation used by
+`pmxtdata`. For example, render `market` or `transaction_hash` as source-style
+text with `"0x" + value.hex()`, and recover a decimal token ID with an unsigned
+big-endian integer conversion. Malformed or out-of-range identifiers abort the
+hour export instead of being truncated, padded ambiguously, or wrapped.
+
+`Nullable` below means a genuine field that the normalized source event may
+omit. It never means that the field belongs to some other event type.
+List elements are non-null; a non-null list itself may still be empty.
+
+## `book.parquet`
+
+A row is a complete aggregated depth snapshot for one outcome asset. It
+replaces the previously reconstructed book for that asset.
+
+Columns after the common prefix:
+
+| Column | Arrow type | Nullable | Meaning |
+|---|---|---:|---|
+| `asset_id` | `fixed_size_binary[32]` | no | Outcome token whose orderbook is represented. |
+| `bids` | `string` | no | Compact JSON array of aggregated bid levels. |
+| `asks` | `string` | no | Compact JSON array of aggregated ask levels. |
+
+`bids` and `asks` are JSON strings, not Arrow list columns. Each contains
+two-string level arrays in source order:
+
+```json
+[["0.48","30"],["0.49","20"]]
+```
+
+Each level is `[price, size]`; both values remain decimal strings inside the
+JSON. Empty sides are encoded as `[]`. The upstream book-content `hash` is not
+exported because it is neither a unique event ID nor needed for reconstruction.
+
+## `price_change.parquet`
+
+A row assigns the new aggregate size at one `(asset_id, side, price)` level.
+Set that level to `size`; remove it when `size == 0`. One upstream message can
+contain multiple changes. The collector emits them as separate consecutive
+rows in their original array order.
+
+Columns after the common prefix:
+
+| Column | Arrow type | Nullable | Meaning |
+|---|---|---:|---|
+| `asset_id` | `fixed_size_binary[32]` | no | Outcome token being changed. |
+| `price` | `decimal128(9, 4)` | no | Affected price level. |
+| `size` | `decimal128(18, 6)` | no | New aggregate size, not a signed size delta. Zero removes the level. |
+| `side` | `string` | no | `BUY` for the bid side or `SELL` for the ask side. |
+| `best_bid` | `decimal128(9, 4)` | yes | Source-provided best bid after the change, when present. |
+| `best_ask` | `decimal128(9, 4)` | yes | Source-provided best ask after the change, when present. |
+
+The upstream per-change `hash` is intentionally omitted. It is not safe for
+deduplication. Orderbook reconstruction uses `price`, `size`, and `side`; the
+optional best prices are accompanying observations, not additional deltas.
+
+## `last_trade_price.parquet`
+
+A row is one trade-execution notification observed on the public market
+channel. Preserve every row in `sequence` order, including rows with identical
+payload values or the same transaction hash.
+
+Columns after the common prefix:
+
+| Column | Arrow type | Nullable | Meaning |
+|---|---|---:|---|
+| `asset_id` | `fixed_size_binary[32]` | no | Outcome token that traded. |
+| `price` | `decimal128(9, 4)` | no | Execution price. |
+| `size` | `decimal128(18, 6)` | no | Executed size. |
+| `side` | `string` | no | `BUY` or `SELL`, from the taker's perspective. |
+| `fee_rate_bps` | `uint16` | no | Fee rate in basis points. |
+| `transaction_hash` | `fixed_size_binary[32]` | no | Polygon transaction containing the fill. It is metadata, not a unique fill ID. |
+
+One Polygon transaction can settle multiple fills. Never deduplicate on
+`transaction_hash`, or on any combination of the public payload columns. Only
+the collector-assigned `sequence` identifies a stored observation and collapses
+an at-least-once transport retry.
+
+## `tick_size_change.parquet`
+
+A row announces a change to the accepted order-price increment for one outcome
+asset. It does not change depth by itself.
+
+Columns after the common prefix:
+
+| Column | Arrow type | Nullable | Meaning |
+|---|---|---:|---|
+| `asset_id` | `fixed_size_binary[32]` | no | Outcome token whose tick size changed. |
+| `old_tick_size` | `decimal128(9, 4)` | no | Tick size before the event. |
+| `new_tick_size` | `decimal128(9, 4)` | no | Tick size after the event. |
+
+## `best_bid_ask.parquet`
+
+A row is an independently observed top-of-book notification enabled by
+Polymarket's `custom_feature_enabled` subscription option. It is useful for BBO
+analysis, but it is not a depth delta and must not be applied to reconstruct the
+book.
+
+Columns after the common prefix:
+
+| Column | Arrow type | Nullable | Meaning |
+|---|---|---:|---|
+| `asset_id` | `fixed_size_binary[32]` | no | Outcome token whose top of book was reported. |
+| `best_bid` | `decimal128(9, 4)` | yes | Best bid, or null when the source provides no bid. |
+| `best_ask` | `decimal128(9, 4)` | yes | Best ask, or null when the source provides no ask. |
+| `spread` | `decimal128(9, 4)` | yes | Source-provided ask-minus-bid spread, or null when unavailable. |
+
+## `new_market.parquet`
+
+A row announces a newly available binary market. This is a market-scoped
+lifecycle event, so there is no synthetic `asset_id` column.
+
+Columns after the common prefix:
+
+| Column | Arrow type | Nullable | Meaning |
+|---|---|---:|---|
+| `id` | `string` | no | Polymarket market ID. This is distinct from the binary condition ID in `market`. |
+| `assets_ids` | `list<fixed_size_binary[32]>` | no | Outcome token IDs in source order. |
+| `outcomes` | `list<string>` | no | Outcome labels in source order. |
+| `question` | `string` | yes | Human-readable market question, when supplied. |
+| `slug` | `string` | yes | Human-readable market URL slug, when supplied. |
+
+`assets_ids[i]` corresponds to `outcomes[i]`. V3 intentionally keeps only the
+identity and outcome-routing fields needed by the collector; descriptive
+payload fields such as `description`, `tags`, and `event_message` are not in
+this export.
+
+## `market_resolved.parquet`
+
+A row announces resolution of a binary market. This is also market-scoped and
+has no synthetic `asset_id` column.
+
+Columns after the common prefix:
+
+| Column | Arrow type | Nullable | Meaning |
+|---|---|---:|---|
+| `id` | `string` | no | Polymarket market ID. |
+| `assets_ids` | `list<fixed_size_binary[32]>` | no | All outcome token IDs in source order. |
+| `winning_asset_id` | `fixed_size_binary[32]` | yes | Winning outcome token, when supplied. |
+| `winning_outcome` | `string` | yes | Winning outcome label, when supplied. |
+
+The winning fields describe the resolution and do not mutate an orderbook.
+Parent-event metadata and tags from the upstream lifecycle payload are not
+exported.
+
+## `manifest.json`
+
+The manifest is uploaded only after all seven Parquet objects. Its presence is
+the sole completion marker for the hour. It contains:
+
+| Field | Meaning |
+|---|---|
+| `hour_utc` | Exported UTC hour. |
+| `row_count` | Total rows across all seven files. |
+| `min_sequence`, `max_sequence` | Hour-wide sequence bounds, or null for an entirely empty hour. |
+| `files` | Object keyed by event type with file path, columns, row count, byte size, SHA-256 digest, and per-file sequence bounds. |
+| `source_table` | ClickHouse table used for the export. |
+| `order_by` | Columns defining row order; currently `["sequence"]`. |
+| `created_at` | UTC time when the manifest was produced. |
+
+Consumers should verify the listed byte size and SHA-256 when downloading an
+archive. Objects from an interrupted export may exist without a manifest; do
+not treat those objects as a completed hour.
+
+The upstream event definitions are documented by Polymarket's
+[Market Channel reference](https://docs.polymarket.com/api-reference/wss/market).
+The archive contract above describes the normalized representation actually
+written by this repository, which is deliberately smaller than the upstream
+wire payload.

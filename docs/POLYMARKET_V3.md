@@ -122,13 +122,17 @@ The date is ISO ordered and the hour is always zero-padded from `00` through
 `23`. The directory and filename encode the hour and event type, so neither is
 repeated as a Parquet column.
 
+The complete per-file data dictionary—including column order, Arrow types,
+nullability, identifier encoding, field semantics, and the manifest contract—is
+in [`PARQUET_EXPORT.md`](PARQUET_EXPORT.md).
+
 Every file has these non-null common columns:
 
 | Column | Arrow/Parquet type |
 |---|---|
-| `timestamp_received` | `timestamp[ns, UTC]` |
+| `timestamp_received` | `timestamp[ns, tz=UTC]` |
 | `sequence` | `uint64` |
-| `timestamp` | `timestamp[ms, UTC]` |
+| `timestamp` | `timestamp[ms, tz=UTC]` |
 | `market` | `fixed_size_binary[32]` |
 
 The remaining columns are specific to the file:
