@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use polymarket_orderbook_rust::events::{Event, Level};
+use polymarket_orderbook_rust::record::CollectorContext;
 use polymarket_orderbook_rust::sink::{Sink, SinkConfig, SinkItem, SinkSchema};
 use reqwest::Client;
 use rust_decimal::Decimal;
@@ -27,6 +28,7 @@ fn ch_password() -> String {
 }
 const CH_DATABASE: &str = "default";
 const CH_TABLE: &str = "polymarket_orderbook_rust_test_typed_cli";
+const CH_V3_TABLE: &str = "polymarket_orderbook_rust_test_v3_cli";
 
 fn dec(s: &str) -> Decimal {
     s.parse().unwrap()
@@ -229,5 +231,114 @@ async fn typed_sink_writes_to_clickhouse_end_to_end() -> Result<()> {
     // Clean up so the test is idempotent.
     query(&http, &format!("DROP TABLE {CH_DATABASE}.{CH_TABLE}")).await?;
 
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn v3_sink_deduplicates_only_transport_retries() -> Result<()> {
+    let http = Client::new();
+    query(
+        &http,
+        &format!("DROP TABLE IF EXISTS {CH_DATABASE}.{CH_V3_TABLE}"),
+    )
+    .await?;
+
+    let sink = Sink::connect(SinkConfig {
+        url: CH_URL.into(),
+        user: CH_USER.into(),
+        password: ch_password(),
+        database: CH_DATABASE.into(),
+        table: CH_V3_TABLE.into(),
+        drop_table_on_start: true,
+        exclude_hash: false,
+        batch_size: 3,
+        flush_interval: Duration::from_millis(200),
+        ttl_minutes: 0,
+        schema: SinkSchema::V3,
+    })
+    .await?;
+
+    let trade = Event::LastTradePrice {
+        market: "0xmarket".into(),
+        asset_id: "asset".into(),
+        timestamp: "1757908892351".into(),
+        price: dec("0.42"),
+        size: dec("75"),
+        side: "BUY".into(),
+        fee_rate_bps: "10".into(),
+        transaction_hash: "0xsame-transaction".into(),
+    };
+    let collector = CollectorContext::new();
+    let first = collector
+        .next_message(4, 1, 10, 0, 1, 1_757_908_892_351_123_456)
+        .record(
+            trade.clone(),
+            0,
+            1,
+            "{\"event_type\":\"last_trade_price\"}".into(),
+        );
+    let second = collector
+        .next_message(4, 1, 11, 0, 1, 1_757_908_892_351_123_457)
+        .record(trade, 0, 1, "{\"event_type\":\"last_trade_price\"}".into());
+
+    let (tx, rx) = mpsc::channel::<SinkItem>(8);
+    let handle = tokio::spawn(sink.run(rx, None));
+    tx.send(SinkItem {
+        record: first.clone(),
+        delivery_id: Some("1-0".into()),
+    })
+    .await?;
+    tx.send(SinkItem {
+        record: first,
+        delivery_id: Some("1-1".into()),
+    })
+    .await?;
+    tx.send(SinkItem {
+        record: second,
+        delivery_id: Some("1-2".into()),
+    })
+    .await?;
+    drop(tx);
+    handle.await??;
+
+    let final_count = query(
+        &http,
+        &format!("SELECT count() FROM {CH_DATABASE}.{CH_V3_TABLE} FINAL FORMAT TabSeparated"),
+    )
+    .await?;
+    assert_eq!(final_count.trim(), "2");
+
+    let rows = query(
+        &http,
+        &format!(
+            "SELECT receive_sequence, toUnixTimestamp64Nano(timestamp_received), transaction_hash \
+             FROM {CH_DATABASE}.{CH_V3_TABLE} FINAL \
+             ORDER BY receive_sequence FORMAT TabSeparated"
+        ),
+    )
+    .await?;
+    let rows: Vec<&str> = rows.lines().collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], "0\t1757908892351123456\t0xsame-transaction");
+    assert_eq!(rows[1], "1\t1757908892351123457\t0xsame-transaction");
+
+    let ddl = query(
+        &http,
+        &format!(
+            "SELECT create_table_query FROM system.tables \
+             WHERE database = '{CH_DATABASE}' AND name = '{CH_V3_TABLE}' \
+             FORMAT TabSeparatedRaw"
+        ),
+    )
+    .await?;
+    assert!(ddl.contains("ReplacingMergeTree"), "DDL: {ddl}");
+    assert!(
+        ddl.contains("message_id, row_index, receive_sequence"),
+        "DDL: {ddl}"
+    );
+    assert!(ddl.contains("DateTime64(9, 'UTC')"), "DDL: {ddl}");
+
+    query(&http, &format!("DROP TABLE {CH_DATABASE}.{CH_V3_TABLE}")).await?;
     Ok(())
 }
