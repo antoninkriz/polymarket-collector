@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -17,7 +19,82 @@ log = logging.getLogger(__name__)
 
 FETCH_BATCH_SIZE = 100
 REQUEST_TIMEOUT_SECONDS = 30
-MAX_RETRIES = 3
+CONNECT_RETRIES = 3
+# Gamma /markets allows 300 requests per 10 seconds. Keep ample reserve for
+# other processes sharing the same public IP.
+GAMMA_REQUESTS_PER_SECOND = 10
+GAMMA_REQUEST_INTERVAL_SECONDS = 1 / GAMMA_REQUESTS_PER_SECOND
+GAMMA_RATE_LIMIT_RETRY_SECONDS = 10.0
+
+
+class GammaClient:
+    """Rate-limited HTTP client for the Polymarket Gamma API."""
+
+    def __init__(self) -> None:
+        transport = httpx2.AsyncHTTPTransport(
+            retries=CONNECT_RETRIES,
+            http2=True,
+        )
+        self._client = httpx2.AsyncClient(
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            transport=transport,
+        )
+        self._request_lock = asyncio.Lock()
+        self._next_request_at = 0.0
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        await self._client.aclose()
+
+    async def get(
+        self,
+        path: str,
+        params: Mapping[str, str | int | float | bool],
+    ) -> httpx2.Response:
+        """Return a successful Gamma response while respecting its rate limit."""
+        while True:
+            await self._wait_for_request_slot()
+            response = await self._client.get(
+                f"{GAMMA_API}{path}",
+                params=params,
+            )
+            if response.status_code != 429:
+                response.raise_for_status()
+                return response
+
+            retry_seconds = _retry_after_seconds(response)
+            log.warning(
+                "Gamma rate limit reached for %s; retrying in %.1f seconds",
+                path,
+                retry_seconds,
+            )
+            await self._defer_requests(retry_seconds)
+
+    async def _wait_for_request_slot(self) -> None:
+        async with self._request_lock:
+            loop = asyncio.get_running_loop()
+            delay = self._next_request_at - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._next_request_at = loop.time() + GAMMA_REQUEST_INTERVAL_SECONDS
+
+    async def _defer_requests(self, seconds: float) -> None:
+        async with self._request_lock:
+            loop = asyncio.get_running_loop()
+            self._next_request_at = max(
+                self._next_request_at,
+                loop.time() + seconds,
+            )
+
+
+def _retry_after_seconds(response: httpx2.Response) -> float:
+    raw_retry_after = response.headers.get("Retry-After")
+    if raw_retry_after is None:
+        return GAMMA_RATE_LIMIT_RETRY_SECONDS
+    try:
+        return max(float(raw_retry_after), 0.0)
+    except ValueError:
+        return GAMMA_RATE_LIMIT_RETRY_SECONDS
 
 
 @dataclass
@@ -88,7 +165,7 @@ def parse_markets(raw_markets: list[dict]) -> ActiveMarkets:
     )
 
 
-async def fetch_active_markets_from_gamma() -> ActiveMarkets:
+async def fetch_active_markets_from_gamma(client: GammaClient) -> ActiveMarkets:
     """Fetch all active binary markets from the Gamma API via keyset pagination.
 
     Uses the /markets/keyset endpoint, which is cursor-based and has no
@@ -106,26 +183,21 @@ async def fetch_active_markets_from_gamma() -> ActiveMarkets:
     raw_markets: list[dict] = []
     cursor: Optional[str] = None
 
-    transport = httpx2.AsyncHTTPTransport(retries=MAX_RETRIES, http2=True)
-    async with httpx2.AsyncClient(
-        timeout=REQUEST_TIMEOUT_SECONDS, transport=transport
-    ) as client:
-        while True:
-            params = dict(base_params)
-            if cursor:
-                params["after_cursor"] = cursor
-            resp = await client.get(f"{GAMMA_API}/markets/keyset", params=params)
-            resp.raise_for_status()
-            body = resp.json()
+    while True:
+        params = dict(base_params)
+        if cursor:
+            params["after_cursor"] = cursor
+        response = await client.get("/markets/keyset", params=params)
+        body = response.json()
 
-            batch = body.get("markets", []) if isinstance(body, dict) else []
-            if not batch:
-                break
-            raw_markets.extend(batch)
+        batch = body.get("markets", []) if isinstance(body, dict) else []
+        if not batch:
+            break
+        raw_markets.extend(batch)
 
-            cursor = body.get("next_cursor") if isinstance(body, dict) else None
-            if not cursor:
-                break
+        cursor = body.get("next_cursor") if isinstance(body, dict) else None
+        if not cursor:
+            break
 
     log.info("Fetched %d markets via keyset", len(raw_markets))
     return parse_markets(raw_markets)

@@ -18,22 +18,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import click
-import httpx2
 from dotenv import load_dotenv
 
 from obdata.cache import CacheData, RedisMarketCache
-from obdata.constants import GAMMA_API, STREAM_MARKET_EVENTS, require_redis_url
+from obdata.constants import STREAM_MARKET_EVENTS, require_redis_url
 from obdata.messaging import RedisStreamPublisher
 from obdata.polymarket import MarketSubscription
 
-from obdata.gamma import fetch_active_markets_from_gamma, parse_markets
+from obdata.gamma import GammaClient, fetch_active_markets_from_gamma, parse_markets
 
 log = logging.getLogger(__name__)
 
 FETCH_BATCH_SIZE = 100
 DEFAULT_POLL_INTERVAL_SECONDS = 10
-REQUEST_TIMEOUT = httpx2.Timeout(connect=3, read=20, write=5, pool=5)
-MAX_RETRIES = 3
 CLOSED_TIME_OVERLAP = timedelta(minutes=30)
 
 
@@ -82,6 +79,7 @@ def _extract_winning_outcome(market_data: dict) -> tuple[Optional[str], Optional
 
 
 async def _fetch_recently_closed_markets(
+    gamma: GammaClient,
     active_markets: dict[str, MarketSubscription],
 ) -> tuple[list[dict], int, int]:
     """Fetch closed markets paged newest-first; return those in active_markets.
@@ -103,40 +101,38 @@ async def _fetch_recently_closed_markets(
     total_fetched = 0
     stop = False
 
-    transport = httpx2.AsyncHTTPTransport(retries=MAX_RETRIES, http2=True)
-    async with httpx2.AsyncClient(
-        timeout=REQUEST_TIMEOUT, transport=transport
-    ) as client:
-        while not stop:
-            params = {
-                **base_params,
-                "limit": FETCH_BATCH_SIZE,
-                "offset": offset,
-            }
-            response = await client.get(f"{GAMMA_API}/markets", params=params)
-            requests_made += 1
-            response.raise_for_status()
-            batch = response.json()
+    while not stop:
+        params = {
+            **base_params,
+            "limit": FETCH_BATCH_SIZE,
+            "offset": offset,
+        }
+        response = await gamma.get("/markets", params=params)
+        requests_made += 1
+        batch = response.json()
 
-            if not batch:
+        if not batch:
+            break
+
+        total_fetched += len(batch)
+        for market_data in batch:
+            closed_time = _parse_closed_time(market_data.get("closedTime"))
+            if closed_time is not None and closed_time < cutoff:
+                stop = True
                 break
+            market = market_data.get("conditionId", "")
+            if market and market in active_markets:
+                matched.append(market_data)
 
-            total_fetched += len(batch)
-            for market_data in batch:
-                closed_time = _parse_closed_time(market_data.get("closedTime"))
-                if closed_time is not None and closed_time < cutoff:
-                    stop = True
-                    break
-                market = market_data.get("conditionId", "")
-                if market and market in active_markets:
-                    matched.append(market_data)
-
-            offset += len(batch)
+        offset += len(batch)
 
     return matched, requests_made, total_fetched
 
 
-async def _fetch_new_markets(max_start_date: datetime) -> tuple[list[dict], int]:
+async def _fetch_new_markets(
+    gamma: GammaClient,
+    max_start_date: datetime,
+) -> tuple[list[dict], int]:
     """Fetch active markets with startDate >= max_start_date.
 
     Queries with:
@@ -155,26 +151,21 @@ async def _fetch_new_markets(max_start_date: datetime) -> tuple[list[dict], int]
     offset = 0
     requests_made = 0
 
-    transport = httpx2.AsyncHTTPTransport(retries=MAX_RETRIES, http2=True)
-    async with httpx2.AsyncClient(
-        timeout=REQUEST_TIMEOUT, transport=transport
-    ) as client:
-        while True:
-            params = {
-                **base_params,
-                "limit": FETCH_BATCH_SIZE,
-                "offset": offset,
-            }
-            response = await client.get(f"{GAMMA_API}/markets", params=params)
-            requests_made += 1
-            response.raise_for_status()
-            batch = response.json()
+    while True:
+        params = {
+            **base_params,
+            "limit": FETCH_BATCH_SIZE,
+            "offset": offset,
+        }
+        response = await gamma.get("/markets", params=params)
+        requests_made += 1
+        batch = response.json()
 
-            if not batch:
-                break
+        if not batch:
+            break
 
-            results.extend(batch)
-            offset += len(batch)
+        results.extend(batch)
+        offset += len(batch)
 
     return results, requests_made
 
@@ -249,6 +240,7 @@ def _parse_closed_time(value: object) -> Optional[datetime]:
 
 
 async def _resolution_poller(
+    gamma: GammaClient,
     active_markets: dict[str, MarketSubscription],
     publisher: RedisStreamPublisher,
     cache: RedisMarketCache,
@@ -267,6 +259,7 @@ async def _resolution_poller(
                 requests_made,
                 total_fetched,
             ) = await _fetch_recently_closed_markets(
+                gamma,
                 active_markets,
             )
 
@@ -339,6 +332,7 @@ def _serialize_new_market_event(market_data: dict) -> dict[str, str]:
 
 
 async def _new_markets_poller(
+    gamma: GammaClient,
     active_markets: dict[str, MarketSubscription],
     publisher: RedisStreamPublisher,
     cache: RedisMarketCache,
@@ -384,7 +378,10 @@ async def _new_markets_poller(
         await asyncio.sleep(poll_interval)
 
         try:
-            raw_markets, requests_made = await _fetch_new_markets(current_max)
+            raw_markets, requests_made = await _fetch_new_markets(
+                gamma,
+                current_max,
+            )
             parsed = parse_markets(raw_markets)
             raw_by_market = {r.get("conditionId", ""): r for r in raw_markets}
 
@@ -435,8 +432,10 @@ async def _run(poll_interval: int) -> None:
     cache = RedisMarketCache(redis_url)
     await cache.connect()
 
+    gamma = GammaClient()
+
     # Fetch all active markets from Gamma API
-    result = await fetch_active_markets_from_gamma()
+    result = await fetch_active_markets_from_gamma(gamma)
     active_markets: dict[str, MarketSubscription] = {
         m.market: m for m in result.markets
     }
@@ -444,6 +443,7 @@ async def _run(poll_interval: int) -> None:
 
     if result.min_start_date is None or result.max_start_date is None:
         log.error("No startDate found across active markets, cannot run pollers")
+        await gamma.close()
         return
 
     log.info(
@@ -464,12 +464,23 @@ async def _run(poll_interval: int) -> None:
     tasks: list[asyncio.Task[None]] = []
     try:
         resolution_task = asyncio.create_task(
-            _resolution_poller(active_markets, publisher, cache, poll_interval),
+            _resolution_poller(
+                gamma,
+                active_markets,
+                publisher,
+                cache,
+                poll_interval,
+            ),
             name="resolution-poller",
         )
         markets_task = asyncio.create_task(
             _new_markets_poller(
-                active_markets, publisher, cache, result.max_start_date, poll_interval
+                gamma,
+                active_markets,
+                publisher,
+                cache,
+                result.max_start_date,
+                poll_interval,
             ),
             name="markets-poller",
         )
@@ -487,6 +498,7 @@ async def _run(poll_interval: int) -> None:
         await _save_cache(cache, active_markets)
         await cache.close()
         await publisher.close()
+        await gamma.close()
 
 
 # -- CLI ----------------------------------------------------------------------

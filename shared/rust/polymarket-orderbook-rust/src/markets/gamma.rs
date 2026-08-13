@@ -4,20 +4,25 @@
 //! filters to binary markets (exactly 2 outcomes / 2 CLOB tokens), and
 //! produces [`Market`]s in the same shape as the Redis cache.
 //!
-//! The Python version (`gamma.py`) parallelizes pages with a semaphore.
-//! This Rust port uses sequential pagination — it's a startup-only path
-//! that only runs under `SKIP_ACTIVE_MARKETS_CACHE=true`, which the
-//! production deployment doesn't set.
+//! This is a startup-only path that runs under
+//! `SKIP_ACTIVE_MARKETS_CACHE=true`, which the production deployment doesn't
+//! set. Requests are paced and retried after rate-limit responses so this
+//! fallback cannot create a tight restart loop.
+
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use reqwest::StatusCode;
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::events::Market;
 
 pub const GAMMA_BASE_URL: &str = "https://gamma-api.polymarket.com";
 const FETCH_BATCH_SIZE: usize = 500;
 const MAX_OFFSET: usize = 60_000;
+const REQUEST_INTERVAL: Duration = Duration::from_millis(100);
+const RATE_LIMIT_RETRY: Duration = Duration::from_secs(10);
 
 /// Fetch all active binary markets from the Gamma API by paging.
 pub async fn fetch_active_markets(http: &reqwest::Client) -> Result<Vec<Market>> {
@@ -37,6 +42,22 @@ pub async fn fetch_active_markets(http: &reqwest::Client) -> Result<Vec<Market>>
             .send()
             .await
             .context("gamma /markets request")?;
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(RATE_LIMIT_RETRY)
+                .max(REQUEST_INTERVAL);
+            warn!(
+                retry_seconds = retry_after.as_secs(),
+                "gamma rate limit reached"
+            );
+            tokio::time::sleep(retry_after).await;
+            continue;
+        }
         if !resp.status().is_success() {
             anyhow::bail!("gamma /markets status: {}", resp.status());
         }
@@ -63,6 +84,7 @@ pub async fn fetch_active_markets(http: &reqwest::Client) -> Result<Vec<Market>>
         if offset >= MAX_OFFSET {
             break;
         }
+        tokio::time::sleep(REQUEST_INTERVAL).await;
     }
 
     info!(total_binary_markets = all.len(), "gamma fetch complete");
