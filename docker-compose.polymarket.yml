@@ -123,7 +123,6 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       CLICKHOUSE_DATABASE: default
       CLICKHOUSE_TABLE: polymarket_orderbook_v3
-      DROP_TABLE_ON_START: "false"
       FLUSH_BATCH_SIZE: "5000"
       FLUSH_INTERVAL_MS: "500"
       QUEUE_SIZE: "5000000"

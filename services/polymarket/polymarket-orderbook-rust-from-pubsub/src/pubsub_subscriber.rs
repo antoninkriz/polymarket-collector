@@ -159,7 +159,7 @@ async fn consume_once(
                 inbound_tx
                     .send(SinkItem {
                         record,
-                        delivery_id: Some(entry.id),
+                        delivery_id: entry.id,
                     })
                     .await
                     .map_err(|_| anyhow::anyhow!("ClickHouse sink channel closed"))?;

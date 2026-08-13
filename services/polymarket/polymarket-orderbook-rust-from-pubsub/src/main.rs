@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use polymarket_orderbook_rust::sink::{Sink, SinkConfig, SinkItem, SinkSchema};
+use polymarket_orderbook_rust::sink::{Sink, SinkConfig, SinkItem};
 
 use polymarket_orderbook_rust_from_pubsub::config::Config;
 use polymarket_orderbook_rust_from_pubsub::pubsub_subscriber::{
@@ -58,18 +58,13 @@ async fn main() -> Result<()> {
         password: cfg.clickhouse_password.clone(),
         database: cfg.clickhouse_database.clone(),
         table: cfg.clickhouse_table.clone(),
-        drop_table_on_start: cfg.drop_table_on_start,
-        // V3 always retains the source hash for audit. This option only
-        // affects the legacy raw sink.
-        exclude_hash: false,
         batch_size: cfg.flush_batch_size,
         flush_interval: cfg.flush_interval,
         ttl_minutes: cfg.ttl_minutes,
-        schema: SinkSchema::V3,
     })
     .await
     .context("connect Polymarket ClickHouse sink")?;
-    let mut sink_handle: JoinHandle<Result<()>> = tokio::spawn(sink.run(event_rx, Some(ack_tx)));
+    let mut sink_handle: JoinHandle<Result<()>> = tokio::spawn(sink.run(event_rx, ack_tx));
 
     let stats = SubscriberStats::new();
     let subscriber_cfg = PubSubSubscriberConfig {

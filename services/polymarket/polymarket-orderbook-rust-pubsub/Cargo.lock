@@ -1083,21 +1083,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "clap",
- "dotenvy",
  "futures-util",
- "rand 0.8.6",
  "redis",
  "reqwest",
  "rust_decimal",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
  "tracing",
- "tracing-subscriber",
- "url",
 ]
 
 [[package]]

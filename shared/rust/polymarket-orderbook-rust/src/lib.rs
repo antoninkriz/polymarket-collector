@@ -3,7 +3,6 @@
 //! Declares the module tree so it can be consumed by both `main.rs` and
 //! the integration tests in `tests/`.
 
-pub mod config;
 pub mod events;
 pub mod markets;
 pub mod record;

@@ -23,7 +23,6 @@ pub struct Config {
     pub clickhouse_password: String,
     pub clickhouse_database: String,
     pub clickhouse_table: String,
-    pub drop_table_on_start: bool,
     pub flush_batch_size: usize,
     pub flush_interval: Duration,
     pub ttl_minutes: u64,
@@ -50,7 +49,6 @@ impl Config {
             clickhouse_password: env_or("CLICKHOUSE_PASSWORD", ""),
             clickhouse_database: env_or("CLICKHOUSE_DATABASE", "default"),
             clickhouse_table: env_or("CLICKHOUSE_TABLE", "polymarket_orderbook_v3"),
-            drop_table_on_start: env_bool("DROP_TABLE_ON_START"),
             flush_batch_size: env_usize_or("FLUSH_BATCH_SIZE", DEFAULT_FLUSH_BATCH_SIZE)?,
             flush_interval: Duration::from_millis(env_u64_or(
                 "FLUSH_INTERVAL_MS",
