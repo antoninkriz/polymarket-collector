@@ -106,6 +106,12 @@ ensure_environment() {
         # Container root maps to the invoking user under a rootless runtime.
         LOCAL_RUN_UID=0
         LOCAL_RUN_GID=0
+        export CONTAINER_NOFILE_LIMIT
+        CONTAINER_NOFILE_LIMIT=$(ulimit -Hn)
+        if [[ $CONTAINER_NOFILE_LIMIT == unlimited ]]; then
+            CONTAINER_NOFILE_LIMIT=-1
+        fi
+        echo "Capping container nofile limits at $CONTAINER_NOFILE_LIMIT"
     else
         LOCAL_RUN_UID=$(id -u)
         LOCAL_RUN_GID=$(id -g)

@@ -34,8 +34,8 @@ services:
       - "127.0.0.1:9003:9000"
     ulimits:
       nofile:
-        soft: 262144
-        hard: 262144
+        soft: ${CONTAINER_NOFILE_LIMIT:-262144}
+        hard: ${CONTAINER_NOFILE_LIMIT:-262144}
 
   obdata-redis:
     image: docker.io/library/redis:8.10.0-trixie

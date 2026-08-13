@@ -58,8 +58,8 @@ services:
       - obdata-polymarket-active-markets
     ulimits:
       nofile:
-        soft: 65536
-        hard: 65536
+        soft: ${CONTAINER_NOFILE_LIMIT:-65536}
+        hard: ${CONTAINER_NOFILE_LIMIT:-65536}
     environment:
       # Redis (host-local)
       REDIS_URL: redis://localhost:6380
@@ -110,8 +110,8 @@ services:
       - obdata-polymarket-orderbook-rust-pubsub
     ulimits:
       nofile:
-        soft: 65536
-        hard: 65536
+        soft: ${CONTAINER_NOFILE_LIMIT:-65536}
+        hard: ${CONTAINER_NOFILE_LIMIT:-65536}
     environment:
       # Redis (host-local) — same durable stream as the publisher
       REDIS_URL: redis://localhost:6380
