@@ -18,8 +18,7 @@ name: obdata-polymarket
 #
 #   obdata-polymarket-r2-archive-exporter
 #     Reads obdata-clickhouse `polymarket_orderbook_v3` and exports hourly
-#     replay-ordered Parquet snapshots. Uses the generic r2-archive exporter
-#     image with EXPORTER_PROFILE=polymarket_v3.
+#     replay-ordered Parquet snapshots.
 #
 # All services use `network_mode: host` so they reach the host-local
 # Redis (localhost:6380) and ClickHouse (localhost:8124).
@@ -139,7 +138,6 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      EXPORTER_PROFILE: polymarket_v3
       CLICKHOUSE_HOST: localhost
       CLICKHOUSE_PORT: "8124"
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}

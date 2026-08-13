@@ -12,7 +12,7 @@ disconnect boundaries explicit rather than claiming an exchange audit log.
 Polymarket Gamma REST ──▶ polymarket-active-markets ──▶ Redis (active_markets cache + market_events stream)
 Polymarket WS ──▶ polymarket-orderbook-rust-pubsub ──▶ Redis Stream `polymarket:events:v3`
                   polymarket-orderbook-rust-from-pubsub ──▶ ClickHouse `polymarket_orderbook_v3`
-                  r2-archive exporter (EXPORTER_PROFILE=polymarket_v3) ──▶ R2 hourly Parquet
+                  r2-archive exporter ──▶ R2 hourly Parquet
 ```
 
 - `services/polymarket/polymarket-active-markets` — Python; polls the Gamma API,
@@ -25,9 +25,8 @@ Polymarket WS ──▶ polymarket-orderbook-rust-pubsub ──▶ Redis Stream 
 - `services/polymarket/polymarket-orderbook-rust-from-pubsub` — Rust; consumes the
   stream and acknowledges rows only after the compact raw v3 ClickHouse insert.
   Logical ad-hoc reads use `FINAL` to collapse same-sequence transport retries.
-- `services/r2-archive/exporter` — generic exporter, run with
-  `EXPORTER_PROFILE=polymarket_v3`, projects typed hourly Parquet to the
-  bucket named by `R2_BUCKET`.
+- `services/r2-archive/exporter` — projects typed hourly Parquet to the bucket
+  named by `R2_BUCKET`.
 - `services/polymarket/orderbook-compare` — ad-hoc comparison script (was untracked
   on the prod server; preserved here).
 - `shared/rust/polymarket-orderbook-rust` — shared library crate (WS pool, REST

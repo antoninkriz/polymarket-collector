@@ -1,34 +1,8 @@
-"""Hourly orderbook → Cloudflare R2 exporter.
+"""Export compact Polymarket v3 ClickHouse rows to hourly Parquet in R2.
 
-Reads one hour of orderbook rows from ClickHouse, re-encodes to Parquet
-with DELTA_BINARY_PACKED on integer timestamp columns and ZSTD(1)
-dictionary encoding elsewhere, and uploads to R2. ClickHouse's own
-FORMAT Parquet writer never emits DELTA, so we fetch FORMAT ArrowStream
-and re-encode client-side (pass 6 in docs/data-dump-optimizations.md).
-
-Profiles, selected via ``EXPORTER_PROFILE`` env (default ``polymarket_v3``):
-
-* ``polymarket_v3`` — projects the compact raw
-  ``polymarket_orderbook_v3`` table into typed Parquet. ``FINAL`` removes
-  collector-owned retries by sequence. Market, asset, and transaction IDs are
-  emitted as 32-byte fixed-size binary values.
-
-* ``polymarket`` — legacy v2 compatibility profile. Rewrites the raw-JSON
-  ``polymarket_orderbook_rust``
-  source table into Schema D in the same SELECT: event-specific fields
-  as ``Nullable(...)`` only on owning event types, ``bids`` / ``asks``
-  as a single ``Nullable(String)`` holding the raw JSON depth (``NULL``
-  outside ``book`` events).
-
-* ``kalshi`` — pass-through ``SELECT *`` from the already-typed
-  ``kalshi_orderbook`` table (which natively uses ``Nullable`` columns
-  for non-owning event types — no JSON transform needed).
-
-* ``limitless`` — pass-through ``SELECT *`` from the already-typed
-  ``limitless_orderbook_rust`` table.
-
-* ``opinion`` — pass-through ``SELECT *`` from the already-typed
-  ``opinion_orderbook`` table.
+The query applies ``FINAL`` to collapse collector-owned retries, projects the
+normalized JSON into typed columns, and orders rows by ``(market, sequence)``.
+PyArrow writes ZSTD level 1 with delta encoding on integer columns.
 """
 
 from __future__ import annotations
@@ -37,10 +11,8 @@ import hashlib
 import json
 import logging
 import os
-import re
 import sys
 import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
@@ -67,105 +39,24 @@ R2_ACCESS_KEY = os.environ.get("R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.environ.get("R2_SECRET_KEY", "")
 R2_BUCKET = os.environ.get("R2_BUCKET", "")
 
-# Export
+# Export format
 PARQUET_COMPRESSION = "zstd"
 PARQUET_COMPRESSION_LEVEL = 1
+FILENAME_PREFIX = os.environ.get("FILENAME_PREFIX", "polymarket_orderbook_v3_")
+DELTA_ENCODED_COLUMNS = (
+    "timestamp",
+    "timestamp_received",
+    "sequence",
+    "fee_rate_bps",
+)
+SELECT_ORDER_BY = ("market", "sequence")
 EXPORT_DELAY_MINUTES = int(os.environ.get("EXPORT_DELAY_MINUTES", "5"))
 EXPORT_LAG_HOURS = int(os.environ.get("EXPORT_LAG_HOURS", "1"))
 LOOP_CHECK_INTERVAL_SECONDS = int(os.environ.get("LOOP_CHECK_INTERVAL_SECONDS", "60"))
 QUERY_MAX_RETRIES = 10
 QUERY_RETRY_DELAY_SECONDS = 10
 
-IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-
-# ---------- Profile ----------
-
-
-@dataclass(frozen=True)
-class Profile:
-    """Per-exchange exporter configuration."""
-
-    name: str
-    default_filename_prefix: str
-    delta_encoded_columns: tuple[str, ...]
-    default_select_order_by: tuple[str, ...]
-    select_template: str
-
-
-# Event-type ownership for the polymarket schema-D transform. Event
-# types populate only the columns they own; everything else is NULL.
-# Mirror of the table in docs/data-dump-optimizations.md.
-BOOK_EVENTS = ("book",)
-TRADE_LIKE_EVENTS = ("price_change", "last_trade_price")
-PRICE_CHANGE_EVENTS = ("price_change",)
-LAST_TRADE_EVENTS = ("last_trade_price",)
-TICK_SIZE_EVENTS = ("tick_size_change",)
-
-
-def _in_list(events: tuple[str, ...]) -> str:
-    """Render a tuple of event types as a SQL ``IN ('a','b')`` fragment."""
-    quoted = ",".join(f"'{e}'" for e in events)
-    return f"IN ({quoted})"
-
-
-POLYMARKET_SELECT_TEMPLATE = f"""
-SELECT
-    timestamp_received,
-    timestamp,
-    toFixedString(market, 66)                                      AS market,
-    event_type,
-    JSONExtractString(data, 'asset_id')                            AS asset_id,
-
-    if(event_type {_in_list(BOOK_EVENTS)},
-       JSONExtractString(data, 'bids'), NULL)                      AS bids,
-    if(event_type {_in_list(BOOK_EVENTS)},
-       JSONExtractString(data, 'asks'), NULL)                      AS asks,
-
-    if(event_type {_in_list(TRADE_LIKE_EVENTS)},
-       toDecimal32OrZero(JSONExtractString(data, 'price'), 4),
-       NULL)                                                       AS price,
-    if(event_type {_in_list(TRADE_LIKE_EVENTS)},
-       toDecimal64OrZero(JSONExtractString(data, 'size'), 6),
-       NULL)                                                       AS size,
-    if(event_type {_in_list(TRADE_LIKE_EVENTS)},
-       JSONExtractString(data, 'side'), NULL)                      AS side,
-
-    if(event_type {_in_list(PRICE_CHANGE_EVENTS)},
-       toDecimal32OrZero(JSONExtractString(data, 'best_bid'), 4),
-       NULL)                                                       AS best_bid,
-    if(event_type {_in_list(PRICE_CHANGE_EVENTS)},
-       toDecimal32OrZero(JSONExtractString(data, 'best_ask'), 4),
-       NULL)                                                       AS best_ask,
-
-    if(event_type {_in_list(LAST_TRADE_EVENTS)},
-       toUInt16OrZero(JSONExtractString(data, 'fee_rate_bps')),
-       NULL)                                                       AS fee_rate_bps,
-    if(event_type {_in_list(LAST_TRADE_EVENTS)},
-       JSONExtractString(data, 'transaction_hash'), NULL)          AS transaction_hash,
-
-    if(event_type {_in_list(TICK_SIZE_EVENTS)},
-       toDecimal32OrZero(JSONExtractString(data, 'old_tick_size'), 4),
-       NULL)                                                       AS old_tick_size,
-    if(event_type {_in_list(TICK_SIZE_EVENTS)},
-       toDecimal32OrZero(JSONExtractString(data, 'new_tick_size'), 4),
-       NULL)                                                       AS new_tick_size
-FROM {{source_table}}
-WHERE timestamp_received >= toDateTime64('{{target}}', 3)
-  AND timestamp_received <  toDateTime64('{{target}}', 3) + INTERVAL 1 HOUR
-ORDER BY {{order_by}}
-FORMAT ArrowStream
-"""
-
-PASSTHROUGH_SELECT_TEMPLATE = """
-SELECT * FROM {source_table}
-WHERE timestamp_received >= toDateTime64('{target}', 3)
-  AND timestamp_received <  toDateTime64('{target}', 3) + INTERVAL 1 HOUR
-ORDER BY {order_by}
-FORMAT ArrowStream
-"""
-
-POLYMARKET_V3_SELECT_TEMPLATE = """
+SELECT_TEMPLATE = """
 SELECT
     timestamp_received,
     sequence,
@@ -219,114 +110,8 @@ ORDER BY {order_by}
 FORMAT ArrowStream
 """
 
-PROFILES: dict[str, Profile] = {
-    "polymarket_v3": Profile(
-        name="polymarket_v3",
-        default_filename_prefix="polymarket_orderbook_v3_",
-        delta_encoded_columns=(
-            "timestamp",
-            "timestamp_received",
-            "sequence",
-            "fee_rate_bps",
-        ),
-        default_select_order_by=(
-            "market",
-            "sequence",
-        ),
-        select_template=POLYMARKET_V3_SELECT_TEMPLATE,
-    ),
-    "polymarket": Profile(
-        name="polymarket",
-        default_filename_prefix="polymarket_orderbook_",
-        delta_encoded_columns=("timestamp", "timestamp_received", "fee_rate_bps"),
-        default_select_order_by=("market", "asset_id", "timestamp_received"),
-        select_template=POLYMARKET_SELECT_TEMPLATE,
-    ),
-    "kalshi": Profile(
-        name="kalshi",
-        default_filename_prefix="kalshi_orderbook_",
-        delta_encoded_columns=("timestamp", "timestamp_received"),
-        default_select_order_by=("market_ticker", "timestamp_received"),
-        select_template=PASSTHROUGH_SELECT_TEMPLATE,
-    ),
-    "limitless": Profile(
-        name="limitless",
-        default_filename_prefix="limitless_orderbook_",
-        delta_encoded_columns=(
-            "timestamp",
-            "timestamp_received",
-            "fee_rate_bps",
-            "receive_sequence",
-            "row_index",
-        ),
-        default_select_order_by=(
-            "market",
-            "asset_id",
-            "timestamp_received",
-            "receive_sequence",
-            "row_index",
-        ),
-        select_template=PASSTHROUGH_SELECT_TEMPLATE,
-    ),
-    "opinion": Profile(
-        name="opinion",
-        default_filename_prefix="opinion_orderbook_",
-        delta_encoded_columns=(
-            "timestamp",
-            "timestamp_received",
-            "receive_sequence",
-            "row_index",
-        ),
-        default_select_order_by=(
-            "market",
-            "asset_id",
-            "timestamp_received",
-            "receive_sequence",
-            "row_index",
-        ),
-        select_template=PASSTHROUGH_SELECT_TEMPLATE,
-    ),
-}
 
-EXPORTER_PROFILE = os.environ.get("EXPORTER_PROFILE", "polymarket_v3")
-if EXPORTER_PROFILE not in PROFILES:
-    raise SystemExit(
-        f"Unknown EXPORTER_PROFILE={EXPORTER_PROFILE!r}; "
-        f"expected one of {sorted(PROFILES)}"
-    )
-PROFILE = PROFILES[EXPORTER_PROFILE]
-
-FILENAME_PREFIX = os.environ.get("FILENAME_PREFIX", PROFILE.default_filename_prefix)
-
-
-def _env_column_list(name: str, default: tuple[str, ...]) -> list[str]:
-    """Read a JSON array env var containing ClickHouse column identifiers."""
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return list(default)
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"{name} must be a JSON array of column names") from e
-
-    if not isinstance(parsed, list) or not parsed:
-        raise ValueError(f"{name} must be a non-empty JSON array of column names")
-
-    columns: list[str] = []
-    for value in parsed:
-        if not isinstance(value, str):
-            raise ValueError(f"{name} must contain only string column names")
-        column = value.strip()
-        if not IDENTIFIER_RE.fullmatch(column):
-            raise ValueError(f"{name} contains invalid column identifier: {value!r}")
-        columns.append(column)
-
-    return columns
-SELECT_ORDER_BY = _env_column_list("SELECT_ORDER_BY", PROFILE.default_select_order_by)
-
-
-# ---------- ClickHouse ----------
+# ClickHouse
 
 
 def _ch_query(query: str, timeout: int = 60) -> requests.Response:
@@ -388,13 +173,10 @@ def query_latest_received_hour() -> datetime | None:
 
 
 def fetch_hour_parquet(hour: datetime) -> bytes | None:
-    """Fetch one hour of rows via the active profile's SELECT template,
-    encode as Parquet with DELTA on integer timestamps + ZSTD(1) dict
-    elsewhere, and return the bytes (or ``None`` for an empty hour).
-    """
+    """Return one logical receive-time hour as typed Parquet bytes."""
     target = hour.strftime("%Y-%m-%d %H:00:00")
     select_order_by = ", ".join(SELECT_ORDER_BY)
-    query = PROFILE.select_template.format(
+    query = SELECT_TEMPLATE.format(
         source_table=CLICKHOUSE_TABLE,
         target=target,
         order_by=select_order_by,
@@ -407,7 +189,7 @@ def fetch_hour_parquet(hour: datetime) -> bytes | None:
     if table.num_rows == 0:
         return None
 
-    delta_cols = [c for c in PROFILE.delta_encoded_columns if c in table.column_names]
+    delta_cols = [c for c in DELTA_ENCODED_COLUMNS if c in table.column_names]
     dict_cols = [c for c in table.column_names if c not in delta_cols]
 
     out = BytesIO()
@@ -423,7 +205,7 @@ def fetch_hour_parquet(hour: datetime) -> bytes | None:
     return out.getvalue()
 
 
-# ---------- R2 ----------
+# R2
 
 
 class R2Client:
@@ -453,7 +235,7 @@ class R2Client:
     def list_keys(self) -> set[str]:
         """Return the set of exported object keys."""
         keys: set[str] = set()
-        kwargs: dict = {"Bucket": self._bucket, "Prefix": FILENAME_PREFIX}
+        kwargs: dict[str, str] = {"Bucket": self._bucket, "Prefix": FILENAME_PREFIX}
         while True:
             resp = self._client.list_objects_v2(**kwargs)
             keys.update(obj["Key"] for obj in resp.get("Contents", []))
@@ -476,7 +258,7 @@ class R2Client:
             raise
 
 
-# ---------- Export orchestration ----------
+# Export orchestration
 
 
 def hour_to_filename(hour: datetime) -> str:
@@ -486,10 +268,7 @@ def hour_to_filename(hour: datetime) -> str:
 
 def hour_to_completion_key(hour: datetime) -> str:
     """Return the object whose presence means an hour was fully published."""
-    filename = hour_to_filename(hour)
-    if PROFILE.name == "polymarket_v3":
-        return f"{filename}.manifest.json"
-    return filename
+    return f"{hour_to_filename(hour)}.manifest.json"
 
 
 def latest_exportable_hour() -> datetime | None:
@@ -522,24 +301,22 @@ def export_hour(client: R2Client, hour: datetime) -> bool:
         log.info("Skipping %s: 0 rows, will retry next tick", filename)
         return False
     client.upload(filename, data)
-    if PROFILE.name == "polymarket_v3":
-        row_count = pq.read_metadata(BytesIO(data)).num_rows
-        manifest = {
-            "file": filename,
-            "hour_utc": hour.isoformat(),
-            "row_count": row_count,
-            "byte_size": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
-            "source_table": CLICKHOUSE_TABLE,
-            "order_by": SELECT_ORDER_BY,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        manifest_data = json.dumps(
-            manifest,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-        client.upload(hour_to_completion_key(hour), manifest_data)
+    manifest = {
+        "file": filename,
+        "hour_utc": hour.isoformat(),
+        "row_count": pq.read_metadata(BytesIO(data)).num_rows,
+        "byte_size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "source_table": CLICKHOUSE_TABLE,
+        "order_by": SELECT_ORDER_BY,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    manifest_data = json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    client.upload(hour_to_completion_key(hour), manifest_data)
     log.info("Uploaded %s (%.2f MB)", filename, len(data) / (1024 * 1024))
     return True
 
@@ -622,8 +399,8 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
 
-    missing = [v for v in ("R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY", "R2_BUCKET")
-               if not globals()[v]]
+    required = ("R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY", "R2_BUCKET")
+    missing = [name for name in required if not globals()[name]]
     if missing:
         log.error("Missing required environment variables: %s", ", ".join(missing))
         sys.exit(1)
@@ -631,8 +408,12 @@ def main() -> None:
     client = R2Client(R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET)
     client.ensure_bucket()
     log.info(
-        "Connected to R2 at %s, bucket=%s, profile=%s, source_table=%s, filename_prefix=%s, order_by=%s",
-        R2_ENDPOINT, R2_BUCKET, PROFILE.name, CLICKHOUSE_TABLE, FILENAME_PREFIX, SELECT_ORDER_BY,
+        "Connected to R2 at %s, bucket=%s, source_table=%s, filename_prefix=%s, order_by=%s",
+        R2_ENDPOINT,
+        R2_BUCKET,
+        CLICKHOUSE_TABLE,
+        FILENAME_PREFIX,
+        SELECT_ORDER_BY,
     )
 
     next_hour = backfill(client)
