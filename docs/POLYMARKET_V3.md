@@ -96,8 +96,11 @@ orders by `(market, sequence)`, and writes ZSTD level 1 Parquet:
 
 Market condition IDs and transaction hashes are decoded from hexadecimal;
 decimal token IDs are decoded as unsigned 256-bit integers. All three therefore
-use the same 32-byte big-endian representation expected by `pmxtdata`.
-Event-specific columns are null when they do not apply.
+use the same 32-byte big-endian representation as `pmxtdata`'s processed
+identifier columns.
+The export aborts rather than padding malformed hexadecimal IDs or wrapping an
+out-of-range decimal token ID. Event-specific columns are null when they do not
+apply.
 
 The sidecar manifest is only an upload-completion marker with row count, byte
 size, digest, source table, and sort order. It is not inserted into the data.

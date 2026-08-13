@@ -57,6 +57,11 @@ QUERY_MAX_RETRIES = 10
 QUERY_RETRY_DELAY_SECONDS = 10
 
 SELECT_TEMPLATE = """
+WITH
+    JSONExtractString(data, 'market') AS market_text,
+    JSONExtractString(data, 'event_type') AS event_type,
+    JSONExtractString(data, 'asset_id') AS asset_id_text,
+    JSONExtractString(data, 'transaction_hash') AS transaction_hash_text
 SELECT
     timestamp_received,
     sequence,
@@ -65,12 +70,12 @@ SELECT
         'UTC'
     ) AS timestamp,
     toFixedString(
-        unhex(substring(JSONExtractString(data, 'market'), 3)),
+        unhex(substring(market_text, 3)),
         32
     ) AS market,
-    JSONExtractString(data, 'event_type') AS event_type,
+    event_type,
     toFixedString(
-        unhex(leftPad(hex(toUInt256(JSONExtractString(data, 'asset_id'))), 64, '0')),
+        unhex(leftPad(hex(toUInt256OrZero(asset_id_text)), 64, '0')),
         32
     ) AS asset_id,
 
@@ -93,7 +98,7 @@ SELECT
        toUInt16OrZero(JSONExtractString(data, 'fee_rate_bps')), NULL) AS fee_rate_bps,
     if(event_type = 'last_trade_price',
        toFixedString(
-           unhex(substring(JSONExtractString(data, 'transaction_hash'), 3)),
+           unhex(substring(transaction_hash_text, 3)),
            32
        ), NULL) AS transaction_hash,
 
@@ -106,6 +111,20 @@ SELECT
 FROM {source_table} FINAL
 WHERE timestamp_received >= toDateTime64('{target}', 9, 'UTC')
   AND timestamp_received <  toDateTime64('{target}', 9, 'UTC') + INTERVAL 1 HOUR
+  AND throwIf(
+      NOT match(market_text, '^0[xX][0-9a-fA-F]{{64}}$'),
+      'invalid Polymarket condition ID'
+  ) = 0
+  AND throwIf(
+      NOT match(asset_id_text, '^(0|[1-9][0-9]{{0,77}})$')
+          OR toString(toUInt256OrZero(asset_id_text)) != asset_id_text,
+      'invalid Polymarket asset ID'
+  ) = 0
+  AND throwIf(
+      event_type = 'last_trade_price'
+          AND NOT match(transaction_hash_text, '^0[xX][0-9a-fA-F]{{64}}$'),
+      'invalid Polymarket transaction hash'
+  ) = 0
 ORDER BY {order_by}
 FORMAT ArrowStream
 """
