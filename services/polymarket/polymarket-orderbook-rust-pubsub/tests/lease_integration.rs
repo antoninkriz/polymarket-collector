@@ -23,8 +23,8 @@ fn lease_config(suffix: &str) -> PublisherLeaseConfig {
         generation_key: format!("test:polymarket:v3:generation:{suffix}"),
         minimum_generation: 0,
         persist_timeout: Duration::from_secs(2),
-        ttl: Duration::from_millis(500),
-        renew_interval: Duration::from_millis(100),
+        ttl: Duration::from_secs(4),
+        renew_interval: Duration::from_secs(1),
     }
 }
 

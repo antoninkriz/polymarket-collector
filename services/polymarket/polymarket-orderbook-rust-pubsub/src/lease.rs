@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::Script;
 use tokio::sync::watch;
 use tracing::info;
@@ -76,8 +76,8 @@ impl PublisherLease {
     pub async fn acquire(cfg: PublisherLeaseConfig) -> Result<Self> {
         ensure!(!cfg.ttl.is_zero(), "publisher lease TTL must be positive");
         ensure!(
-            !cfg.persist_timeout.is_zero(),
-            "publisher generation persistence timeout must be positive"
+            !cfg.persist_timeout.is_zero() && cfg.persist_timeout < cfg.ttl,
+            "publisher generation persistence timeout must be positive and less than the lease TTL"
         );
         ensure!(
             cfg.minimum_generation < SEQUENCE_GENERATION_MAX,
@@ -89,15 +89,22 @@ impl PublisherLease {
         );
         let client = redis::Client::open(cfg.redis_url.as_str())
             .with_context(|| format!("invalid REDIS_URL: {}", cfg.redis_url))?;
-        let mut conn = ConnectionManager::new(client)
+        // redis-rs defaults to a 500 ms response timeout, shorter than Redis's
+        // normal one-second AOF fsync cadence. Let the server-side WAITAOF
+        // timeout expire first, while still bounding all lease requests.
+        let response_timeout = cfg.persist_timeout.saturating_add(Duration::from_secs(1));
+        let connection_config =
+            ConnectionManagerConfig::new().set_response_timeout(Some(response_timeout));
+        let mut conn = ConnectionManager::new_with_config(client, connection_config)
             .await
             .context("connect Redis for publisher lease")?;
         let instance_id = Uuid::new_v4().to_string();
+        let ttl_ms = duration_ms(cfg.ttl)?;
         let acquired: Option<(u64, String)> = Script::new(ACQUIRE_SCRIPT)
             .key(&cfg.lease_key)
             .key(&cfg.generation_key)
             .arg(instance_id)
-            .arg(duration_ms(cfg.ttl)?)
+            .arg(ttl_ms)
             .arg(cfg.minimum_generation)
             .arg(SEQUENCE_GENERATION_MAX)
             .invoke_async(&mut conn)
@@ -119,6 +126,17 @@ impl PublisherLease {
         ensure!(
             local_fsyncs >= 1,
             "publisher generation was not persisted to Redis AOF before timeout"
+        );
+        let renewed: i64 = Script::new(RENEW_SCRIPT)
+            .key(&cfg.lease_key)
+            .arg(&token)
+            .arg(ttl_ms)
+            .invoke_async(&mut conn)
+            .await
+            .context("refresh publisher lease after persisting generation")?;
+        ensure!(
+            renewed == 1,
+            "publisher lease was lost while persisting its generation"
         );
         info!(
             lease_key = cfg.lease_key,

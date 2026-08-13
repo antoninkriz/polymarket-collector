@@ -65,8 +65,9 @@ impl Config {
             "PUBLISHER_LEASE_RENEW_MS must be positive and less than PUBLISHER_LEASE_TTL_MS",
         );
         anyhow::ensure!(
-            !publisher_generation_persist_timeout.is_zero(),
-            "PUBLISHER_GENERATION_PERSIST_TIMEOUT_MS must be positive",
+            !publisher_generation_persist_timeout.is_zero()
+                && publisher_generation_persist_timeout < publisher_lease_ttl,
+            "PUBLISHER_GENERATION_PERSIST_TIMEOUT_MS must be positive and less than PUBLISHER_LEASE_TTL_MS",
         );
 
         Ok(Self {
