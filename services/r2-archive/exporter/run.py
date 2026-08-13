@@ -12,10 +12,13 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from pathlib import Path
+from typing import Protocol
 
 import boto3
 import pyarrow as pa
@@ -39,6 +42,8 @@ R2_ENDPOINT = os.environ.get("R2_ENDPOINT", "")
 R2_ACCESS_KEY = os.environ.get("R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.environ.get("R2_SECRET_KEY", "")
 R2_BUCKET = os.environ.get("R2_BUCKET", "")
+EXPORT_BACKEND = os.environ.get("EXPORT_BACKEND", "r2").strip().lower()
+LOCAL_EXPORT_DIR = os.environ.get("LOCAL_EXPORT_DIR", "/exports")
 
 # Export format
 PARQUET_COMPRESSION = "zstd"
@@ -375,7 +380,79 @@ def table_to_parquet(table: pa.Table) -> bytes:
     return out.getvalue()
 
 
-# R2
+# Archive destinations
+
+
+class ArchiveWriter(Protocol):
+    """Destination that accepts completed archive objects."""
+
+    def upload(self, key: str, data: bytes) -> None:
+        """Store one object under its archive key."""
+        ...
+
+
+class ArchiveClient(ArchiveWriter, Protocol):
+    """Queryable destination for completed archive objects."""
+
+    def list_keys(self) -> set[str]:
+        """Return the stored object keys."""
+        ...
+
+    def exists(self, key: str) -> bool:
+        """Return whether an object exists."""
+        ...
+
+
+class LocalArchive:
+    """Atomic local-filesystem archive destination."""
+
+    def __init__(self, root: str | Path) -> None:
+        self._root = Path(root).resolve()
+
+    def ensure_directory(self) -> None:
+        """Create the archive root when it does not exist."""
+        self._root.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, key: str) -> Path:
+        target = (self._root / key).resolve()
+        if target == self._root or not target.is_relative_to(self._root):
+            raise ValueError(f"archive key escapes local export directory: {key!r}")
+        return target
+
+    def list_keys(self) -> set[str]:
+        """Return all file keys relative to the archive root."""
+        if not self._root.exists():
+            return set()
+        return {
+            path.relative_to(self._root).as_posix()
+            for path in self._root.rglob("*")
+            if path.is_file()
+        }
+
+    def upload(self, key: str, data: bytes) -> None:
+        """Atomically replace one local archive object."""
+        target = self._path(key)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary.write(data)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+                temporary_path = Path(temporary.name)
+            os.replace(temporary_path, target)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    def exists(self, key: str) -> bool:
+        """Return whether a local archive object exists."""
+        return self._path(key).is_file()
 
 
 class R2Client:
@@ -467,7 +544,7 @@ def latest_exportable_hour() -> datetime | None:
     return min(wall_bound, watermark_bound)
 
 
-def export_hour(client: R2Client, hour: datetime) -> None:
+def export_hour(client: ArchiveWriter, hour: datetime) -> None:
     """Upload every event-specific file, then atomically complete the hour."""
     prefix = hour_to_prefix(hour)
     log.info("Exporting %s", prefix)
@@ -540,7 +617,7 @@ def export_hour(client: R2Client, hour: datetime) -> None:
     )
 
 
-def backfill(client: R2Client) -> datetime | None:
+def backfill(client: ArchiveClient) -> datetime | None:
     """Export missing complete hours and return the next hour to attempt."""
     earliest = query_earliest_hour()
     if earliest is None:
@@ -578,7 +655,7 @@ def backfill(client: R2Client) -> datetime | None:
     return latest + timedelta(hours=1)
 
 
-def run_loop(client: R2Client, next_hour: datetime | None) -> None:
+def run_loop(client: ArchiveClient, next_hour: datetime | None) -> None:
     """Steady-state loop: export each new hour shortly after it completes.
 
     The manifest is uploaded only after all seven typed Parquet files. Empty
@@ -621,21 +698,37 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
 
-    required = ("R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY", "R2_BUCKET")
-    missing = [name for name in required if not globals()[name]]
-    if missing:
-        log.error("Missing required environment variables: %s", ", ".join(missing))
-        sys.exit(1)
+    client: ArchiveClient
+    if EXPORT_BACKEND == "local":
+        local_client = LocalArchive(LOCAL_EXPORT_DIR)
+        local_client.ensure_directory()
+        client = local_client
+        log.info(
+            "Using local archive directory %s, source_table=%s, order_by=%s",
+            LOCAL_EXPORT_DIR,
+            CLICKHOUSE_TABLE,
+            SELECT_ORDER_BY,
+        )
+    elif EXPORT_BACKEND == "r2":
+        required = ("R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY", "R2_BUCKET")
+        missing = [name for name in required if not globals()[name]]
+        if missing:
+            log.error("Missing required environment variables: %s", ", ".join(missing))
+            sys.exit(1)
 
-    client = R2Client(R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET)
-    client.ensure_bucket()
-    log.info(
-        "Connected to R2 at %s, bucket=%s, source_table=%s, order_by=%s",
-        R2_ENDPOINT,
-        R2_BUCKET,
-        CLICKHOUSE_TABLE,
-        SELECT_ORDER_BY,
-    )
+        r2_client = R2Client(R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET)
+        r2_client.ensure_bucket()
+        client = r2_client
+        log.info(
+            "Connected to R2 at %s, bucket=%s, source_table=%s, order_by=%s",
+            R2_ENDPOINT,
+            R2_BUCKET,
+            CLICKHOUSE_TABLE,
+            SELECT_ORDER_BY,
+        )
+    else:
+        log.error("Unsupported EXPORT_BACKEND: %s", EXPORT_BACKEND)
+        sys.exit(1)
 
     next_hour = backfill(client)
     run_loop(client, next_hour)

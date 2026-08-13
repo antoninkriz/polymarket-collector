@@ -7,6 +7,8 @@ import unittest
 from decimal import Decimal
 from datetime import datetime, timezone
 from io import BytesIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import pyarrow as pa
@@ -169,6 +171,31 @@ class ParquetSchemaTest(unittest.TestCase):
         self.assertEqual(round_trip.column("asks")[0].as_py(), [])
 
 
+class LocalArchiveTest(unittest.TestCase):
+    def test_upload_lists_overwrites_and_finds_objects(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "archive"
+            client = exporter.LocalArchive(root)
+            client.ensure_directory()
+
+            key = "2026-08-13/14/book.parquet"
+            client.upload(key, b"first")
+            client.upload(key, b"second")
+
+            self.assertEqual((root / key).read_bytes(), b"second")
+            self.assertEqual(client.list_keys(), {key})
+            self.assertTrue(client.exists(key))
+            self.assertFalse(client.exists("2026-08-13/14/manifest.json"))
+
+    def test_rejects_keys_outside_export_directory(self) -> None:
+        with TemporaryDirectory() as directory:
+            client = exporter.LocalArchive(directory)
+            client.ensure_directory()
+
+            with self.assertRaises(ValueError):
+                client.upload("../outside.parquet", b"data")
+
+
 class ExportHourTest(unittest.TestCase):
     def test_manifest_is_uploaded_last_and_records_empty_types(self) -> None:
         hour = datetime(2026, 8, 13, 14, tzinfo=timezone.utc)
@@ -183,7 +210,7 @@ class ExportHourTest(unittest.TestCase):
             "fetch_event_table",
             side_effect=fetch_event_table,
         ):
-            exporter.export_hour(client, hour)  # pyright: ignore[reportArgumentType]
+            exporter.export_hour(client, hour)
 
         manifest_key = "2026-08-13/14/manifest.json"
         self.assertEqual(client.upload_order[-1], manifest_key)
