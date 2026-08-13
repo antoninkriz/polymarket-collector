@@ -112,6 +112,9 @@ services:
       EVENT_CONSUMER_GROUP: polymarket-clickhouse-v3
       # Keep this stable across restarts so this consumer drains its pending entries.
       EVENT_CONSUMER_NAME: polymarket-clickhouse-v3-1
+      # Safe only because this deployment owns the stream's sole consumer group.
+      # The atomic cleanup refuses to delete if another group is ever added.
+      DELETE_ACKED_STREAM_ENTRIES: "true"
       STREAM_RECONNECT_DELAY_MS: "2000"
       # ClickHouse (host-local)
       CLICKHOUSE_HOST: localhost

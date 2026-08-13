@@ -114,7 +114,12 @@ Polymarket did not publish.
 
 The publisher appends to Redis Streams and retries failed appends without
 discarding its batch. The consumer leaves entries pending until ClickHouse
-commits, and ClickHouse insert failures retry with backpressure. The exporter
+commits, and ClickHouse insert failures retry with backpressure. In the bundled
+single-group deployment, it then atomically acknowledges and deletes committed
+stream entries. The deletion script first proves that the configured
+ClickHouse group is the stream's only consumer group and fails closed if any
+other group exists. Set `DELETE_ACKED_STREAM_ENTRIES=false` when retaining the
+stream for multiple independent groups. The exporter
 waits until a later receive-time hour has committed before publishing an
 immutable earlier hour. A Parquet object is complete only when its sidecar
 manifest exists; the manifest records its row count, byte size, SHA-256 digest,

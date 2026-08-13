@@ -16,6 +16,7 @@ pub struct Config {
     pub redis_event_stream: String,
     pub stream_consumer_group: String,
     pub stream_consumer_name: String,
+    pub delete_acked_stream_entries: bool,
     pub pubsub_reconnect_delay: Duration,
     pub clickhouse_url: String,
     pub clickhouse_user: String,
@@ -39,6 +40,7 @@ impl Config {
             redis_event_stream: env_or("REDIS_EVENT_STREAM", "polymarket:events:v3"),
             stream_consumer_group: env_or("EVENT_CONSUMER_GROUP", "polymarket-clickhouse-v3"),
             stream_consumer_name: env_or("EVENT_CONSUMER_NAME", "polymarket-clickhouse-v3-1"),
+            delete_acked_stream_entries: env_bool("DELETE_ACKED_STREAM_ENTRIES"),
             pubsub_reconnect_delay: Duration::from_millis(env_u64_or(
                 "STREAM_RECONNECT_DELAY_MS",
                 2_000,

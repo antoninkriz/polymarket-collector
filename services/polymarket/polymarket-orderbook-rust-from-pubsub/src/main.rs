@@ -44,6 +44,7 @@ async fn main() -> Result<()> {
         clickhouse_table = %cfg.clickhouse_table,
         flush_batch_size = cfg.flush_batch_size,
         flush_interval_ms = cfg.flush_interval.as_millis() as u64,
+        delete_acked_stream_entries = cfg.delete_acked_stream_entries,
         ttl_minutes = cfg.ttl_minutes,
         queue_size = cfg.queue_size,
         "starting polymarket-orderbook-rust-from-pubsub",
@@ -76,6 +77,7 @@ async fn main() -> Result<()> {
         stream: cfg.redis_event_stream.clone(),
         group: cfg.stream_consumer_group.clone(),
         consumer: cfg.stream_consumer_name.clone(),
+        delete_acked_entries: cfg.delete_acked_stream_entries,
         reconnect_delay: cfg.pubsub_reconnect_delay,
     };
     let subscriber_handle = tokio::spawn(pubsub_subscriber::run(
@@ -130,6 +132,7 @@ async fn stats_loop(event_tx: mpsc::Sender<SinkItem>, stats: Arc<SubscriberStats
             events_received = stats.events_received.load(Ordering::Relaxed),
             events_forwarded = stats.events_forwarded.load(Ordering::Relaxed),
             events_acked = stats.events_acked.load(Ordering::Relaxed),
+            events_deleted = stats.events_deleted.load(Ordering::Relaxed),
             parse_failures = stats.parse_failures.load(Ordering::Relaxed),
             reconnects = stats.reconnects.load(Ordering::Relaxed),
             "[POLYMARKET-FROM-PUBSUB-STATS]",
