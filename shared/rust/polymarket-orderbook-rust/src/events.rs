@@ -204,11 +204,13 @@ pub enum Event {
         asset_id: String,
         timestamp: String,
         #[serde(
+            default,
             skip_serializing_if = "Option::is_none",
             with = "rust_decimal::serde::str_option"
         )]
         best_bid: Option<Decimal>,
         #[serde(
+            default,
             skip_serializing_if = "Option::is_none",
             with = "rust_decimal::serde::str_option"
         )]
@@ -245,16 +247,19 @@ pub enum Event {
         asset_id: String,
         timestamp: String,
         #[serde(
+            default,
             skip_serializing_if = "Option::is_none",
             with = "rust_decimal::serde::str_option"
         )]
         best_bid: Option<Decimal>,
         #[serde(
+            default,
             skip_serializing_if = "Option::is_none",
             with = "rust_decimal::serde::str_option"
         )]
         best_ask: Option<Decimal>,
         #[serde(
+            default,
             skip_serializing_if = "Option::is_none",
             with = "rust_decimal::serde::str_option"
         )]
@@ -748,6 +753,44 @@ mod tests {
         assert_eq!(v["old_tick_size"], "0.01");
         assert_eq!(v["new_tick_size"], "0.001");
         assert_eq!(v["timestamp"], "1");
+    }
+
+    #[test]
+    fn custom_events_round_trip_through_the_durable_stream() {
+        let events = [
+            Event::BestBidAsk {
+                market: "m".into(),
+                asset_id: "a".into(),
+                timestamp: "1".into(),
+                best_bid: Some(dec("0.4")),
+                best_ask: None,
+                spread: None,
+            },
+            Event::NewMarket {
+                id: "1".into(),
+                market: "m".into(),
+                timestamp: "2".into(),
+                assets_ids: vec!["yes".into(), "no".into()],
+                outcomes: vec!["Yes".into(), "No".into()],
+                question: None,
+                slug: None,
+            },
+            Event::MarketResolved {
+                id: "1".into(),
+                market: "m".into(),
+                timestamp: "3".into(),
+                assets_ids: vec!["yes".into(), "no".into()],
+                winning_asset_id: Some("yes".into()),
+                winning_outcome: Some("Yes".into()),
+            },
+        ];
+
+        for event in events {
+            let encoded = serde_json::to_string(&event).unwrap();
+            let decoded: Event = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.asset_id(), event.asset_id());
+            assert_eq!(decoded.market_lifecycle(), event.market_lifecycle());
+        }
     }
 
     #[test]
