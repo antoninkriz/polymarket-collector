@@ -30,9 +30,10 @@
 //!   strongly-typed columns with `Delta + ZSTD(3)` on the timestamps and
 //!   `ORDER BY (market, asset_id, timestamp_received)` for compressible
 //!   layout. ~62% smaller on disk than `Raw`.
-//! - [`SinkSchema::V3`] — replayable schema with socket receipt timestamps,
-//!   parent/child ordering, connection epochs, raw parent messages, nullable
-//!   event fields, and collector-owned idempotency identity.
+//! - [`SinkSchema::V3`] — compact replayable raw schema. Stores the socket
+//!   receipt timestamp, one monotonic sequence used for both ordering and
+//!   retry identity, and normalized event JSON. The archive exporter performs
+//!   the typed projection.
 //!
 //! Both modes use `INSERT ... FORMAT JSONEachRow` over HTTP.
 //!
@@ -93,7 +94,7 @@ pub enum SinkSchema {
     Raw,
     /// Recommended typed columnar schema (see docs/data-dump-optimizations.md).
     Typed,
-    /// Replayable v3 schema. This is the production Polymarket format.
+    /// Compact replayable raw schema. This is the production Polymarket format.
     V3,
 }
 
@@ -342,7 +343,7 @@ impl Sink {
             match self.cfg.schema {
                 SinkSchema::Raw => self.write_raw_row(&mut body, ev, timestamp_ms)?,
                 SinkSchema::Typed => self.write_typed_row(&mut body, ev, timestamp_ms)?,
-                SinkSchema::V3 => self.write_v3_row(&mut body, item, timestamp_ms)?,
+                SinkSchema::V3 => self.write_v3_row(&mut body, item)?,
             }
             body.push(b'\n');
         }
@@ -376,9 +377,16 @@ impl Sink {
         Ok(())
     }
 
-    fn write_v3_row(&self, body: &mut Vec<u8>, item: &SinkItem, timestamp_ms: i64) -> Result<()> {
-        let value = v3_row_value(item, timestamp_ms);
-        serde_json::to_writer(body, &value).context("serialize v3 row")?;
+    fn write_v3_row(&self, body: &mut Vec<u8>, item: &SinkItem) -> Result<()> {
+        let mut event = item.record.event.clone();
+        event.strip_hash();
+        let data = serde_json::to_string(&event).context("serialize v3 event")?;
+        let row = V3RawRow {
+            timestamp_received: item.record.timestamp_received_ns,
+            sequence: item.record.sequence,
+            data: &data,
+        };
+        serde_json::to_writer(body, &row).context("serialize v3 row")?;
         Ok(())
     }
 
@@ -398,13 +406,7 @@ impl Sink {
             ),
             SinkSchema::V3 => format!(
                 "INSERT INTO {} (\
-                    schema_version, timestamp_received, timestamp, timestamp_raw, \
-                    collector_session_id, collector_session_started_at, publisher_fence, \
-                    connection_id, connection_epoch, frame_sequence, receive_sequence, \
-                    message_id, message_index, message_count, row_index, row_count, \
-                    transport_id, market, event_type, asset_id, hash, raw_message, \
-                    bids, asks, price, size, side, best_bid, best_ask, \
-                    fee_rate_bps, transaction_hash, old_tick_size, new_tick_size\
+                    timestamp_received, sequence, data\
                 ) FORMAT JSONEachRow",
                 self.cfg.table
             ),
@@ -488,64 +490,17 @@ impl Sink {
             ),
             SinkSchema::V3 => format!(
                 "CREATE TABLE IF NOT EXISTS {} (
-                    schema_version                 UInt8,
-                    timestamp_received             DateTime64(9, 'UTC') CODEC(Delta, ZSTD(3)),
-                    timestamp                      DateTime64(3, 'UTC') CODEC(Delta, ZSTD(3)),
-                    timestamp_raw                  String CODEC(ZSTD(3)),
-                    collector_session_id           UUID CODEC(ZSTD(3)),
-                    collector_session_started_at   DateTime64(9, 'UTC') CODEC(Delta, ZSTD(3)),
-                    publisher_fence                UInt64 CODEC(Delta, ZSTD(3)),
-                    connection_id                  UInt32 CODEC(Delta, ZSTD(3)),
-                    connection_epoch               UInt64 CODEC(Delta, ZSTD(3)),
-                    frame_sequence                 UInt64 CODEC(Delta, ZSTD(3)),
-                    receive_sequence               UInt64 CODEC(Delta, ZSTD(3)),
-                    message_id                     UUID,
-                    message_index                  UInt32,
-                    message_count                  UInt32,
-                    row_index                      UInt32,
-                    row_count                      UInt32,
-                    transport_id                   String CODEC(ZSTD(3)),
-                    market                         LowCardinality(String) CODEC(ZSTD(3)),
-                    event_type                     LowCardinality(String) CODEC(ZSTD(3)),
-                    asset_id                       LowCardinality(String) CODEC(ZSTD(3)),
-                    hash                           Nullable(String) CODEC(ZSTD(3)),
-                    raw_message                    String CODEC(ZSTD(3)),
-                    bids                           Array(Tuple(Decimal32(4), Decimal64(6))) CODEC(ZSTD(3)),
-                    asks                           Array(Tuple(Decimal32(4), Decimal64(6))) CODEC(ZSTD(3)),
-                    price                          Nullable(Decimal32(4)) CODEC(ZSTD(3)),
-                    size                           Nullable(Decimal64(6)) CODEC(ZSTD(3)),
-                    side                           LowCardinality(Nullable(String)) CODEC(ZSTD(3)),
-                    best_bid                       Nullable(Decimal32(4)) CODEC(ZSTD(3)),
-                    best_ask                       Nullable(Decimal32(4)) CODEC(ZSTD(3)),
-                    fee_rate_bps                   Nullable(UInt32) CODEC(ZSTD(3)),
-                    transaction_hash               Nullable(String) CODEC(ZSTD(3)),
-                    old_tick_size                  Nullable(Decimal32(4)) CODEC(ZSTD(3)),
-                    new_tick_size                  Nullable(Decimal32(4)) CODEC(ZSTD(3))
+                    timestamp_received DateTime64(9, 'UTC') CODEC(Delta, ZSTD(1)),
+                    sequence           UInt64 CODEC(Delta, ZSTD(1)),
+                    data               String CODEC(ZSTD(1))
                 )
                 ENGINE = ReplacingMergeTree()
                 PARTITION BY toStartOfHour(timestamp_received)
-                ORDER BY (
-                    market, asset_id, collector_session_id,
-                    message_id, row_index, receive_sequence
-                ){ttl_clause}",
+                ORDER BY sequence{ttl_clause}",
                 self.cfg.table
             ),
         };
         self.exec(&sql).await.context("ensure table")?;
-        if self.cfg.schema == SinkSchema::V3 {
-            // Keep an already-created v3 table forward-compatible while this
-            // branch is rolled out incrementally. Historical rows receive the
-            // neutral fence value 0.
-            self.exec(&format!(
-                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS \
-                 publisher_fence UInt64 DEFAULT 0 CODEC(Delta, ZSTD(3)) \
-                 AFTER collector_session_started_at",
-                self.cfg.table,
-            ))
-            .await
-            .context("ensure v3 publisher fence column")?;
-            self.ensure_v3_views().await?;
-        }
         info!(
             table = %self.cfg.table,
             schema = self.cfg.schema.label(),
@@ -556,82 +511,10 @@ impl Sink {
     }
 
     async fn drop_table(&self) -> Result<()> {
-        if self.cfg.schema == SinkSchema::V3 {
-            for view in self.v3_view_names() {
-                self.exec(&format!("DROP VIEW IF EXISTS {view}"))
-                    .await
-                    .with_context(|| format!("drop v3 view {view}"))?;
-            }
-        }
         let sql = format!("DROP TABLE IF EXISTS {}", self.cfg.table);
         self.exec(&sql).await.context("drop table")?;
         info!(table = %self.cfg.table, "dropped table");
         Ok(())
-    }
-
-    async fn ensure_v3_views(&self) -> Result<()> {
-        let [canonical_view, health_view, sessions_view] = self.v3_view_names();
-
-        self.exec(&format!(
-            "CREATE OR REPLACE VIEW {canonical_view} AS \
-             SELECT * FROM {} FINAL",
-            self.cfg.table,
-        ))
-        .await
-        .with_context(|| format!("ensure canonical v3 view {canonical_view}"))?;
-
-        // This view deliberately reads the physical table without FINAL. A
-        // positive difference catches retries still present in separate parts;
-        // background merges eventually collapse them, so the sink's insert
-        // failure warnings remain the durable operational signal.
-        self.exec(&format!(
-            "CREATE OR REPLACE VIEW {health_view} AS \
-             SELECT \
-                 toStartOfHour(timestamp_received) AS receive_hour, \
-                 count() AS physical_rows, \
-                 uniqExact(tuple( \
-                     market, asset_id, collector_session_id, \
-                     message_id, row_index, receive_sequence \
-                 )) AS logical_rows, \
-                 physical_rows - logical_rows AS transport_retry_rows, \
-                 uniqExact(publisher_fence) AS publisher_generations, \
-                 uniqExact(collector_session_id) AS collector_sessions \
-             FROM {} \
-             GROUP BY receive_hour",
-            self.cfg.table,
-        ))
-        .await
-        .with_context(|| format!("ensure v3 ingestion-health view {health_view}"))?;
-
-        self.exec(&format!(
-            "CREATE OR REPLACE VIEW {sessions_view} AS \
-             SELECT \
-                 publisher_fence, \
-                 collector_session_id, \
-                 min(timestamp_received) AS first_received, \
-                 max(timestamp_received) AS last_received, \
-                 uniqExact(message_id) AS messages, \
-                 count() AS rows \
-             FROM {} FINAL \
-             GROUP BY publisher_fence, collector_session_id",
-            self.cfg.table,
-        ))
-        .await
-        .with_context(|| format!("ensure v3 publisher-sessions view {sessions_view}"))?;
-
-        info!(
-            canonical_view,
-            health_view, sessions_view, "ensured canonical and diagnostic v3 views",
-        );
-        Ok(())
-    }
-
-    fn v3_view_names(&self) -> [String; 3] {
-        [
-            format!("{}_final", self.cfg.table),
-            format!("{}_ingestion_health", self.cfg.table),
-            format!("{}_publisher_sessions", self.cfg.table),
-        ]
     }
 
     /// Execute a statement against the configured database.
@@ -678,6 +561,15 @@ struct RawRow<'a> {
     event_type: &'a str,
     /// Already-serialized JSON string. Serde re-escapes it so the value is
     /// stored as a string in ClickHouse's `String` column.
+    data: &'a str,
+}
+
+#[derive(Serialize)]
+struct V3RawRow<'a> {
+    timestamp_received: i64,
+    sequence: u64,
+    /// Normalized event JSON. Hashes are removed because they are neither an
+    /// event identity nor needed to reconstruct the book.
     data: &'a str,
 }
 
@@ -796,130 +688,6 @@ fn typed_row_value(ev: &Event, timestamp_ms: i64) -> serde_json::Value {
             "new_tick_size": dec(new_tick_size),
         }),
     }
-}
-
-/// Build one replayable v3 row. Unlike the legacy typed schema, scalar fields
-/// that do not belong to an event are NULL rather than overloaded zero values.
-fn v3_row_value(item: &SinkItem, timestamp_ms: i64) -> serde_json::Value {
-    let record = &item.record;
-    let event = &record.event;
-    let mut row = json!({
-        "schema_version": record.schema_version,
-        "timestamp_received": record.timestamp_received_ns,
-        "timestamp": timestamp_ms,
-        "timestamp_raw": event.timestamp(),
-        "collector_session_id": record.collector_session_id.to_string(),
-        "collector_session_started_at": record.collector_session_started_at_ns,
-        "publisher_fence": record.publisher_fence,
-        "connection_id": record.connection_id,
-        "connection_epoch": record.connection_epoch,
-        "frame_sequence": record.frame_sequence,
-        "receive_sequence": record.receive_sequence,
-        "message_id": record.message_id.to_string(),
-        "message_index": record.message_index,
-        "message_count": record.message_count,
-        "row_index": record.row_index,
-        "row_count": record.row_count,
-        "transport_id": item.delivery_id.as_deref().unwrap_or(""),
-        "market": event.market(),
-        "event_type": event.kind(),
-        "asset_id": event.asset_id(),
-        "hash": serde_json::Value::Null,
-        "raw_message": record.raw_message,
-        "bids": [],
-        "asks": [],
-        "price": serde_json::Value::Null,
-        "size": serde_json::Value::Null,
-        "side": serde_json::Value::Null,
-        "best_bid": serde_json::Value::Null,
-        "best_ask": serde_json::Value::Null,
-        "fee_rate_bps": serde_json::Value::Null,
-        "transaction_hash": serde_json::Value::Null,
-        "old_tick_size": serde_json::Value::Null,
-        "new_tick_size": serde_json::Value::Null,
-    });
-    let object = row.as_object_mut().expect("v3 row is an object");
-    let decimal = |value: &Decimal| serde_json::Value::String(value.to_string());
-    let optional_decimal = |value: &Option<Decimal>| {
-        value
-            .as_ref()
-            .map(decimal)
-            .unwrap_or(serde_json::Value::Null)
-    };
-
-    match event {
-        Event::Book {
-            bids, asks, hash, ..
-        } => {
-            object.insert(
-                "bids".into(),
-                serde_json::to_value(bids).expect("serialize bids"),
-            );
-            object.insert(
-                "asks".into(),
-                serde_json::to_value(asks).expect("serialize asks"),
-            );
-            object.insert(
-                "hash".into(),
-                hash.as_ref()
-                    .map(|value| serde_json::Value::String(value.clone()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-        }
-        Event::PriceChange {
-            price,
-            size,
-            side,
-            best_bid,
-            best_ask,
-            hash,
-            ..
-        } => {
-            object.insert("price".into(), decimal(price));
-            object.insert("size".into(), decimal(size));
-            object.insert("side".into(), serde_json::Value::String(side.clone()));
-            object.insert("best_bid".into(), optional_decimal(best_bid));
-            object.insert("best_ask".into(), optional_decimal(best_ask));
-            object.insert(
-                "hash".into(),
-                hash.as_ref()
-                    .map(|value| serde_json::Value::String(value.clone()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-        }
-        Event::LastTradePrice {
-            price,
-            size,
-            side,
-            fee_rate_bps,
-            transaction_hash,
-            ..
-        } => {
-            object.insert("price".into(), decimal(price));
-            object.insert("size".into(), decimal(size));
-            object.insert("side".into(), serde_json::Value::String(side.clone()));
-            object.insert(
-                "fee_rate_bps".into(),
-                fee_rate_bps
-                    .parse::<u32>()
-                    .map(serde_json::Value::from)
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            object.insert(
-                "transaction_hash".into(),
-                serde_json::Value::String(transaction_hash.clone()),
-            );
-        }
-        Event::TickSizeChange {
-            old_tick_size,
-            new_tick_size,
-            ..
-        } => {
-            object.insert("old_tick_size".into(), decimal(old_tick_size));
-            object.insert("new_tick_size".into(), decimal(new_tick_size));
-        }
-    }
-    row
 }
 
 #[cfg(test)]
@@ -1232,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_trade_keeps_receive_order_and_nullable_shape() {
+    fn v3_stores_only_receive_time_sequence_and_event_json() {
         let mut sink = empty_sink(v3_cfg());
         sink.buffer.push(v3_item(
             Event::LastTradePrice {
@@ -1252,18 +1020,12 @@ mod tests {
         let body = sink.serialize_batch().unwrap();
         let row: serde_json::Value =
             serde_json::from_slice(body.strip_suffix(b"\n").unwrap()).unwrap();
-        assert_eq!(row["schema_version"], 3);
-        assert_eq!(row["publisher_fence"], 42);
+        assert_eq!(row.as_object().unwrap().len(), 3);
         assert_eq!(row["timestamp_received"], 1_757_908_892_351_123_456_i64);
-        assert_eq!(row["connection_epoch"], 2);
-        assert_eq!(row["frame_sequence"], 9);
-        assert_eq!(row["row_index"], 0);
-        assert_eq!(row["row_count"], 1);
-        assert_eq!(row["transport_id"], "1757908892351-0");
-        assert_eq!(row["raw_message"], "{\"server\":\"payload\"}");
-        assert_eq!(row["price"], "0.42");
-        assert_eq!(row["transaction_hash"], "0xtx");
-        assert!(row["best_bid"].is_null());
-        assert!(row["hash"].is_null());
+        assert_eq!(row["sequence"], 42_u64 << 48);
+        let event: serde_json::Value = serde_json::from_str(row["data"].as_str().unwrap()).unwrap();
+        assert_eq!(event["price"], "0.42");
+        assert_eq!(event["transaction_hash"], "0xtx");
+        assert!(event.get("hash").is_none());
     }
 }

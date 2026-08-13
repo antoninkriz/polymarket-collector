@@ -264,20 +264,12 @@ async fn v3_sink_deduplicates_only_transport_retries() -> Result<()> {
         table: CH_V3_TABLE.into(),
         drop_table_on_start: true,
         exclude_hash: false,
-        batch_size: 1,
+        batch_size: 3,
         flush_interval: Duration::from_millis(200),
         ttl_minutes: 0,
         schema: SinkSchema::V3,
     })
     .await?;
-    // Keep the three one-row inserts as separate parts long enough to assert
-    // both the physical retry diagnostic and the FINAL read model.
-    query(
-        &http,
-        &format!("SYSTEM STOP MERGES {CH_DATABASE}.{CH_V3_TABLE}"),
-    )
-    .await?;
-
     let trade = Event::LastTradePrice {
         market: "0xmarket".into(),
         asset_id: "asset".into(),
@@ -328,49 +320,21 @@ async fn v3_sink_deduplicates_only_transport_retries() -> Result<()> {
     .await?;
     assert_eq!(final_count.trim(), "2");
 
-    let canonical_count = query(
-        &http,
-        &format!("SELECT count() FROM {CH_DATABASE}.{CH_V3_TABLE}_final FORMAT TabSeparated"),
-    )
-    .await?;
-    assert_eq!(canonical_count.trim(), "2");
-
-    let health = query(
-        &http,
-        &format!(
-            "SELECT physical_rows, logical_rows, transport_retry_rows, \
-                    publisher_generations, collector_sessions \
-             FROM {CH_DATABASE}.{CH_V3_TABLE}_ingestion_health \
-             FORMAT TabSeparated"
-        ),
-    )
-    .await?;
-    assert_eq!(health.trim(), "3\t2\t1\t1\t1");
-
-    let sessions = query(
-        &http,
-        &format!(
-            "SELECT publisher_fence, messages, rows \
-             FROM {CH_DATABASE}.{CH_V3_TABLE}_publisher_sessions \
-             FORMAT TabSeparated"
-        ),
-    )
-    .await?;
-    assert_eq!(sessions.trim(), "7\t2\t2");
-
     let rows = query(
         &http,
         &format!(
-            "SELECT publisher_fence, receive_sequence, toUnixTimestamp64Nano(timestamp_received), transaction_hash \
+            "SELECT sequence, toUnixTimestamp64Nano(timestamp_received), data \
              FROM {CH_DATABASE}.{CH_V3_TABLE} FINAL \
-             ORDER BY receive_sequence FORMAT TabSeparated"
+             ORDER BY sequence FORMAT TabSeparated"
         ),
     )
     .await?;
     let rows: Vec<&str> = rows.lines().collect();
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], "7\t0\t1757908892351123456\t0xsame-transaction");
-    assert_eq!(rows[1], "7\t1\t1757908892351123457\t0xsame-transaction");
+    let first_sequence = 7_u64 << 48;
+    assert!(rows[0].starts_with(&format!("{first_sequence}\t1757908892351123456\t")));
+    assert!(rows[1].starts_with(&format!("{}\t1757908892351123457\t", first_sequence + 1,)));
+    assert!(rows.iter().all(|row| row.contains("0xsame-transaction")));
 
     let ddl = query(
         &http,
@@ -382,17 +346,24 @@ async fn v3_sink_deduplicates_only_transport_retries() -> Result<()> {
     )
     .await?;
     assert!(ddl.contains("ReplacingMergeTree"), "DDL: {ddl}");
-    assert!(
-        ddl.contains("message_id, row_index, receive_sequence"),
-        "DDL: {ddl}"
-    );
+    assert!(ddl.contains("ORDER BY sequence"), "DDL: {ddl}");
     assert!(ddl.contains("DateTime64(9, 'UTC')"), "DDL: {ddl}");
+    assert!(ddl.contains("ZSTD(1)"), "DDL: {ddl}");
 
-    query(
+    let columns = query(
         &http,
-        &format!("SYSTEM START MERGES {CH_DATABASE}.{CH_V3_TABLE}"),
+        &format!(
+            "SELECT name FROM system.columns \
+             WHERE database = '{CH_DATABASE}' AND table = '{CH_V3_TABLE}' \
+             ORDER BY position FORMAT TabSeparated"
+        ),
     )
     .await?;
+    assert_eq!(
+        columns.lines().collect::<Vec<_>>(),
+        ["timestamp_received", "sequence", "data"],
+    );
+
     drop_v3_objects(&http).await?;
     Ok(())
 }
