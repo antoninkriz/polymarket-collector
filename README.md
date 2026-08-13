@@ -51,6 +51,15 @@ collection, the ClickHouse writer, and the archive exporter:
 ./run_local.sh
 ```
 
+It automatically uses a working Docker Compose installation, or Podman with
+either `podman compose` or `podman-compose`. Docker is preferred when both are
+available. Override the selection when necessary:
+
+```sh
+CONTAINER_RUNTIME=podman ./run_local.sh
+CONTAINER_RUNTIME=docker ./run_local.sh
+```
+
 It creates `.env` from `.env.example` when needed and writes the archive to
 `.data/parquet/YYYY-MM-DD/HH/EVENT_TYPE.parquet`. No R2 credentials are
 required. The files are written with the current host user ID, and an existing
