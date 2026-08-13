@@ -1,25 +1,27 @@
 # polymarket-orderbook-collector
 
-A production-grade collector for the full Polymarket orderbook firehose:
-market discovery, websocket ingestion, ClickHouse storage, and hourly Parquet
-archival to S3-compatible object storage.
+A collector for Polymarket's public orderbook feed: market discovery,
+WebSocket ingestion, replayable ClickHouse storage, and hourly Parquet archival
+to S3-compatible object storage. The upstream feed has no exchange sequence or
+replay cursor; v3 preserves the collector's actual observations and makes
+disconnect boundaries explicit rather than claiming an exchange audit log.
 
 ## Pipeline
 
 ```
 Polymarket Gamma REST ──▶ polymarket-active-markets ──▶ Redis (active_markets cache + market_events stream)
-Polymarket WS ──▶ polymarket-orderbook-rust-pubsub ──▶ Redis pub/sub `polymarket:events`
-                  polymarket-orderbook-rust-from-pubsub ──▶ ClickHouse `polymarket_orderbook_rust`
-                  r2-archive exporter (EXPORTER_PROFILE=polymarket) ──▶ R2 hourly Parquet snapshots
+Polymarket WS ──▶ polymarket-orderbook-rust-pubsub ──▶ Redis Stream `polymarket:events:v3`
+                  polymarket-orderbook-rust-from-pubsub ──▶ ClickHouse `polymarket_orderbook_v3`
+                  r2-archive exporter (EXPORTER_PROFILE=polymarket_v3) ──▶ R2 hourly Parquet
 ```
 
 - `services/polymarket/polymarket-active-markets` — Python; polls the Gamma API,
   maintains the Redis active-markets cache and lifecycle event stream.
 - `services/polymarket/polymarket-orderbook-rust-pubsub` — Rust; the only service
-  holding Polymarket WS connections. Publishes all 4 event variants
-  (book / price_change / last_trade_price / tick_size_change) to Redis pub/sub.
+  holding Polymarket WS connections. Captures v3 receipt/order metadata and
+  appends all four event variants to a durable Redis Stream.
 - `services/polymarket/polymarket-orderbook-rust-from-pubsub` — Rust; consumes the
-  pub/sub channel and writes to ClickHouse with full fidelity.
+  stream and acknowledges rows only after the replayable v3 ClickHouse insert.
 - `services/r2-archive/exporter` — generic exporter, run with
   `EXPORTER_PROFILE=polymarket`, dumps hourly Parquet to the
   bucket named by `R2_BUCKET`.
@@ -53,12 +55,15 @@ docker compose -f docker-compose.polymarket.yml up -d --build \
   obdata-polymarket-orderbook-rust-pubsub
 ```
 
-Then subscribe to the firehose (~10k+ events/sec across all markets):
+Then inspect the durable firehose (~10k+ events/sec across all markets):
 
 ```sh
-docker exec obdata-redis redis-cli SUBSCRIBE polymarket:events
+docker exec obdata-redis redis-cli XRANGE polymarket:events:v3 - + COUNT 1
 ```
 
 To also record into ClickHouse, set `CLICKHOUSE_PASSWORD`, start
 `obdata-clickhouse` from the infra compose, and add
 `obdata-polymarket-orderbook-rust-from-pubsub` to the `up` command.
+
+The v3 data contract and replay rules are documented in
+[`docs/POLYMARKET_V3.md`](docs/POLYMARKET_V3.md).

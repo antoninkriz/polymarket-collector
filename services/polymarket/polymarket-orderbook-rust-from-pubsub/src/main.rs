@@ -59,7 +59,9 @@ async fn main() -> Result<()> {
         database: cfg.clickhouse_database.clone(),
         table: cfg.clickhouse_table.clone(),
         drop_table_on_start: cfg.drop_table_on_start,
-        exclude_hash: cfg.exclude_hash,
+        // V3 always retains the source hash for audit. This option only
+        // affects the legacy raw sink.
+        exclude_hash: false,
         batch_size: cfg.flush_batch_size,
         flush_interval: cfg.flush_interval,
         ttl_minutes: cfg.ttl_minutes,

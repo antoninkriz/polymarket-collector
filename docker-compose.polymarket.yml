@@ -8,19 +8,18 @@ name: obdata-polymarket
 #
 #   obdata-polymarket-orderbook-rust-pubsub
 #     Subscribes to the Polymarket WS, publishes all 4 event variants
-#     (book/price_change/last_trade_price/tick_size_change) as tagged JSON on
-#     Redis pub/sub channel `polymarket:events`. Only service holding a
+#     (book/price_change/last_trade_price/tick_size_change) as v3 records on
+#     durable Redis Stream `polymarket:events:v3`. Only service holding a
 #     Polymarket WS connection.
 #
 #   obdata-polymarket-orderbook-rust-from-pubsub
-#     Subscribes to `polymarket:events`, deserializes each Event variant and
-#     feeds the existing polymarket ClickHouse sink — writing all 4 event
-#     types to `polymarket_orderbook_rust` with full fidelity.
+#     Consumes `polymarket:events:v3` and acknowledges records only after
+#     ClickHouse commits them to `polymarket_orderbook_v3`.
 #
 #   obdata-polymarket-r2-archive-exporter
 #     Reads obdata-clickhouse `polymarket_orderbook_rust` and exports hourly
-#     Parquet snapshots to the polymarket v2 bucket. Uses the generic
-#     r2-archive exporter image with EXPORTER_PROFILE=polymarket.
+#     replay-ordered Parquet snapshots. Uses the generic r2-archive exporter
+#     image with EXPORTER_PROFILE=polymarket_v3.
 #
 # All services use `network_mode: host` so they reach the host-local
 # Redis (localhost:6380) and ClickHouse (localhost:8124).
@@ -69,15 +68,13 @@ services:
       REDIS_STREAM_MARKET_EVENTS: polymarket:market_events
       REDIS_KEY_ACTIVE_MARKETS: polymarket:active_markets
       REDIS_KEY_ACTIVE_MARKETS_COUNT: polymarket:active_markets:count
-      # Pub/sub publish channel — consumed by obdata-polymarket-orderbook-rust-from-pubsub
-      REDIS_PUBSUB_CHANNEL: polymarket:events
+      # Durable event log consumed and acknowledged by the ClickHouse writer.
+      REDIS_EVENT_STREAM: polymarket:events:v3
       # WS pool
-      EXCLUDE_HASH: "true"
       SKIP_ACTIVE_MARKETS_CACHE: "false"
       QUEUE_SIZE: "5000000"
       MAX_ASSETS_PER_CONN: "500"
-      DEDUP_TTL_SECONDS: "10"
-      # Pub/sub publisher batching
+      # Redis Stream publisher batching
       MAX_BATCH: "200"
       LINGER_MS: "2"
       # Independent consumer group from the from-pubsub side
@@ -103,19 +100,21 @@ services:
         soft: 65536
         hard: 65536
     environment:
-      # Redis (host-local) — same pub/sub channel as the publisher
+      # Redis (host-local) — same durable stream as the publisher
       REDIS_URL: redis://localhost:6380
-      REDIS_PUBSUB_CHANNEL: polymarket:events
-      PUBSUB_RECONNECT_DELAY_MS: "2000"
+      REDIS_EVENT_STREAM: polymarket:events:v3
+      EVENT_CONSUMER_GROUP: polymarket-clickhouse-v3
+      # Keep this stable across restarts so this consumer drains its pending entries.
+      EVENT_CONSUMER_NAME: polymarket-clickhouse-v3-1
+      STREAM_RECONNECT_DELAY_MS: "2000"
       # ClickHouse (host-local)
       CLICKHOUSE_HOST: localhost
       CLICKHOUSE_PORT: "8124"
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       CLICKHOUSE_DATABASE: default
-      CLICKHOUSE_TABLE: polymarket_orderbook_rust
+      CLICKHOUSE_TABLE: polymarket_orderbook_v3
       DROP_TABLE_ON_START: "false"
-      EXCLUDE_HASH: "true"
       FLUSH_BATCH_SIZE: "5000"
       FLUSH_INTERVAL_MS: "500"
       QUEUE_SIZE: "5000000"
@@ -132,12 +131,12 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      EXPORTER_PROFILE: polymarket
+      EXPORTER_PROFILE: polymarket_v3
       CLICKHOUSE_HOST: localhost
       CLICKHOUSE_PORT: "8124"
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
-      CLICKHOUSE_TABLE: polymarket_orderbook_rust
+      CLICKHOUSE_TABLE: polymarket_orderbook_v3
       R2_ENDPOINT: ${R2_ENDPOINT:-}
       R2_BUCKET: ${R2_BUCKET:-}
       R2_ACCESS_KEY: ${R2_ACCESS_KEY:-}

@@ -23,7 +23,6 @@ pub struct Config {
     pub clickhouse_database: String,
     pub clickhouse_table: String,
     pub drop_table_on_start: bool,
-    pub exclude_hash: bool,
     pub flush_batch_size: usize,
     pub flush_interval: Duration,
     pub ttl_minutes: u64,
@@ -41,7 +40,7 @@ impl Config {
             stream_consumer_group: env_or("EVENT_CONSUMER_GROUP", "polymarket-clickhouse-v3"),
             stream_consumer_name: env_or("EVENT_CONSUMER_NAME", "polymarket-clickhouse-v3-1"),
             pubsub_reconnect_delay: Duration::from_millis(env_u64_or(
-                "PUBSUB_RECONNECT_DELAY_MS",
+                "STREAM_RECONNECT_DELAY_MS",
                 2_000,
             )?),
             clickhouse_url: format!("http://{clickhouse_host}:{clickhouse_port}"),
@@ -50,7 +49,6 @@ impl Config {
             clickhouse_database: env_or("CLICKHOUSE_DATABASE", "default"),
             clickhouse_table: env_or("CLICKHOUSE_TABLE", "polymarket_orderbook_v3"),
             drop_table_on_start: env_bool("DROP_TABLE_ON_START"),
-            exclude_hash: env_bool_default("EXCLUDE_HASH", true),
             flush_batch_size: env_usize_or("FLUSH_BATCH_SIZE", DEFAULT_FLUSH_BATCH_SIZE)?,
             flush_interval: Duration::from_millis(env_u64_or(
                 "FLUSH_INTERVAL_MS",
