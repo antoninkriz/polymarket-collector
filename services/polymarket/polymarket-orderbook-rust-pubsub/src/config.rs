@@ -144,7 +144,10 @@ mod tests {
         clear_env();
 
         let err = Config::from_env().unwrap_err().to_string();
-        assert!(err.contains("REDIS_URL"), "expected REDIS_URL in error: {err}");
+        assert!(
+            err.contains("REDIS_URL"),
+            "expected REDIS_URL in error: {err}"
+        );
 
         restore_env(snap);
     }
@@ -159,7 +162,10 @@ mod tests {
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.redis_url, "redis://localhost:6379");
         assert_eq!(cfg.redis_stream_market_events, "polymarket:market_events");
-        assert_eq!(cfg.redis_key_active_markets, "polymarket:active_markets:pubsub");
+        assert_eq!(
+            cfg.redis_key_active_markets,
+            "polymarket:active_markets:pubsub"
+        );
         assert_eq!(
             cfg.redis_key_active_markets_count,
             "polymarket:active_markets:pubsub:count",

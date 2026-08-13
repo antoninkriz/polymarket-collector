@@ -179,7 +179,11 @@ impl Connection {
                 pong_timed_out = false;
                 info!(conn = index, "PONG timeout — reconnecting immediately");
             } else {
-                info!(conn = index, delay_ms = backoff.as_millis() as u64, "reconnecting");
+                info!(
+                    conn = index,
+                    delay_ms = backoff.as_millis() as u64,
+                    "reconnecting"
+                );
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(RECONNECT_DELAY_MAX);
             }
@@ -577,7 +581,8 @@ fn handle_text(
                 context.stats.books.fetch_add(1, Ordering::Relaxed);
             }
             WireMessage::PriceChange(pc) => {
-                context.stats
+                context
+                    .stats
                     .price_changes
                     .fetch_add(pc.price_changes.len() as u64, Ordering::Relaxed);
             }
@@ -668,14 +673,7 @@ mod tests {
             collector: &collector,
             stats,
         };
-        handle_text(
-            text,
-            sub,
-            events,
-            &context,
-            0,
-            123,
-        )
+        handle_text(text, sub, events, &context, 0, 123)
     }
 
     fn sub_state(desired: &[&str]) -> SubState {
@@ -731,7 +729,11 @@ mod tests {
         }"#;
         handle(raw, &sub, &stats, &mut buf).unwrap();
         assert_eq!(buf.len(), 2, "only a1 entries should survive filter");
-        assert_eq!(stats.price_changes.load(Ordering::Relaxed), 3, "wire count is 3");
+        assert_eq!(
+            stats.price_changes.load(Ordering::Relaxed),
+            3,
+            "wire count is 3"
+        );
     }
 
     #[test]
@@ -809,7 +811,9 @@ mod tests {
         // must NOT exit early in that case — the inner loop will drain
         // them and then return when recv() yields None.
         let (tx, rx) = mpsc::channel::<Command>(8);
-        tx.send(Command::Unsubscribe(vec!["a1".into()])).await.unwrap();
+        tx.send(Command::Unsubscribe(vec!["a1".into()]))
+            .await
+            .unwrap();
         drop(tx);
         let should_exit = rx.is_closed() && rx.is_empty();
         assert!(

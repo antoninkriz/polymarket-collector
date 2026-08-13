@@ -101,10 +101,7 @@ fn env_bool(name: &str) -> bool {
 
 fn env_bool_default(name: &str, default: bool) -> bool {
     match std::env::var(name) {
-        Ok(value) => matches!(
-            value.to_ascii_lowercase().as_str(),
-            "true" | "1" | "yes"
-        ),
+        Ok(value) => matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
         Err(_) => default,
     }
 }

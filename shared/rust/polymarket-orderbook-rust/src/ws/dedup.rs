@@ -22,7 +22,10 @@ pub struct EventIdentity {
 
 pub fn event_identity(record: &EventRecord) -> EventIdentity {
     let (message_id, row_index) = record.identity();
-    EventIdentity { message_id, row_index }
+    EventIdentity {
+        message_id,
+        row_index,
+    }
 }
 
 #[cfg(test)]

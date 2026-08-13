@@ -157,7 +157,10 @@ impl Level {
 
 impl From<WireLevel> for Level {
     fn from(w: WireLevel) -> Self {
-        Self { price: w.price, size: w.size }
+        Self {
+            price: w.price,
+            size: w.size,
+        }
     }
 }
 
@@ -290,7 +293,13 @@ impl Event {
 impl fmt::Display for Event {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Event::Book { market, asset_id, bids, asks, .. } => {
+            Event::Book {
+                market,
+                asset_id,
+                bids,
+                asks,
+                ..
+            } => {
                 write!(
                     f,
                     "book market={} asset={} bids={} asks={}",
@@ -328,7 +337,11 @@ impl fmt::Display for Event {
                 market, asset_id, side, price, size, transaction_hash
             ),
             Event::TickSizeChange {
-                market, asset_id, old_tick_size, new_tick_size, ..
+                market,
+                asset_id,
+                old_tick_size,
+                new_tick_size,
+                ..
             } => write!(
                 f,
                 "tick_size_change market={} asset={} old={} new={}",
@@ -402,7 +415,10 @@ pub struct Market {
 
 impl Market {
     pub fn new(hash: String, yes_asset: String, no_asset: String) -> Self {
-        Self { hash, assets: [yes_asset, no_asset] }
+        Self {
+            hash,
+            assets: [yes_asset, no_asset],
+        }
     }
 
     #[cfg(test)]
@@ -443,7 +459,9 @@ mod tests {
             "hash": "abc123"
         }"#;
         let msg: WireMessage = serde_json::from_str(raw).unwrap();
-        let WireMessage::Book(b) = msg else { panic!("expected Book") };
+        let WireMessage::Book(b) = msg else {
+            panic!("expected Book")
+        };
         assert_eq!(b.market, "0xmarket");
         assert_eq!(b.asset_id, "asset-1");
         assert_eq!(b.bids.len(), 2);
@@ -470,7 +488,9 @@ mod tests {
             ]
         }"#;
         let msg: WireMessage = serde_json::from_str(raw).unwrap();
-        let WireMessage::PriceChange(pc) = msg else { panic!("expected PriceChange") };
+        let WireMessage::PriceChange(pc) = msg else {
+            panic!("expected PriceChange")
+        };
         assert_eq!(pc.market, "0xmarket");
         assert_eq!(pc.timestamp, "1757908892351");
         assert_eq!(pc.price_changes.len(), 3);
@@ -493,7 +513,9 @@ mod tests {
             "timestamp": "1757908892351"
         }"#;
         let msg: WireMessage = serde_json::from_str(raw).unwrap();
-        let WireMessage::LastTradePrice(t) = msg else { panic!("expected trade") };
+        let WireMessage::LastTradePrice(t) = msg else {
+            panic!("expected trade")
+        };
         assert_eq!(t.price, dec("0.42"));
         assert_eq!(t.fee_rate_bps, "10");
         assert_eq!(t.transaction_hash, "0xtx");
@@ -510,7 +532,9 @@ mod tests {
             "timestamp": "1757908892351"
         }"#;
         let msg: WireMessage = serde_json::from_str(raw).unwrap();
-        let WireMessage::TickSizeChange(c) = msg else { panic!("expected tick") };
+        let WireMessage::TickSizeChange(c) = msg else {
+            panic!("expected tick")
+        };
         assert_eq!(c.old_tick_size, dec("0.01"));
         assert_eq!(c.new_tick_size, dec("0.001"));
     }
@@ -739,8 +763,14 @@ mod tests {
             transaction_hash: "0xtx".into(),
         };
         t.strip_hash();
-        if let Event::LastTradePrice { transaction_hash, .. } = &t {
-            assert_eq!(transaction_hash, "0xtx", "transaction_hash should not be stripped");
+        if let Event::LastTradePrice {
+            transaction_hash, ..
+        } = &t
+        {
+            assert_eq!(
+                transaction_hash, "0xtx",
+                "transaction_hash should not be stripped"
+            );
         }
     }
 

@@ -114,9 +114,15 @@ impl Pool {
         PoolStats {
             market_count: self.markets.len(),
             connection_count: self.connections.len(),
-            asset_down_events: self.health_counters.asset_down_events.load(Ordering::Relaxed),
+            asset_down_events: self
+                .health_counters
+                .asset_down_events
+                .load(Ordering::Relaxed),
             asset_degraded_events: 0,
-            conn_down_events: self.health_counters.conn_down_events.load(Ordering::Relaxed),
+            conn_down_events: self
+                .health_counters
+                .conn_down_events
+                .load(Ordering::Relaxed),
             conns_down: self.health_counters.conns_down.load(Ordering::Relaxed) as usize,
             assets_down: self.health_counters.assets_down.load(Ordering::Relaxed) as usize,
             assets_degraded: 0,
@@ -223,7 +229,11 @@ impl Pool {
                 let handle = self.connections.swap_remove(index);
                 let conn_id = handle.conn_id;
                 drop(handle.cmd_tx);
-                info!(conn = conn_id, remaining = self.connections.len(), "removed empty connection");
+                info!(
+                    conn = conn_id,
+                    remaining = self.connections.len(),
+                    "removed empty connection"
+                );
                 tokio::spawn(async move {
                     let _ = handle.join.await;
                 });
@@ -267,11 +277,14 @@ impl Pool {
         required: usize,
         pending: &HashMap<usize, Vec<String>>,
     ) -> Option<usize> {
-        self.connections.iter().enumerate().find_map(|(index, handle)| {
-            let pending_count = pending.get(&handle.conn_id).map(Vec::len).unwrap_or(0);
-            (handle.assets.len() + pending_count + required <= self.max_assets_per_conn)
-                .then_some(index)
-        })
+        self.connections
+            .iter()
+            .enumerate()
+            .find_map(|(index, handle)| {
+                let pending_count = pending.get(&handle.conn_id).map(Vec::len).unwrap_or(0);
+                (handle.assets.len() + pending_count + required <= self.max_assets_per_conn)
+                    .then_some(index)
+            })
     }
 
     async fn spawn_connection(&mut self) {
@@ -293,7 +306,11 @@ impl Pool {
             cmd_tx,
             join,
         });
-        info!(conn = conn_id, total = self.connections.len(), "spawned connection");
+        info!(
+            conn = conn_id,
+            total = self.connections.len(),
+            "spawned connection"
+        );
     }
 
     fn update_monitor_mappings(&self) {
@@ -383,8 +400,12 @@ fn update_gauges(
         .values()
         .filter(|id| !matches!(conn_status.get(id), Some(ConnStatus::Connected)))
         .count();
-    counters.conns_down.store(conns_down as u64, Ordering::Relaxed);
-    counters.assets_down.store(assets_down as u64, Ordering::Relaxed);
+    counters
+        .conns_down
+        .store(conns_down as u64, Ordering::Relaxed);
+    counters
+        .assets_down
+        .store(assets_down as u64, Ordering::Relaxed);
 }
 
 #[cfg(test)]

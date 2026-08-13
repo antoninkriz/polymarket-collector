@@ -210,9 +210,10 @@ mod tests {
         let first = collector
             .next_message(0, 1, 0, 0, 1, 100)
             .record(tick("1"), 0, 1, "{}".into());
-        let second = collector
-            .next_message(0, 1, 1, 0, 1, 101)
-            .record(tick("1"), 0, 1, "{}".into());
+        let second =
+            collector
+                .next_message(0, 1, 1, 0, 1, 101)
+                .record(tick("1"), 0, 1, "{}".into());
 
         assert_ne!(first.message_id, second.message_id);
         assert_ne!(first.identity(), second.identity());

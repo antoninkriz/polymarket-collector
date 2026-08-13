@@ -51,7 +51,11 @@ async fn typed_sink_writes_to_clickhouse_end_to_end() -> Result<()> {
     let http = Client::new();
 
     // Clean slate.
-    query(&http, &format!("DROP TABLE IF EXISTS {CH_DATABASE}.{CH_TABLE}")).await?;
+    query(
+        &http,
+        &format!("DROP TABLE IF EXISTS {CH_DATABASE}.{CH_TABLE}"),
+    )
+    .await?;
 
     // Build a sink in typed mode. drop_table_on_start is redundant with the
     // DROP above, but exercises the code path.
@@ -80,8 +84,14 @@ async fn typed_sink_writes_to_clickhouse_end_to_end() -> Result<()> {
             market: "0x0000000000000000000000000000000000000000000000000000000000000abc".into(),
             asset_id: "asset-book".into(),
             timestamp: "1757908892351".into(),
-            bids: vec![Level { price: dec("0.41"), size: dec("100") }],
-            asks: vec![Level { price: dec("0.42"), size: dec("200.5") }],
+            bids: vec![Level {
+                price: dec("0.41"),
+                size: dec("100"),
+            }],
+            asks: vec![Level {
+                price: dec("0.42"),
+                size: dec("200.5"),
+            }],
             hash: Some("h".into()),
         },
         Event::PriceChange {
@@ -122,10 +132,13 @@ async fn typed_sink_writes_to_clickhouse_end_to_end() -> Result<()> {
 
     // -- Verify ----------------------------------------------------------
 
-    let count: u64 = query(&http, &format!("SELECT count() FROM {CH_DATABASE}.{CH_TABLE} FORMAT TabSeparated"))
-        .await?
-        .trim()
-        .parse()?;
+    let count: u64 = query(
+        &http,
+        &format!("SELECT count() FROM {CH_DATABASE}.{CH_TABLE} FORMAT TabSeparated"),
+    )
+    .await?
+    .trim()
+    .parse()?;
     assert_eq!(count, 4, "expected 4 rows, got {count}");
 
     // Pull each row back as JSON so we can assert against field shapes.
@@ -203,9 +216,15 @@ async fn typed_sink_writes_to_clickhouse_end_to_end() -> Result<()> {
     // CH normalizes `Delta` → `Delta(8)` (inferred byte-width for DateTime64)
     // and `Decimal32(4)` → `Decimal(9, 4)` when reading back, so match the
     // normalized forms.
-    assert!(ddl.contains("LowCardinality(FixedString(66))"), "DDL: {ddl}");
+    assert!(
+        ddl.contains("LowCardinality(FixedString(66))"),
+        "DDL: {ddl}"
+    );
     assert!(ddl.contains("CODEC(Delta(8), ZSTD(3))"), "DDL: {ddl}");
-    assert!(ddl.contains("ORDER BY (market, asset_id, timestamp_received)"), "DDL: {ddl}");
+    assert!(
+        ddl.contains("ORDER BY (market, asset_id, timestamp_received)"),
+        "DDL: {ddl}"
+    );
 
     // Clean up so the test is idempotent.
     query(&http, &format!("DROP TABLE {CH_DATABASE}.{CH_TABLE}")).await?;

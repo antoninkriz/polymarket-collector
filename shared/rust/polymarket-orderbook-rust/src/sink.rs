@@ -76,8 +76,8 @@ use clap::ValueEnum;
 use reqwest::Client;
 use rust_decimal::Decimal;
 use serde::Serialize;
-use tokio::sync::mpsc;
 use serde_json::json;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::events::Event;
@@ -127,7 +127,10 @@ impl From<Event> for SinkItem {
 
 impl From<EventRecord> for SinkItem {
     fn from(record: EventRecord) -> Self {
-        Self { record, delivery_id: None }
+        Self {
+            record,
+            delivery_id: None,
+        }
     }
 }
 
@@ -293,7 +296,9 @@ impl Sink {
         }
         let count = self.buffer.len();
 
-        let body = self.serialize_batch().context("serialize ClickHouse batch")?;
+        let body = self
+            .serialize_batch()
+            .context("serialize ClickHouse batch")?;
         let mut retry_delay = Duration::from_secs(1);
         loop {
             match self.send_insert(body.clone()).await {
@@ -408,7 +413,10 @@ impl Sink {
             .http
             .post(&self.cfg.url)
             .basic_auth(&self.cfg.user, Some(&self.cfg.password))
-            .query(&[("database", self.cfg.database.as_str()), ("query", query.as_str())])
+            .query(&[
+                ("database", self.cfg.database.as_str()),
+                ("query", query.as_str()),
+            ])
             .body(body)
             .send()
             .await
@@ -599,7 +607,13 @@ fn typed_row_value(ev: &Event, timestamp_ms: i64) -> serde_json::Value {
     let opt = |d: &Option<Decimal>| d.as_ref().map(dec).unwrap_or_else(|| ZERO.to_string());
 
     match ev {
-        Event::Book { market, asset_id, bids, asks, .. } => json!({
+        Event::Book {
+            market,
+            asset_id,
+            bids,
+            asks,
+            ..
+        } => json!({
             "timestamp": timestamp_ms,
             "market": market,
             "event_type": "book",
@@ -617,7 +631,14 @@ fn typed_row_value(ev: &Event, timestamp_ms: i64) -> serde_json::Value {
             "new_tick_size": ZERO,
         }),
         Event::PriceChange {
-            market, asset_id, price, size, side, best_bid, best_ask, ..
+            market,
+            asset_id,
+            price,
+            size,
+            side,
+            best_bid,
+            best_ask,
+            ..
         } => json!({
             "timestamp": timestamp_ms,
             "market": market,
@@ -636,7 +657,14 @@ fn typed_row_value(ev: &Event, timestamp_ms: i64) -> serde_json::Value {
             "new_tick_size": ZERO,
         }),
         Event::LastTradePrice {
-            market, asset_id, price, size, side, fee_rate_bps, transaction_hash, ..
+            market,
+            asset_id,
+            price,
+            size,
+            side,
+            fee_rate_bps,
+            transaction_hash,
+            ..
         } => json!({
             "timestamp": timestamp_ms,
             "market": market,
@@ -658,7 +686,11 @@ fn typed_row_value(ev: &Event, timestamp_ms: i64) -> serde_json::Value {
             "new_tick_size": ZERO,
         }),
         Event::TickSizeChange {
-            market, asset_id, old_tick_size, new_tick_size, ..
+            market,
+            asset_id,
+            old_tick_size,
+            new_tick_size,
+            ..
         } => json!({
             "timestamp": timestamp_ms,
             "market": market,
@@ -728,9 +760,17 @@ fn v3_row_value(item: &SinkItem, timestamp_ms: i64) -> serde_json::Value {
     };
 
     match event {
-        Event::Book { bids, asks, hash, .. } => {
-            object.insert("bids".into(), serde_json::to_value(bids).expect("serialize bids"));
-            object.insert("asks".into(), serde_json::to_value(asks).expect("serialize asks"));
+        Event::Book {
+            bids, asks, hash, ..
+        } => {
+            object.insert(
+                "bids".into(),
+                serde_json::to_value(bids).expect("serialize bids"),
+            );
+            object.insert(
+                "asks".into(),
+                serde_json::to_value(asks).expect("serialize asks"),
+            );
             object.insert(
                 "hash".into(),
                 hash.as_ref()
@@ -870,7 +910,8 @@ mod tests {
         assert_eq!(row1["timestamp"], 1757908892351_i64);
         assert_eq!(row1["event_type"], "book");
         // Inner data round-trips back to the bids/asks shape we serialized.
-        let inner: serde_json::Value = serde_json::from_str(row1["data"].as_str().unwrap()).unwrap();
+        let inner: serde_json::Value =
+            serde_json::from_str(row1["data"].as_str().unwrap()).unwrap();
         assert_eq!(inner["bids"], serde_json::json!([["0.41", "100"]]));
         assert_eq!(inner["hash"], "h");
     }
@@ -928,7 +969,12 @@ mod tests {
         SinkItem {
             record: collector
                 .next_message(4, 2, 9, 0, 1, 1_757_908_892_351_123_456)
-                .record(event, row_index, row_count, "{\"server\":\"payload\"}".into()),
+                .record(
+                    event,
+                    row_index,
+                    row_count,
+                    "{\"server\":\"payload\"}".into(),
+                ),
             delivery_id: Some("1757908892351-0".into()),
         }
     }
@@ -1116,7 +1162,8 @@ mod tests {
         ));
 
         let body = sink.serialize_batch().unwrap();
-        let row: serde_json::Value = serde_json::from_slice(body.strip_suffix(b"\n").unwrap()).unwrap();
+        let row: serde_json::Value =
+            serde_json::from_slice(body.strip_suffix(b"\n").unwrap()).unwrap();
         assert_eq!(row["schema_version"], 3);
         assert_eq!(row["timestamp_received"], 1_757_908_892_351_123_456_i64);
         assert_eq!(row["connection_epoch"], 2);

@@ -101,16 +101,21 @@ async fn main() -> Result<()> {
         skip_backlog: cli.skip_backlog,
     };
     let stream_pool = Arc::clone(&pool);
-    let stream_handle: JoinHandle<Result<()>> = tokio::spawn(async move {
-        markets::stream::run(stream_cfg, stream_pool).await
-    });
+    let stream_handle: JoinHandle<Result<()>> =
+        tokio::spawn(async move { markets::stream::run(stream_cfg, stream_pool).await });
 
     let stats_pool = Arc::clone(&pool);
     let stats_event_tx = event_tx.clone();
     let stats_redis_url = cfg.redis_url.clone();
     let stats_cache_count_key = cfg.redis_key_active_markets_count.clone();
     let stats_handle = tokio::spawn(async move {
-        stats_loop(stats_pool, stats_event_tx, stats_redis_url, stats_cache_count_key).await;
+        stats_loop(
+            stats_pool,
+            stats_event_tx,
+            stats_redis_url,
+            stats_cache_count_key,
+        )
+        .await;
     });
 
     wait_for_shutdown().await;

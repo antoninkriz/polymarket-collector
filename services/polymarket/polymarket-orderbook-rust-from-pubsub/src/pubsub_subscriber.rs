@@ -53,17 +53,11 @@ pub async fn run(
 ) -> Result<()> {
     let mut pending_acks = Vec::new();
     loop {
-        match consume_once(
-            &cfg,
-            &inbound_tx,
-            &mut ack_rx,
-            &mut pending_acks,
-            &stats,
-        )
-        .await
-        {
+        match consume_once(&cfg, &inbound_tx, &mut ack_rx, &mut pending_acks, &stats).await {
             Ok(()) => info!(stream = %cfg.stream, "Redis event stream ended; reconnecting"),
-            Err(error) => warn!(?error, stream = %cfg.stream, "Redis event stream error; reconnecting"),
+            Err(error) => {
+                warn!(?error, stream = %cfg.stream, "Redis event stream error; reconnecting")
+            }
         }
         stats.reconnects.fetch_add(1, Ordering::Relaxed);
         tokio::time::sleep(cfg.reconnect_delay).await;

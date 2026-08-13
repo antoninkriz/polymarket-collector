@@ -117,12 +117,12 @@ impl PubSubSink {
             match result {
                 Ok(()) => break,
                 Err(error) => {
-                error!(
-                    %error,
-                    batch_size,
-                    retry_delay_ms = retry_delay.as_millis() as u64,
-                    "Redis stream append failed; retaining batch for retry",
-                );
+                    error!(
+                        %error,
+                        batch_size,
+                        retry_delay_ms = retry_delay.as_millis() as u64,
+                        "Redis stream append failed; retaining batch for retry",
+                    );
                     tokio::time::sleep(retry_delay).await;
                     retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
                 }
