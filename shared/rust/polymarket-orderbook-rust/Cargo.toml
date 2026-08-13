@@ -41,6 +41,7 @@ thiserror = "2"
 url = "2"
 rand = "0.8"
 chrono = "0.4"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [profile.release]
 opt-level = 3

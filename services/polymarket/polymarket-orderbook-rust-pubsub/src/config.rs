@@ -18,7 +18,7 @@ pub struct Config {
     pub stream_consumer_name: String,
 
     // -- Pub/sub publish -----------------------------------------------------
-    pub redis_pubsub_channel: String,
+    pub redis_event_stream: String,
     pub publish_batch_max: usize,
     pub publish_linger: Duration,
 
@@ -28,7 +28,6 @@ pub struct Config {
     // -- Pipeline ------------------------------------------------------------
     pub queue_size: usize,
     pub max_assets_per_conn: usize,
-    pub dedup_ttl: Duration,
 }
 
 impl Config {
@@ -50,7 +49,7 @@ impl Config {
             stream_consumer_group: env_or("ORDERBOOK_CONSUMER_GROUP", "orderbook-rust-pubsub"),
             stream_consumer_name: env_or("ORDERBOOK_CONSUMER_NAME", "orderbook-rust-pubsub-1"),
 
-            redis_pubsub_channel: env_or("REDIS_PUBSUB_CHANNEL", "polymarket:events"),
+            redis_event_stream: env_or("REDIS_EVENT_STREAM", "polymarket:events:v3"),
             publish_batch_max: env_parse("MAX_BATCH", 200_usize)?,
             publish_linger: Duration::from_millis(env_parse("LINGER_MS", 2_u64)?),
 
@@ -58,7 +57,6 @@ impl Config {
 
             queue_size: env_parse("QUEUE_SIZE", 5_000_000)?,
             max_assets_per_conn: env_parse("MAX_ASSETS_PER_CONN", 200)?,
-            dedup_ttl: Duration::from_secs(env_parse("DEDUP_TTL_SECONDS", 10_u64)?),
         })
     }
 }
@@ -109,11 +107,10 @@ mod tests {
         "REDIS_KEY_ACTIVE_MARKETS_COUNT",
         "ORDERBOOK_CONSUMER_GROUP",
         "ORDERBOOK_CONSUMER_NAME",
-        "REDIS_PUBSUB_CHANNEL",
+        "REDIS_EVENT_STREAM",
         "SKIP_ACTIVE_MARKETS_CACHE",
         "QUEUE_SIZE",
         "MAX_ASSETS_PER_CONN",
-        "DEDUP_TTL_SECONDS",
         "MAX_BATCH",
         "LINGER_MS",
     ];
@@ -169,11 +166,10 @@ mod tests {
         );
         assert_eq!(cfg.stream_consumer_group, "orderbook-rust-pubsub");
         assert_eq!(cfg.stream_consumer_name, "orderbook-rust-pubsub-1");
-        assert_eq!(cfg.redis_pubsub_channel, "polymarket:events");
+        assert_eq!(cfg.redis_event_stream, "polymarket:events:v3");
         assert!(!cfg.skip_active_markets_cache);
         assert_eq!(cfg.queue_size, 5_000_000);
         assert_eq!(cfg.max_assets_per_conn, 200);
-        assert_eq!(cfg.dedup_ttl, Duration::from_secs(10));
         assert_eq!(cfg.publish_batch_max, 200);
         assert_eq!(cfg.publish_linger, Duration::from_millis(2));
 
@@ -186,17 +182,15 @@ mod tests {
         let snap = snapshot_env();
         clear_env();
         std::env::set_var("REDIS_URL", "redis://r:6379");
-        std::env::set_var("REDIS_PUBSUB_CHANNEL", "my:custom:channel");
+        std::env::set_var("REDIS_EVENT_STREAM", "my:custom:stream");
         std::env::set_var("MAX_ASSETS_PER_CONN", "100");
-        std::env::set_var("DEDUP_TTL_SECONDS", "30");
         std::env::set_var("ORDERBOOK_CONSUMER_GROUP", "g1");
         std::env::set_var("ORDERBOOK_CONSUMER_NAME", "c1");
 
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.redis_url, "redis://r:6379");
-        assert_eq!(cfg.redis_pubsub_channel, "my:custom:channel");
+        assert_eq!(cfg.redis_event_stream, "my:custom:stream");
         assert_eq!(cfg.max_assets_per_conn, 100);
-        assert_eq!(cfg.dedup_ttl, Duration::from_secs(30));
         assert_eq!(cfg.stream_consumer_group, "g1");
         assert_eq!(cfg.stream_consumer_name, "c1");
 

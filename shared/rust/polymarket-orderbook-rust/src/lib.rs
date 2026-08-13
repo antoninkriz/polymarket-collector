@@ -6,5 +6,6 @@
 pub mod config;
 pub mod events;
 pub mod markets;
+pub mod record;
 pub mod sink;
 pub mod ws;

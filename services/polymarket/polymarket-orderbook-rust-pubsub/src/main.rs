@@ -23,9 +23,10 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use polymarket_orderbook_rust::events::{Event, Market};
+use polymarket_orderbook_rust::events::Market;
 use polymarket_orderbook_rust::markets;
 use polymarket_orderbook_rust::markets::stream::StreamConfig;
+use polymarket_orderbook_rust::record::EventRecord;
 use polymarket_orderbook_rust::ws::pool::Pool;
 
 use polymarket_orderbook_rust_pubsub::config::Config;
@@ -54,10 +55,9 @@ async fn main() -> Result<()> {
         new_only = cli.new_only,
         skip_backlog = cli.skip_backlog,
         redis_url = %cfg.redis_url,
-        pubsub_channel = %cfg.redis_pubsub_channel,
+        event_stream = %cfg.redis_event_stream,
         max_assets_per_conn = cfg.max_assets_per_conn,
         queue_size = cfg.queue_size,
-        dedup_ttl_secs = cfg.dedup_ttl.as_secs(),
         publish_batch_max = cfg.publish_batch_max,
         publish_linger_ms = cfg.publish_linger.as_millis() as u64,
         "starting polymarket-orderbook-rust-pubsub",
@@ -65,19 +65,18 @@ async fn main() -> Result<()> {
 
     let sink = PubSubSink::connect(PubSubSinkConfig {
         redis_url: cfg.redis_url.clone(),
-        channel: cfg.redis_pubsub_channel.clone(),
+        stream: cfg.redis_event_stream.clone(),
         batch_max: cfg.publish_batch_max,
         linger: cfg.publish_linger,
     })
     .await
     .context("connect Redis pub/sub sink")?;
 
-    let (event_tx, event_rx) = mpsc::channel::<Event>(cfg.queue_size);
+    let (event_tx, event_rx) = mpsc::channel::<EventRecord>(cfg.queue_size);
     let sink_handle: JoinHandle<Result<()>> = tokio::spawn(sink.run(event_rx));
 
     let pool = Arc::new(Mutex::new(Pool::new(
         cfg.max_assets_per_conn,
-        cfg.dedup_ttl,
         event_tx.clone(),
     )));
 
@@ -196,7 +195,7 @@ async fn wait_for_shutdown() {
 
 async fn stats_loop(
     pool: Arc<Mutex<Pool>>,
-    event_tx: mpsc::Sender<Event>,
+    event_tx: mpsc::Sender<EventRecord>,
     redis_url: String,
     cache_count_key: String,
 ) {

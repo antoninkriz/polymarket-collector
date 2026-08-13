@@ -32,8 +32,9 @@
 //!
 //! ## Failure mode for the event channel
 //!
-//! Events are pushed via the global [`DedupForwarder`](crate::ws::dedup::DedupForwarder)
-//! `try_send`. If the channel is **full**, the consumer is too slow and we
+//! Events are stamped at receipt and pushed directly to the global channel.
+//! Each market has one authoritative connection, so no payload merge or
+//! deduplication occurs here. If the channel is **full**, the consumer is too slow and we
 //! exit the process. If the channel is **closed**, the sink has shut down
 //! and we return cleanly.
 
@@ -48,8 +49,8 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
-use crate::events::{explode, Event, WireFrame, WireMessage};
-use crate::ws::dedup::DedupForwarder;
+use crate::events::{explode, Event, WireMessage};
+use crate::record::{now_ns, CollectorContext, EventRecord};
 use crate::ws::WS_MARKET_URL;
 
 /// Liveness state of a single WebSocket connection. Published by the
@@ -124,7 +125,8 @@ pub enum Command {
 
 pub struct Connection {
     pub index: usize,
-    pub forwarder: Arc<DedupForwarder>,
+    pub event_tx: mpsc::Sender<EventRecord>,
+    pub collector: Arc<CollectorContext>,
     pub status_tx: mpsc::UnboundedSender<(usize, ConnStatus)>,
     pub stats: Arc<ConnStats>,
 }
@@ -132,12 +134,14 @@ pub struct Connection {
 impl Connection {
     pub fn new(
         index: usize,
-        forwarder: Arc<DedupForwarder>,
+        event_tx: mpsc::Sender<EventRecord>,
+        collector: Arc<CollectorContext>,
         status_tx: mpsc::UnboundedSender<(usize, ConnStatus)>,
     ) -> Self {
         Self {
             index,
-            forwarder,
+            event_tx,
+            collector,
             status_tx,
             stats: Arc::new(ConnStats::default()),
         }
@@ -155,7 +159,8 @@ impl Connection {
     pub async fn run(self, mut commands: mpsc::Receiver<Command>) -> Result<()> {
         let Connection {
             index,
-            forwarder,
+            event_tx,
+            collector,
             status_tx,
             stats,
         } = self;
@@ -164,6 +169,8 @@ impl Connection {
         let mut last_message_time: Option<Instant> = None;
         let mut pong_timed_out = false;
         let mut first_attempt = true;
+        let mut connection_epoch = 0_u64;
+        let mut frame_sequence = 0_u64;
         loop {
             // Reconnect delay (skip on first attempt and on PONG timeout).
             if first_attempt {
@@ -202,6 +209,7 @@ impl Connection {
                     continue;
                 }
             };
+            connection_epoch += 1;
 
             // Reset session state. `desired` survives, `subscribed` does not.
             sub.reset_session();
@@ -228,11 +236,14 @@ impl Connection {
             let outcome = run_session(
                 ws_stream,
                 index,
+                connection_epoch,
                 &mut sub,
-                &forwarder,
+                &event_tx,
+                &collector,
                 &stats,
                 &mut commands,
                 &mut last_message_time,
+                &mut frame_sequence,
             )
             .await;
 
@@ -304,11 +315,14 @@ async fn run_session(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     index: usize,
+    connection_epoch: u64,
     sub: &mut SubState,
-    forwarder: &DedupForwarder,
+    event_tx: &mpsc::Sender<EventRecord>,
+    collector: &CollectorContext,
     stats: &ConnStats,
     commands: &mut mpsc::Receiver<Command>,
     last_message_time: &mut Option<Instant>,
+    frame_sequence: &mut u64,
 ) -> SessionOutcome {
     let (mut write, mut read) = ws_stream.split();
 
@@ -331,13 +345,16 @@ async fn run_session(
     let mut last_pong = Instant::now();
     let mut last_ping_sent: Option<Instant> = None;
 
-    let mut events_buf: Vec<Event> = Vec::new();
+    let mut events_buf: Vec<EventRecord> = Vec::new();
 
     loop {
         tokio::select! {
             // -- Read next frame from the socket -------------------------
             msg = read.next() => match msg {
                 Some(Ok(Message::Text(text))) => {
+                    // Capture wall time before parsing, filtering, queueing, or
+                    // any downstream transport work.
+                    let timestamp_received_ns = now_ns();
                     *last_message_time = Some(Instant::now());
                     let stripped = text.trim();
                     if stripped.is_empty() {
@@ -348,16 +365,28 @@ async fn run_session(
                         debug!(conn = index, "PONG received");
                         continue;
                     }
-                    match handle_text(stripped, sub, stats, &mut events_buf) {
+                    let this_frame_sequence = *frame_sequence;
+                    *frame_sequence = frame_sequence.wrapping_add(1);
+                    match handle_text(
+                        stripped,
+                        sub,
+                        stats,
+                        &mut events_buf,
+                        collector,
+                        index as u32,
+                        connection_epoch,
+                        this_frame_sequence,
+                        timestamp_received_ns,
+                    ) {
                         Ok(()) => {
                             for ev in events_buf.drain(..) {
-                                match forwarder.try_send(ev) {
+                                match event_tx.try_send(ev) {
                                     Ok(()) => {}
                                     Err(mpsc::error::TrySendError::Full(_)) => {
                                         error!(
                                             conn = index,
-                                            capacity = forwarder.capacity(),
-                                            max_capacity = forwarder.max_capacity(),
+                                            capacity = event_tx.capacity(),
+                                            max_capacity = event_tx.max_capacity(),
                                             "[QUEUE-OVERFLOW] event channel full, exiting"
                                         );
                                         std::process::exit(1);
@@ -481,11 +510,25 @@ fn handle_text(
     text: &str,
     sub: &SubState,
     stats: &ConnStats,
-    events_buf: &mut Vec<Event>,
+    events_buf: &mut Vec<EventRecord>,
+    collector: &CollectorContext,
+    connection_id: u32,
+    connection_epoch: u64,
+    frame_sequence: u64,
+    timestamp_received_ns: i64,
 ) -> Result<()> {
-    let frame: WireFrame = serde_json::from_str(text).context("parse wire frame")?;
-    let mut staged: Vec<Event> = Vec::new();
-    for msg in frame.into_iter() {
+    let frame: serde_json::Value = serde_json::from_str(text).context("parse wire frame")?;
+    let messages = match frame {
+        serde_json::Value::Array(messages) => messages,
+        message => vec![message],
+    };
+    let message_count = u32::try_from(messages.len()).context("too many messages in frame")?;
+
+    for (message_index, raw_value) in messages.into_iter().enumerate() {
+        // Serialize from Value rather than from the typed struct so fields a
+        // newer server adds remain available in raw_message.
+        let raw_message = serde_json::to_string(&raw_value).context("serialize raw message")?;
+        let msg: WireMessage = serde_json::from_value(raw_value).context("parse wire message")?;
         // Per-type counters need to be incremented from the wire message
         // before fan-out (price_change still counts as one wire arrival per
         // entry, matching `connection.py::_handle_price_change`).
@@ -505,12 +548,29 @@ fn handle_text(
                 stats.tick_changes.fetch_add(1, Ordering::Relaxed);
             }
         }
+        let mut staged: Vec<Event> = Vec::new();
         explode(msg, &mut staged);
-    }
-    // Filter by desired before queuing.
-    for ev in staged {
-        if sub.desired.contains(ev.asset_id()) {
-            events_buf.push(ev);
+        let row_count = u32::try_from(staged.len()).context("too many rows in message")?;
+        let message = collector.next_message(
+            connection_id,
+            connection_epoch,
+            frame_sequence,
+            message_index as u32,
+            message_count,
+            timestamp_received_ns,
+        );
+
+        // Preserve the original exploded index even when an unexpected asset
+        // is filtered. A non-contiguous row_index then exposes the omission.
+        for (row_index, ev) in staged.into_iter().enumerate() {
+            if sub.desired.contains(ev.asset_id()) {
+                events_buf.push(message.record(
+                    ev,
+                    row_index as u32,
+                    row_count,
+                    raw_message.clone(),
+                ));
+            }
         }
     }
     Ok(())
@@ -560,6 +620,25 @@ where
 mod tests {
     use super::*;
 
+    fn handle(
+        text: &str,
+        sub: &SubState,
+        stats: &ConnStats,
+        events: &mut Vec<EventRecord>,
+    ) -> Result<()> {
+        handle_text(
+            text,
+            sub,
+            stats,
+            events,
+            &CollectorContext::new(),
+            0,
+            1,
+            0,
+            123,
+        )
+    }
+
     fn sub_state(desired: &[&str]) -> SubState {
         let mut s = SubState::default();
         for a in desired {
@@ -577,7 +656,7 @@ mod tests {
             "event_type": "book", "asset_id": "not-wanted", "market": "m",
             "bids": [], "asks": [], "timestamp": "1", "hash": "h"
         }"#;
-        handle_text(raw, &sub, &stats, &mut buf).unwrap();
+        handle(raw, &sub, &stats, &mut buf).unwrap();
         assert_eq!(buf.len(), 0, "undesired asset should be filtered");
         // The book counter still increments because the wire message arrived.
         assert_eq!(stats.books.load(Ordering::Relaxed), 1);
@@ -594,7 +673,7 @@ mod tests {
             "asks": [{"price": "0.5", "size": "10"}],
             "timestamp": "1", "hash": "h"
         }"#;
-        handle_text(raw, &sub, &stats, &mut buf).unwrap();
+        handle(raw, &sub, &stats, &mut buf).unwrap();
         assert_eq!(buf.len(), 1);
     }
 
@@ -611,7 +690,7 @@ mod tests {
                 {"asset_id": "a1", "price": "0.6", "size": "10", "side": "BUY", "hash": "h3"}
             ]
         }"#;
-        handle_text(raw, &sub, &stats, &mut buf).unwrap();
+        handle(raw, &sub, &stats, &mut buf).unwrap();
         assert_eq!(buf.len(), 2, "only a1 entries should survive filter");
         assert_eq!(stats.price_changes.load(Ordering::Relaxed), 3, "wire count is 3");
     }
@@ -627,7 +706,7 @@ mod tests {
             {"event_type": "tick_size_change", "asset_id": "a", "market": "m",
              "old_tick_size": "0.02", "new_tick_size": "0.002", "timestamp": "2"}
         ]"#;
-        handle_text(raw, &sub, &stats, &mut buf).unwrap();
+        handle(raw, &sub, &stats, &mut buf).unwrap();
         assert_eq!(buf.len(), 2);
         assert_eq!(stats.tick_changes.load(Ordering::Relaxed), 2);
     }

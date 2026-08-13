@@ -1,11 +1,9 @@
-//! Redis pub/sub sink for Polymarket events.
+//! Durable Redis Stream sink for v3 Polymarket records.
 //!
-//! Receives [`Event`]s on an mpsc channel and publishes each as a tagged
-//! JSON payload on a single Redis pub/sub channel. All 4 event variants
-//! (`book`, `price_change`, `last_trade_price`, `tick_size_change`) round-trip
-//! through the wire so the downstream `polymarket-orderbook-rust-from-pubsub`
-//! consumer can reconstruct the same `Event` enum and feed the existing
-//! ClickHouse sink with full fidelity.
+//! Records are appended with `XADD`. Failed writes retain the batch and retry
+//! with backoff. An uncertain Redis response can append a record twice, but
+//! both copies carry the same collector `(message_id, row_index)` and the v3
+//! ClickHouse table removes that transport retry by identity.
 
 use std::time::{Duration, Instant};
 
@@ -14,12 +12,12 @@ use redis::aio::ConnectionManager;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
-use polymarket_orderbook_rust::events::Event;
+use polymarket_orderbook_rust::record::EventRecord;
 
 #[derive(Debug, Clone)]
 pub struct PubSubSinkConfig {
     pub redis_url: String,
-    pub channel: String,
+    pub stream: String,
     pub batch_max: usize,
     pub linger: Duration,
 }
@@ -38,7 +36,7 @@ impl PubSubSink {
         let conn = ConnectionManager::new(client)
             .await
             .context("connect Redis ConnectionManager")?;
-        info!(channel = %cfg.channel, "polymarket pubsub sink connected");
+        info!(stream = %cfg.stream, "polymarket durable stream sink connected");
         Ok(Self {
             cfg,
             conn,
@@ -47,10 +45,10 @@ impl PubSubSink {
         })
     }
 
-    pub async fn run(mut self, mut rx: mpsc::Receiver<Event>) -> Result<()> {
+    pub async fn run(mut self, mut rx: mpsc::Receiver<EventRecord>) -> Result<()> {
         let batch_max = self.cfg.batch_max;
         let linger = self.cfg.linger;
-        let mut batch: Vec<Event> = Vec::with_capacity(batch_max);
+        let mut batch: Vec<EventRecord> = Vec::with_capacity(batch_max);
 
         loop {
             // Block for first event so we don't busy-loop when idle.
@@ -78,7 +76,7 @@ impl PubSubSink {
                 }
             }
 
-            self.flush(&mut batch).await;
+            self.flush(&mut batch).await?;
 
             if channel_closed {
                 break;
@@ -93,44 +91,45 @@ impl PubSubSink {
         Ok(())
     }
 
-    async fn flush(&mut self, batch: &mut Vec<Event>) {
+    async fn flush(&mut self, batch: &mut Vec<EventRecord>) -> Result<()> {
         if batch.is_empty() {
-            return;
+            return Ok(());
         }
         let batch_size = batch.len();
-        let mut pipe = redis::pipe();
-        let mut serialized: u64 = 0;
-        for event in batch.drain(..) {
-            match serde_json::to_string(&event) {
-                Ok(payload) => {
-                    pipe.publish(&self.cfg.channel, payload).ignore();
-                    serialized += 1;
-                }
-                Err(err) => {
-                    self.total_dropped += 1;
-                    error!(
-                        error = %err,
-                        total_dropped = self.total_dropped,
-                        "polymarket pubsub event serialization failed",
-                    );
-                }
+        let payloads: Vec<String> = batch
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<std::result::Result<_, _>>()
+            .context("serialize v3 stream batch")?;
+
+        let mut retry_delay = Duration::from_millis(250);
+        loop {
+            let mut pipe = redis::pipe();
+            for payload in &payloads {
+                pipe.cmd("XADD")
+                    .arg(&self.cfg.stream)
+                    .arg("*")
+                    .arg("payload")
+                    .arg(payload)
+                    .ignore();
             }
-        }
-        if serialized == 0 {
-            return;
-        }
-        let result: redis::RedisResult<()> = pipe.query_async(&mut self.conn).await;
-        match result {
-            Ok(()) => self.total_published += serialized,
-            Err(e) => {
-                self.total_dropped += serialized;
+            let result: redis::RedisResult<()> = pipe.query_async(&mut self.conn).await;
+            match result {
+                Ok(()) => break,
+                Err(error) => {
                 error!(
-                    error = %e,
+                    %error,
                     batch_size,
-                    total_dropped = self.total_dropped,
-                    "polymarket pubsub pipelined publish failed",
+                    retry_delay_ms = retry_delay.as_millis() as u64,
+                    "Redis stream append failed; retaining batch for retry",
                 );
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+                }
             }
         }
+        self.total_published += payloads.len() as u64;
+        batch.clear();
+        Ok(())
     }
 }

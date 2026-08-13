@@ -3,13 +3,13 @@
 //!
 //! Module split:
 //! - [`connection`] — single WebSocket session: connect, ping/pong heartbeat,
-//!   parse incoming frames into [`crate::events::Event`]s, automatic
+//!   parse incoming frames into [`crate::record::EventRecord`]s, automatic
 //!   reconnect with subscription recovery.
-//! - [`dedup`] — global dedup cache + the [`dedup::DedupForwarder`] that all
-//!   Connections push events into.
-//! - [`pool`] — connection pool: randomized two-pass asset allocation across
-//!   connections, batched startup, market lifecycle (subscribe / unsubscribe),
-//!   and asset-level health monitoring.
+//! - [`dedup`] — the collector-owned retry identity. Public payloads are never
+//!   treated as unique fill identifiers.
+//! - [`pool`] — connection pool: keeps both assets of each market on one
+//!   authoritative connection so parent-message order is not merged across
+//!   independent sockets.
 
 pub mod connection;
 pub mod dedup;
