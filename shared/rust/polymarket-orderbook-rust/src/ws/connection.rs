@@ -8,10 +8,12 @@
 //!
 //! Polymarket uses **application-level** PING/PONG text messages, not
 //! WebSocket protocol ping frames. Per the Polymarket docs, the client
-//! sends `"PING"` every **10 s** and the server responds `"PONG"`. We wait
-//! 5 s for the PONG; if it's missed, the socket is closed and the run loop
-//! reconnects immediately (no backoff). Other failures use exponential
-//! backoff (1 → 60 s).
+//! sends `"PING"` every **10 s** and the server responds `"PONG"`. Any frame
+//! received after a PING proves the transport is alive; this matters when a
+//! busy market-data stream delays the textual PONG behind data frames. If no
+//! frame arrives before the heartbeat deadline, the socket is closed and the
+//! run loop reconnects immediately (no backoff). Other failures use
+//! exponential backoff (1 → 60 s).
 //!
 //! ## Subscription state
 //!
@@ -132,15 +134,15 @@ impl Connection {
         let mut sub = SubState::default();
         let mut backoff = Duration::from_secs(1);
         let mut last_message_time: Option<Instant> = None;
-        let mut pong_timed_out = false;
+        let mut heartbeat_timed_out = false;
         let mut first_attempt = true;
         loop {
             // Reconnect delay (skip on first attempt and on PONG timeout).
             if first_attempt {
                 first_attempt = false;
-            } else if pong_timed_out {
-                pong_timed_out = false;
-                info!(conn = index, "PONG timeout — reconnecting immediately");
+            } else if heartbeat_timed_out {
+                heartbeat_timed_out = false;
+                info!(conn = index, "heartbeat timeout — reconnecting immediately");
             } else {
                 info!(
                     conn = index,
@@ -195,8 +197,8 @@ impl Connection {
             // the pool's health monitor sees us go up immediately.
             let _ = status_tx.send((index, ConnStatus::Connected));
 
-            // Run a single connected session. Returns true if the session
-            // ended due to a PONG timeout (so we skip the next backoff).
+            // Run a single connected session. A heartbeat timeout skips the
+            // next reconnect backoff.
             let context = SessionContext {
                 index,
                 event_tx: &event_tx,
@@ -218,8 +220,8 @@ impl Connection {
             let _ = status_tx.send((index, ConnStatus::Disconnected));
 
             match outcome {
-                SessionOutcome::PongTimeout => {
-                    pong_timed_out = true;
+                SessionOutcome::HeartbeatTimeout => {
+                    heartbeat_timed_out = true;
                     backoff = Duration::from_secs(1);
                 }
                 SessionOutcome::Closed => {
@@ -265,8 +267,8 @@ impl SubState {
 
 #[derive(Debug)]
 enum SessionOutcome {
-    /// Session ended because the PONG heartbeat timed out. Reconnect with no delay.
-    PongTimeout,
+    /// Session ended because no frame followed a heartbeat. Reconnect immediately.
+    HeartbeatTimeout,
     /// Session ended due to a remote close or read EOF. Reconnect with backoff.
     Closed,
     /// Event channel closed (sink died). Connection should shut down.
@@ -317,7 +319,7 @@ async fn run_session(
     // Skip the first immediate tick.
     ping_interval.tick().await;
 
-    let mut last_pong = Instant::now();
+    let mut last_inbound = Instant::now();
     let mut last_ping_sent: Option<Instant> = None;
 
     let mut events_buf: Vec<EventRecord> = Vec::new();
@@ -330,13 +332,14 @@ async fn run_session(
                     // Capture wall time before parsing, filtering, queueing, or
                     // any downstream transport work.
                     let timestamp_received_ns = now_ns();
-                    *last_message_time = Some(Instant::now());
+                    let received_at = Instant::now();
+                    *last_message_time = Some(received_at);
+                    last_inbound = received_at;
                     let stripped = text.trim();
                     if stripped.is_empty() {
                         continue;
                     }
                     if stripped == "PONG" {
-                        last_pong = Instant::now();
                         debug!(conn = index, "PONG received");
                         continue;
                     }
@@ -377,14 +380,16 @@ async fn run_session(
                     }
                 }
                 Some(Ok(Message::Ping(p))) => {
+                    last_inbound = Instant::now();
                     // Protocol-level ping. Reply per spec; this is independent
                     // of the application-level "PING"/"PONG" text exchange.
                     let _ = write.send(Message::Pong(p)).await;
                 }
                 Some(Ok(Message::Pong(_))) => {
-                    // Protocol-level pong. Ignore.
+                    last_inbound = Instant::now();
                 }
                 Some(Ok(Message::Binary(_))) => {
+                    last_inbound = Instant::now();
                     debug!(conn = index, "ignoring binary frame");
                 }
                 Some(Ok(Message::Close(frame))) => {
@@ -392,6 +397,7 @@ async fn run_session(
                     return SessionOutcome::Closed;
                 }
                 Some(Ok(Message::Frame(_))) => {
+                    last_inbound = Instant::now();
                     // Raw frames are not expected from a tungstenite stream
                     // unless we explicitly ask. Ignore defensively.
                 }
@@ -407,19 +413,18 @@ async fn run_session(
 
             // -- PING ticker --------------------------------------------
             _ = ping_interval.tick() => {
-                // Before sending the next PING, check whether the previous
-                // PING ever got its PONG. If we sent at T and `last_pong`
-                // is still earlier than T after PONG_TIMEOUT, the connection
-                // is dead.
+                // A PONG is the normal response, but any later inbound frame
+                // proves this socket is alive. Requiring the textual PONG
+                // alone creates false reconnects on busy market streams.
                 if let Some(sent_at) = last_ping_sent {
-                    if last_pong < sent_at && sent_at.elapsed() >= PONG_TIMEOUT {
+                    if heartbeat_expired(last_inbound, sent_at, Instant::now()) {
                         warn!(
                             conn = index,
-                            since_pong_secs = last_pong.elapsed().as_secs_f64(),
-                            "PONG timeout, closing dead connection",
+                            since_inbound_secs = last_inbound.elapsed().as_secs_f64(),
+                            "heartbeat timeout, closing dead connection",
                         );
                         let _ = write.send(Message::Close(None)).await;
-                        return SessionOutcome::PongTimeout;
+                        return SessionOutcome::HeartbeatTimeout;
                     }
                 }
                 if let Err(e) = write.send(Message::Text("PING".into())).await {
@@ -479,6 +484,10 @@ async fn run_session(
             }
         }
     }
+}
+
+fn heartbeat_expired(last_inbound: Instant, ping_sent: Instant, now: Instant) -> bool {
+    last_inbound < ping_sent && now.duration_since(ping_sent) >= PONG_TIMEOUT
 }
 
 /// Parse a text frame, explode it, filter by `desired`, and append the
@@ -627,6 +636,33 @@ mod tests {
             s.initialized.insert((*a).into());
         }
         s
+    }
+
+    #[test]
+    fn heartbeat_expires_without_an_inbound_frame() {
+        let now = Instant::now();
+        let sent_at = now - PONG_TIMEOUT;
+        let last_inbound = sent_at - Duration::from_millis(1);
+
+        assert!(heartbeat_expired(last_inbound, sent_at, now));
+    }
+
+    #[test]
+    fn market_frame_after_ping_keeps_heartbeat_alive() {
+        let now = Instant::now();
+        let sent_at = now - PONG_TIMEOUT;
+        let last_inbound = sent_at + Duration::from_millis(1);
+
+        assert!(!heartbeat_expired(last_inbound, sent_at, now));
+    }
+
+    #[test]
+    fn heartbeat_waits_for_its_deadline() {
+        let now = Instant::now();
+        let sent_at = now - PONG_TIMEOUT + Duration::from_millis(1);
+        let last_inbound = sent_at - Duration::from_millis(1);
+
+        assert!(!heartbeat_expired(last_inbound, sent_at, now));
     }
 
     #[test]
