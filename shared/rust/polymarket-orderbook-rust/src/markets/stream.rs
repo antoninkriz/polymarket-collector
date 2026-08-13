@@ -66,7 +66,11 @@ pub async fn run(cfg: StreamConfig, pool: Arc<Mutex<Pool>>) -> Result<()> {
     let mut last_pending_id = String::from("0");
 
     loop {
-        let read_id: &str = if pending_done { ">" } else { last_pending_id.as_str() };
+        let read_id: &str = if pending_done {
+            ">"
+        } else {
+            last_pending_id.as_str()
+        };
 
         let reply: StreamReadReply = conn
             .xread_options(&[cfg.stream_key.as_str()], &[read_id], &opts)
@@ -95,7 +99,11 @@ pub async fn run(cfg: StreamConfig, pool: Arc<Mutex<Pool>>) -> Result<()> {
                     );
                 }
                 if let Err(e) = conn
-                    .xack::<_, _, _, i64>(cfg.stream_key.as_str(), cfg.group.as_str(), &[entry.id.as_str()])
+                    .xack::<_, _, _, i64>(
+                        cfg.stream_key.as_str(),
+                        cfg.group.as_str(),
+                        &[entry.id.as_str()],
+                    )
                     .await
                 {
                     warn!(message_id = %entry.id, error = %e, "xack failed");
@@ -146,7 +154,9 @@ async fn ensure_consumer_group(conn: &mut MultiplexedConnection, cfg: &StreamCon
     Ok(())
 }
 
-fn stream_entry_to_map(entry: &redis::streams::StreamId) -> std::collections::HashMap<String, String> {
+fn stream_entry_to_map(
+    entry: &redis::streams::StreamId,
+) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     for (k, v) in &entry.map {
         if let redis::Value::BulkString(bytes) = v {
@@ -167,8 +177,8 @@ async fn dispatch(
 
     match event_type {
         "new_market" => {
-            let payload: NewMarketPayload = serde_json::from_str(payload_raw)
-                .context("parse new_market payload")?;
+            let payload: NewMarketPayload =
+                serde_json::from_str(payload_raw).context("parse new_market payload")?;
             let Some(market) = markets::binary_market_from_outcomes(
                 payload.market.clone(),
                 &payload.outcomes,
@@ -184,8 +194,8 @@ async fn dispatch(
             pool.lock().await.subscribe_markets(vec![market]).await?;
         }
         "market_resolved" => {
-            let payload: MarketResolvedPayload = serde_json::from_str(payload_raw)
-                .context("parse market_resolved payload")?;
+            let payload: MarketResolvedPayload =
+                serde_json::from_str(payload_raw).context("parse market_resolved payload")?;
             if payload.market.is_empty() {
                 return Ok(());
             }
@@ -194,7 +204,10 @@ async fn dispatch(
                 winner = %payload.winning_outcome.unwrap_or_default(),
                 "[MARKET_EVENT] market_resolved",
             );
-            pool.lock().await.unsubscribe_markets(vec![payload.market]).await?;
+            pool.lock()
+                .await
+                .unsubscribe_markets(vec![payload.market])
+                .await?;
         }
         _ => {
             // Unknown event type — ignore.
@@ -204,7 +217,10 @@ async fn dispatch(
 }
 
 fn short(s: &str) -> &str {
-    let end = s.floor_char_boundary(16);
+    let mut end = s.len().min(16);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
     &s[..end]
 }
 
@@ -292,5 +308,11 @@ mod tests {
             &["1".into(), "2".into(), "3".into()],
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn short_does_not_split_a_utf8_character() {
+        let value = format!("{}é-tail", "a".repeat(15));
+        assert_eq!(short(&value), "a".repeat(15));
     }
 }

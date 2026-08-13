@@ -46,12 +46,15 @@ pub enum WireFrame {
     One(WireMessage),
 }
 
-impl WireFrame {
+impl IntoIterator for WireFrame {
+    type Item = WireMessage;
+    type IntoIter = std::vec::IntoIter<WireMessage>;
+
     /// Iterate the messages in this frame.
-    pub fn into_iter(self) -> Box<dyn Iterator<Item = WireMessage>> {
+    fn into_iter(self) -> Self::IntoIter {
         match self {
-            WireFrame::One(m) => Box::new(std::iter::once(m)),
-            WireFrame::Many(v) => Box::new(v.into_iter()),
+            WireFrame::One(message) => vec![message].into_iter(),
+            WireFrame::Many(messages) => messages.into_iter(),
         }
     }
 }
