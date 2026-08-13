@@ -1,180 +1,130 @@
 # Polymarket orderbook v3
 
-## Contract
+## What v3 stores
 
-V3 records the order observed by the collector before message expansion,
-queueing, Redis transport, or ClickHouse batching. It supports exact replay of
-the messages actually received for a market, subject to the upstream feed and
-gap limitations below.
-
-Polymarket's public market channel provides millisecond source timestamps but
-no exchange sequence number and no unique public fill ID. A Polygon
-transaction can settle multiple fills. Consequently, v3 never deduplicates
-WebSocket events by transaction hash, content hash, timestamp, price, size, or
-any combination of public payload fields. Two byte-identical messages received
-from the authoritative socket are retained as two observations.
-
-The public feed shapes used by this collector are documented in Polymarket's
-[market stream reference](https://docs.polymarket.com/market-data/realtime-data#market-stream).
-
-## Ingestion and ordering
-
-Each binary market's two outcome assets are assigned to one authoritative
-WebSocket connection. This preserves a parent `price_change` message containing
-updates for both assets and avoids an impossible merge of redundant socket
-deliveries.
-
-Before opening sockets, the collector acquires a renewable Redis lease and a
-monotonic fencing generation. A second collector refuses to start while that
-lease is held. Every event-stream append verifies the opaque lease token in the
-same Redis Lua operation as `XADD`, so a paused process cannot resume publishing
-after its lease expires and another generation takes over.
-
-The collector attaches these fields at the receive boundary:
-
-| Field | Meaning |
-|---|---|
-| `collector_session_id` | UUID created once per collector process. |
-| `collector_session_started_at` | UTC process-session start time, nanosecond precision. |
-| `publisher_fence` | Monotonic Redis-issued generation of the authoritative publisher. |
-| `connection_id` | Stable socket-task identity within the collector session. |
-| `connection_epoch` | Increments every time that socket reconnects. |
-| `frame_sequence` | Monotonic text-frame order for that socket task, across reconnects. |
-| `receive_sequence` | Monotonic parent-message merge order within the collector session. |
-| `message_id` | Random UUID shared by all rows exploded from one parent message. |
-| `message_index` / `message_count` | Parent position and count in a top-level JSON array frame. |
-| `row_index` / `row_count` | Child position and count within the normalized parent message. |
-| `timestamp_received` | UTC wall clock sampled immediately when tungstenite yields the text frame. |
-| `raw_message` | Complete parent JSON object, repeated on its normalized child rows. |
-
-`timestamp_received` is a real socket receive observation, represented as
-`DateTime64(9, 'UTC')`. It includes kernel, TLS, and WebSocket-library delivery
-time; it is not a hardware packet timestamp. It is not the ordering key because
-wall clocks can step. All messages in the same WebSocket frame share the same
-receive timestamp.
-
-`receive_sequence` gives the collector's total merge order. The stricter
-source-faithful order for any one connection is
-`connection_epoch, frame_sequence, message_index, row_index`. There is no
-exchange-defined total order between different WebSocket connections, so v3
-does not claim one. Because both assets of a market stay on one connection,
-this limitation does not prevent per-market book replay or per-market trade
-delivery order.
-
-## ClickHouse schema
-
-The `polymarket_orderbook_v3` table contains:
-
-- all ordering and provenance fields above;
-- `schema_version` and the Redis `transport_id`;
-- both parsed `timestamp` and lossless `timestamp_raw`;
-- `market`, `event_type`, `asset_id`, and the Polymarket `hash` where supplied;
-- typed depth arrays for `book`;
-- nullable typed price, size, side, BBO, fee, transaction, and tick-size fields;
-- the raw parent message for audit and forward-compatible reparsing.
-
-The table uses `ReplacingMergeTree`. Its key includes the collector-generated
-`message_id, row_index` identity, retaining every distinct collector
-observation while collapsing retries of the same collector row.
-
-Use `polymarket_orderbook_v3_final` for interactive and downstream reads. It is
-the canonical view over the base table with `FINAL` applied, so correctness
-does not depend on background merge timing. The hourly exporter applies
-`FINAL` directly to the base table for the same reason. A direct query of
-`polymarket_orderbook_v3` is a physical-storage query and can temporarily show
-more than one copy of an at-least-once Redis delivery.
-
-Two diagnostic views distinguish those collector-owned retries from genuine
-repeated source observations:
-
-- `polymarket_orderbook_v3_ingestion_health` reports current hourly physical
-  rows, logical rows, transport-retry rows, publisher generations, and
-  collector sessions. A positive `transport_retry_rows` catches retries before
-  a background merge collapses them; ClickHouse insert-failure warnings are the
-  durable operational signal.
-- `polymarket_orderbook_v3_publisher_sessions` reports the accepted receive
-  interval and row/message counts for each fencing generation and session.
-
-Multiple publisher generations in one hour can be an ordinary restart; it is
-not by itself evidence of duplication. Intersecting session intervals warrant
-investigation (with the caveat that `timestamp_received` is a wall clock):
+V3 is a compact raw event log. ClickHouse stores only the receive time, the
+collector's observed order, and the normalized event:
 
 ```sql
-WITH sessions AS (
-    SELECT * FROM polymarket_orderbook_v3_publisher_sessions
+CREATE TABLE polymarket_orderbook_v3 (
+    timestamp_received DateTime64(9, 'UTC') CODEC(Delta, ZSTD(1)),
+    sequence           UInt64               CODEC(Delta, ZSTD(1)),
+    data               String               CODEC(ZSTD(1))
 )
-SELECT
-    older.publisher_fence AS older_fence,
-    newer.publisher_fence AS newer_fence,
-    older.last_received,
-    newer.first_received
-FROM sessions AS older
-CROSS JOIN sessions AS newer
-WHERE older.publisher_fence < newer.publisher_fence
-  AND older.first_received <= newer.last_received
-  AND newer.first_received <= older.last_received;
+ENGINE = ReplacingMergeTree()
+PARTITION BY toStartOfHour(timestamp_received)
+ORDER BY sequence;
 ```
 
-## Replay algorithm
+There is no per-row schema version, payload hash, raw parent message,
+connection or collector identifier, transport identifier, or session metadata.
+Those fields are not needed to reconstruct an observed market stream.
+
+`data` is one normalized child event encoded as JSON. It contains the source
+`timestamp`, `market`, `event_type`, `asset_id`, and fields owned by that event
+type. The non-unique Polymarket `hash` is stripped. A multi-entry
+`price_change` parent becomes consecutive child events in its original order.
+
+## Why `sequence` exists
+
+Polymarket supplies neither an exchange sequence nor a unique public fill ID.
+Source and receive timestamps can tie, and clocks can move, so neither is a
+safe replay key. `sequence` is the one piece of collector metadata required for
+correctness:
+
+- it orders every normalized event exactly as the collector admitted it;
+- it orders the two outcome assets of a market without a later timestamp merge;
+- the same record keeps the same value when Redis or ClickHouse retries it; and
+- a genuinely repeated source delivery receives a new value and is retained.
+
+The high 16 bits contain the Redis-issued publisher generation and the low 48
+bits contain the process-local event order. This keeps restarts monotonic in one
+column. The generation is an internal fencing mechanism, not another exported
+provenance field.
+
+## Collection rules
+
+Each binary market and both of its outcome assets have exactly one
+authoritative WebSocket route. A Redis lease prevents a second publisher from
+writing concurrently, and its fencing token is checked atomically with every
+stream append.
+
+`timestamp_received` is sampled immediately after tungstenite yields a text
+frame, before JSON parsing, fan-out, Redis, or ClickHouse work. All children of
+one frame share that nanosecond UTC wall-clock value. It is an honest userspace
+socket receive time, not a kernel or hardware packet timestamp.
+
+After a connection or subscription starts, the collector discards
+`price_change` events for an asset until that asset's fresh `book` snapshot has
+arrived. Consequently an exported asset segment never applies post-reconnect
+deltas to a stale pre-reconnect book. Trades and tick-size events remain in
+their observed order because they do not mutate depth.
+
+## Duplication policy
+
+Public payload fields are never used for deduplication. In particular,
+`transaction_hash`, market, asset, timestamp, price, size, side, and fee cannot
+identify a fill: Polygon can settle multiple fills in one transaction, and the
+public feed can legitimately repeat identical-looking observations.
+
+Only an at-least-once delivery of the same collector record is collapsed. Such
+a retry has the same `sequence`; a separate WebSocket observation does not.
+`ReplacingMergeTree` keyed by `sequence` provides this idempotency, and readers
+that require an immediately logical result use `FINAL`. The subscriber
+acknowledges and removes a Redis Stream entry only after ClickHouse commits it.
+
+## Parquet export
+
+The exporter reads the raw table with `FINAL`, projects JSON into typed columns,
+orders by `(market, sequence)`, and writes ZSTD level 1 Parquet:
+
+| Column | Arrow/Parquet type | Nullable |
+|---|---|---:|
+| `timestamp_received` | `timestamp[ns, UTC]` | no |
+| `sequence` | `uint64` | no |
+| `timestamp` | `timestamp[ms, UTC]` | no |
+| `market` | `fixed_size_binary[32]` | no |
+| `event_type` | `string` | no |
+| `asset_id` | `fixed_size_binary[32]` | no |
+| `bids`, `asks` | JSON `string` | yes |
+| `price`, `best_bid`, `best_ask` | `decimal(9, 4)` | yes |
+| `size` | `decimal(18, 6)` | yes |
+| `side` | `string` | yes |
+| `fee_rate_bps` | `uint16` | yes |
+| `transaction_hash` | `fixed_size_binary[32]` | yes |
+| `old_tick_size`, `new_tick_size` | `decimal(9, 4)` | yes |
+
+Market condition IDs and transaction hashes are decoded from hexadecimal;
+decimal token IDs are decoded as unsigned 256-bit integers. All three therefore
+use the same 32-byte big-endian representation expected by `pmxtdata`.
+Event-specific columns are null when they do not apply.
+
+The sidecar manifest is only an upload-completion marker with row count, byte
+size, digest, source table, and sort order. It is not inserted into the data.
+
+## Replay
 
 For one market:
 
-1. Order rows by `collector_session_started_at`, `collector_session_id`,
-   `receive_sequence`, `message_index`, and `row_index`.
-2. Group rows by `message_id`; validate the observed child indices against
-   `row_count`.
-3. Start or restart each asset only from a complete `book` snapshot. A new
-   collector session, connection, or connection epoch is a gap boundary until
-   the subscription snapshot for that asset arrives.
-4. A `book` replaces the entire asset book. A `price_change` assigns the
-   supplied size at `(side, price)`; size zero removes the level.
-5. Apply all children of a parent in `row_index` order before exposing the next
-   state. This preserves the atomic message boundary for downstream consumers.
+1. Read logical rows (`FINAL`) in ascending `sequence`.
+2. For each asset, begin at its first `book`; the snapshot replaces all depth.
+3. Apply each `price_change` by assigning `size` at `(side, price)`; zero size
+   removes the level.
+4. Deliver `last_trade_price` rows in `sequence` order. Never deduplicate them
+   by transaction hash or payload values.
 
-The Parquet exporter uses that order directly. It does not group by
-`asset_id`, `timestamp_received`, or Polymarket's source `timestamp`.
+No connection epoch is required in the file because reconnect deltas are
+withheld until a new snapshot makes the stream self-initializing again.
 
-## Trades and deduplication
+## Explicit limits
 
-`last_trade_price` records use the same receive order as book messages. The
-transaction hash is retained as data, not treated as an identifier. V3's only
-deduplication identity is the collector-generated `(message_id, row_index)`;
-it removes a retry created after socket receipt and cannot merge two genuine
-feed deliveries.
+V3 reproduces what the collector accepted; it is not an exchange audit log.
+Polymarket provides no replay cursor or source sequence, so a disconnect or
+collector outage can contain an unknowable gap. Unsupported parent event types
+are logged and omitted. The userspace receive timestamp includes network-stack,
+TLS, and scheduling latency. Consumers must not infer upstream completeness or
+exchange order that the public feed does not expose.
 
-Per-market trade delivery order is reconstructible inside a collector session.
-Across different socket connections, v3 exposes the actual receive timestamp
-and collector merge order but cannot manufacture an exchange sequence that
-Polymarket did not publish.
-
-## Durability and completeness boundaries
-
-The publisher appends to Redis Streams and retries failed appends without
-discarding its batch. The consumer leaves entries pending until ClickHouse
-commits, and ClickHouse insert failures retry with backpressure. In the bundled
-single-group deployment, it then atomically acknowledges and deletes committed
-stream entries. The deletion script first proves that the configured
-ClickHouse group is the stream's only consumer group and fails closed if any
-other group exists. Set `DELETE_ACKED_STREAM_ENTRIES=false` when retaining the
-stream for multiple independent groups. The exporter
-waits until a later receive-time hour has committed before publishing an
-immutable earlier hour. A Parquet object is complete only when its sidecar
-manifest exists; the manifest records its row count, byte size, SHA-256 digest,
-source table, and replay ordering. This proves object integrity and resumable
-publication, not completeness relative to an unsequenced upstream feed.
-
-These mechanisms protect against subscriber downtime and ordinary transient
-Redis/ClickHouse failures. They do not turn the public feed into an exchange
-audit log. Remaining explicit boundaries are:
-
-- Polymarket supplies no source sequence or replay cursor;
-- a socket disconnect has an unknowable gap until new snapshots arrive;
-- malformed or unsupported server messages cannot be normalized (the raw
-  frame should be captured separately if forward compatibility beyond the four
-  supported event types is required);
-- Redis AOF policy and host/process failure determine the crash-loss window;
-- an overflowing pre-Redis process queue terminates the publisher; and
-- no public manifest proves that Polymarket delivered every exchange event.
-
-Consumers must surface these boundaries rather than replay across them as if
-the book were continuous.
+The compact layout is incompatible with earlier experimental v3 tables. Deploy
+it to an empty table, or archive and recreate the old table explicitly;
+`CREATE TABLE IF NOT EXISTS` cannot migrate an existing layout.

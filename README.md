@@ -12,22 +12,21 @@ disconnect boundaries explicit rather than claiming an exchange audit log.
 Polymarket Gamma REST ──▶ polymarket-active-markets ──▶ Redis (active_markets cache + market_events stream)
 Polymarket WS ──▶ polymarket-orderbook-rust-pubsub ──▶ Redis Stream `polymarket:events:v3`
                   polymarket-orderbook-rust-from-pubsub ──▶ ClickHouse `polymarket_orderbook_v3`
-                                                            canonical: `polymarket_orderbook_v3_final`
                   r2-archive exporter (EXPORTER_PROFILE=polymarket_v3) ──▶ R2 hourly Parquet
 ```
 
 - `services/polymarket/polymarket-active-markets` — Python; polls the Gamma API,
   maintains the Redis active-markets cache and lifecycle event stream.
 - `services/polymarket/polymarket-orderbook-rust-pubsub` — Rust; the only service
-  holding Polymarket WS connections. Captures v3 receipt/order metadata and
-  appends all four event variants to a durable Redis Stream. A renewable Redis
-  lease and fenced `XADD` enforce one authoritative publisher.
+  holding Polymarket WS connections. Captures receive time plus one compact
+  observed-order sequence and appends all four event variants to a durable
+  Redis Stream. A renewable Redis lease and fenced `XADD` enforce one
+  authoritative publisher.
 - `services/polymarket/polymarket-orderbook-rust-from-pubsub` — Rust; consumes the
-  stream and acknowledges rows only after the replayable v3 ClickHouse insert.
-  Read through the generated `_final` view to hide at-least-once transport
-  retries before background merges complete.
+  stream and acknowledges rows only after the compact raw v3 ClickHouse insert.
+  Logical ad-hoc reads use `FINAL` to collapse same-sequence transport retries.
 - `services/r2-archive/exporter` — generic exporter, run with
-  `EXPORTER_PROFILE=polymarket`, dumps hourly Parquet to the
+  `EXPORTER_PROFILE=polymarket_v3`, projects typed hourly Parquet to the
   bucket named by `R2_BUCKET`.
 - `services/polymarket/orderbook-compare` — ad-hoc comparison script (was untracked
   on the prod server; preserved here).

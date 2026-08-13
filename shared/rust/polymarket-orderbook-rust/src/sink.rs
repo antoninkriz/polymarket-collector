@@ -35,7 +35,7 @@
 //!   retry identity, and normalized event JSON. The archive exporter performs
 //!   the typed projection.
 //!
-//! Both modes use `INSERT ... FORMAT JSONEachRow` over HTTP.
+//! All modes use `INSERT ... FORMAT JSONEachRow` over HTTP.
 //!
 //! ## Raw schema
 //!
