@@ -20,6 +20,9 @@ use uuid::Uuid;
 use crate::events::Event;
 
 pub const SCHEMA_VERSION: u8 = 3;
+const SEQUENCE_LOCAL_BITS: u32 = 48;
+const SEQUENCE_LOCAL_MASK: u64 = (1_u64 << SEQUENCE_LOCAL_BITS) - 1;
+const SEQUENCE_GENERATION_MAX: u64 = u64::MAX >> SEQUENCE_LOCAL_BITS;
 
 /// Process-scoped identity and sequencer shared by all WebSocket connections.
 #[derive(Debug)]
@@ -28,6 +31,7 @@ pub struct CollectorContext {
     session_started_at_ns: i64,
     publisher_fence: u64,
     next_receive_sequence: AtomicU64,
+    next_event_sequence: AtomicU64,
 }
 
 impl CollectorContext {
@@ -37,11 +41,16 @@ impl CollectorContext {
 
     /// Create a collector bound to an externally acquired publisher fence.
     pub fn with_publisher_fence(publisher_fence: u64) -> Self {
+        assert!(
+            publisher_fence <= SEQUENCE_GENERATION_MAX,
+            "publisher generation {publisher_fence} exceeds compact sequence capacity",
+        );
         Self {
             session_id: Uuid::new_v4(),
             session_started_at_ns: now_ns(),
             publisher_fence,
             next_receive_sequence: AtomicU64::new(0),
+            next_event_sequence: AtomicU64::new(0),
         }
     }
 
@@ -54,11 +63,12 @@ impl CollectorContext {
         message_index: u32,
         message_count: u32,
         timestamp_received_ns: i64,
-    ) -> MessageContext {
+    ) -> MessageContext<'_> {
         MessageContext {
             collector_session_id: self.session_id,
             collector_session_started_at_ns: self.session_started_at_ns,
             publisher_fence: self.publisher_fence,
+            sequence_allocator: &self.next_event_sequence,
             connection_id,
             connection_epoch,
             frame_sequence,
@@ -78,11 +88,12 @@ impl Default for CollectorContext {
 }
 
 /// Metadata shared by all exploded rows from one parent market message.
-#[derive(Debug, Clone)]
-pub struct MessageContext {
+#[derive(Debug)]
+pub struct MessageContext<'a> {
     collector_session_id: Uuid,
     collector_session_started_at_ns: i64,
     publisher_fence: u64,
+    sequence_allocator: &'a AtomicU64,
     connection_id: u32,
     connection_epoch: u64,
     frame_sequence: u64,
@@ -93,7 +104,7 @@ pub struct MessageContext {
     timestamp_received_ns: i64,
 }
 
-impl MessageContext {
+impl MessageContext<'_> {
     pub fn record(
         &self,
         event: Event,
@@ -101,11 +112,17 @@ impl MessageContext {
         row_count: u32,
         raw_message: String,
     ) -> EventRecord {
+        let local_sequence = self.sequence_allocator.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            local_sequence <= SEQUENCE_LOCAL_MASK,
+            "collector emitted more than 2^48 events in one publisher generation",
+        );
         EventRecord {
             schema_version: SCHEMA_VERSION,
             collector_session_id: self.collector_session_id,
             collector_session_started_at_ns: self.collector_session_started_at_ns,
             publisher_fence: self.publisher_fence,
+            sequence: (self.publisher_fence << SEQUENCE_LOCAL_BITS) | local_sequence,
             connection_id: self.connection_id,
             connection_epoch: self.connection_epoch,
             frame_sequence: self.frame_sequence,
@@ -130,6 +147,9 @@ pub struct EventRecord {
     pub collector_session_started_at_ns: i64,
     /// Monotonic Redis-issued generation of the authoritative publisher.
     pub publisher_fence: u64,
+    /// Monotonic replay order. The high 16 bits are the fenced publisher
+    /// generation and the low 48 bits are the process-local event order.
+    pub sequence: u64,
     pub connection_id: u32,
     pub connection_epoch: u64,
     pub frame_sequence: u64,
@@ -164,6 +184,7 @@ impl EventRecord {
             collector_session_id: Uuid::nil(),
             collector_session_started_at_ns: 0,
             publisher_fence: 0,
+            sequence: 0,
             connection_id: 0,
             connection_epoch: 0,
             frame_sequence: 0,
@@ -212,6 +233,7 @@ mod tests {
 
         assert_eq!(first.message_id, second.message_id);
         assert_eq!(first.receive_sequence, second.receive_sequence);
+        assert_eq!(second.sequence, first.sequence + 1);
         assert_eq!(first.row_index, 0);
         assert_eq!(second.row_index, 1);
         assert_ne!(first.identity(), second.identity());
@@ -231,5 +253,20 @@ mod tests {
         assert_ne!(first.message_id, second.message_id);
         assert_ne!(first.identity(), second.identity());
         assert!(first.receive_sequence < second.receive_sequence);
+        assert!(first.sequence < second.sequence);
+    }
+
+    #[test]
+    fn publisher_generation_orders_process_restarts() {
+        let old = CollectorContext::with_publisher_fence(7)
+            .next_message(0, 1, 0, 0, 1, 100)
+            .record(tick("1"), 0, 1, "{}".into());
+        let new = CollectorContext::with_publisher_fence(8)
+            .next_message(0, 1, 0, 0, 1, 90)
+            .record(tick("1"), 0, 1, "{}".into());
+
+        assert!(old.sequence < new.sequence);
+        assert_eq!(old.sequence, 7_u64 << SEQUENCE_LOCAL_BITS);
+        assert_eq!(new.sequence, 8_u64 << SEQUENCE_LOCAL_BITS);
     }
 }
