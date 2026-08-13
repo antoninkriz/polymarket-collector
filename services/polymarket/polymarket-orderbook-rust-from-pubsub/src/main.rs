@@ -1,12 +1,11 @@
-//! Polymarket orderbook → ClickHouse writer fed from Redis pub/sub.
+//! Polymarket orderbook → ClickHouse writer fed from a durable Redis Stream.
 //!
-//! Subscribes to the channel published by `polymarket-orderbook-rust-pubsub`,
-//! deserializes each `Event` and feeds it into the existing ClickHouse `Sink`
-//! from `polymarket-orderbook-rust`. No WS pool, no market lifecycle stream,
-//! no trade-events polling.
+//! Consumes the stream written by `polymarket-orderbook-rust-pubsub`,
+//! deserializes each v3 record, and acknowledges it only after the ClickHouse
+//! sink commits. No WS pool or market lifecycle processing runs here.
 //!
 //! ```text
-//!   Redis pub/sub channel ──► subscriber ──► mpsc<Event> ──► Sink ──► ClickHouse
+//!   Redis Stream ──► consumer group ──► mpsc<SinkItem> ──► Sink ──► ClickHouse
 //! ```
 
 use std::sync::Arc;
@@ -27,7 +26,7 @@ use polymarket_orderbook_rust_from_pubsub::pubsub_subscriber::{
 
 #[derive(Debug, Parser)]
 #[command(name = "polymarket-orderbook-rust-from-pubsub")]
-#[command(about = "Polymarket orderbook → ClickHouse writer fed from Redis pub/sub")]
+#[command(about = "Polymarket orderbook → ClickHouse writer fed from Redis Streams")]
 struct Cli {}
 
 #[tokio::main]

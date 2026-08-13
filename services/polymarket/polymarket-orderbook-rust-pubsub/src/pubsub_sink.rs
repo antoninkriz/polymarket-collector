@@ -86,7 +86,7 @@ impl PubSubSink {
         info!(
             total_published = self.total_published,
             total_dropped = self.total_dropped,
-            "polymarket pubsub sink shutting down",
+            "Polymarket Redis stream sink shutting down",
         );
         Ok(())
     }

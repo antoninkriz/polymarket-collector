@@ -1,6 +1,6 @@
-//! Runtime configuration for the Polymarket pub/sub → ClickHouse writer.
+//! Runtime configuration for the Polymarket Redis Stream → ClickHouse writer.
 //!
-//! No WS pool, no market lifecycle, no shards: just the Redis pub/sub source
+//! No WS pool, no market lifecycle, no shards: just the Redis Stream source
 //! and the existing ClickHouse sink knobs.
 
 use std::time::Duration;

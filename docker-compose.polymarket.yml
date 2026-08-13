@@ -17,7 +17,7 @@ name: obdata-polymarket
 #     ClickHouse commits them to `polymarket_orderbook_v3`.
 #
 #   obdata-polymarket-r2-archive-exporter
-#     Reads obdata-clickhouse `polymarket_orderbook_rust` and exports hourly
+#     Reads obdata-clickhouse `polymarket_orderbook_v3` and exports hourly
 #     replay-ordered Parquet snapshots. Uses the generic r2-archive exporter
 #     image with EXPORTER_PROFILE=polymarket_v3.
 #

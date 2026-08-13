@@ -1,14 +1,14 @@
-//! Polymarket orderbook → Redis pub/sub publisher.
+//! Polymarket orderbook → durable Redis Stream publisher.
 //!
 //! Mirrors the streaming pipeline of the sibling `polymarket-orderbook-rust`
-//! service, but the terminal sink publishes JSON events on a single Redis
-//! pub/sub channel instead of inserting into ClickHouse.
+//! service, but the terminal sink appends v3 records to a Redis Stream
+//! instead of inserting into ClickHouse.
 //!
 //! ```text
 //!   Redis cache / Gamma API ──┐
 //!                             │
 //!                             v
-//!   WS pool ── (mpsc) ──> Redis pub/sub PUBLISH (channel)
+//!   WS pool ── (mpsc) ──> Redis XADD (durable stream)
 //!     ^
 //!     │
 //!   Redis stream listener (market lifecycle)
@@ -34,7 +34,7 @@ use polymarket_orderbook_rust_pubsub::pubsub_sink::{PubSubSink, PubSubSinkConfig
 
 #[derive(Debug, Parser)]
 #[command(name = "polymarket-orderbook-rust-pubsub")]
-#[command(about = "Polymarket orderbook → Redis pub/sub publisher")]
+#[command(about = "Polymarket orderbook → durable Redis Stream publisher")]
 struct Cli {
     /// Only listen for new markets, skip pre-loading active markets.
     #[arg(long)]
@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
         linger: cfg.publish_linger,
     })
     .await
-    .context("connect Redis pub/sub sink")?;
+    .context("connect Redis stream sink")?;
 
     let (event_tx, event_rx) = mpsc::channel::<EventRecord>(cfg.queue_size);
     let sink_handle: JoinHandle<Result<()>> = tokio::spawn(sink.run(event_rx));
