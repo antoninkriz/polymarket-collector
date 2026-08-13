@@ -223,7 +223,7 @@ impl Connection {
                     conn = index,
                     gap_seconds = gap.as_secs_f64(),
                     desired_count = sub.desired.len(),
-                    "[CONN-GAP] reconnect gap (assets covered by redundant connection)",
+                    "[CONN-GAP] authoritative connection reconnect gap",
                 );
             }
 
@@ -233,14 +233,18 @@ impl Connection {
 
             // Run a single connected session. Returns true if the session
             // ended due to a PONG timeout (so we skip the next backoff).
+            let context = SessionContext {
+                index,
+                connection_id: index as u32,
+                connection_epoch,
+                event_tx: &event_tx,
+                collector: &collector,
+                stats: &stats,
+            };
             let outcome = run_session(
                 ws_stream,
-                index,
-                connection_epoch,
+                context,
                 &mut sub,
-                &event_tx,
-                &collector,
-                &stats,
                 &mut commands,
                 &mut last_message_time,
                 &mut frame_sequence,
@@ -307,6 +311,16 @@ enum SessionOutcome {
     Error(anyhow::Error),
 }
 
+#[derive(Clone, Copy)]
+struct SessionContext<'a> {
+    index: usize,
+    connection_id: u32,
+    connection_epoch: u64,
+    event_tx: &'a mpsc::Sender<EventRecord>,
+    collector: &'a CollectorContext,
+    stats: &'a ConnStats,
+}
+
 /// Run a single connected WebSocket session: send the initial subscription,
 /// then multiplex reads, ping ticker, and pool commands until something
 /// breaks. Updates `last_message_time` whenever a frame is received.
@@ -314,16 +328,13 @@ async fn run_session(
     ws_stream: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
-    index: usize,
-    connection_epoch: u64,
+    context: SessionContext<'_>,
     sub: &mut SubState,
-    event_tx: &mpsc::Sender<EventRecord>,
-    collector: &CollectorContext,
-    stats: &ConnStats,
     commands: &mut mpsc::Receiver<Command>,
     last_message_time: &mut Option<Instant>,
     frame_sequence: &mut u64,
 ) -> SessionOutcome {
+    let index = context.index;
     let (mut write, mut read) = ws_stream.split();
 
     // (Re-)subscribe everything we want.
@@ -370,23 +381,20 @@ async fn run_session(
                     match handle_text(
                         stripped,
                         sub,
-                        stats,
                         &mut events_buf,
-                        collector,
-                        index as u32,
-                        connection_epoch,
+                        &context,
                         this_frame_sequence,
                         timestamp_received_ns,
                     ) {
                         Ok(()) => {
                             for ev in events_buf.drain(..) {
-                                match event_tx.try_send(ev) {
+                                match context.event_tx.try_send(ev) {
                                     Ok(()) => {}
                                     Err(mpsc::error::TrySendError::Full(_)) => {
                                         error!(
                                             conn = index,
-                                            capacity = event_tx.capacity(),
-                                            max_capacity = event_tx.max_capacity(),
+                                            capacity = context.event_tx.capacity(),
+                                            max_capacity = context.event_tx.max_capacity(),
                                             "[QUEUE-OVERFLOW] event channel full, exiting"
                                         );
                                         std::process::exit(1);
@@ -398,7 +406,12 @@ async fn run_session(
                             }
                         }
                         Err(e) => {
-                            error!(conn = index, error = %e, snippet = %&stripped[..stripped.len().min(200)], "parse failed");
+                            error!(
+                                conn = index,
+                                error = %e,
+                                snippet = %stripped.chars().take(200).collect::<String>(),
+                                "parse failed",
+                            );
                         }
                     }
                 }
@@ -470,7 +483,10 @@ async fn run_session(
                             new_in_session.push(a.clone());
                         }
                     }
-                    stats.desired_count.store(sub.desired.len(), Ordering::Relaxed);
+                    context
+                        .stats
+                        .desired_count
+                        .store(sub.desired.len(), Ordering::Relaxed);
                     if new_in_session.is_empty() {
                         continue;
                     }
@@ -487,7 +503,10 @@ async fn run_session(
                             removed.push(a.clone());
                         }
                     }
-                    stats.desired_count.store(sub.desired.len(), Ordering::Relaxed);
+                    context
+                        .stats
+                        .desired_count
+                        .store(sub.desired.len(), Ordering::Relaxed);
                     if removed.is_empty() {
                         continue;
                     }
@@ -509,11 +528,8 @@ async fn run_session(
 fn handle_text(
     text: &str,
     sub: &SubState,
-    stats: &ConnStats,
     events_buf: &mut Vec<EventRecord>,
-    collector: &CollectorContext,
-    connection_id: u32,
-    connection_epoch: u64,
+    context: &SessionContext<'_>,
     frame_sequence: u64,
     timestamp_received_ns: i64,
 ) -> Result<()> {
@@ -532,32 +548,44 @@ fn handle_text(
         // expansion. Parsing failures therefore leave an observable sequence
         // gap in the process logs rather than allowing a later message to take
         // this parent's position.
-        let message = collector.next_message(
-            connection_id,
-            connection_epoch,
+        let message = context.collector.next_message(
+            context.connection_id,
+            context.connection_epoch,
             frame_sequence,
             message_index as u32,
             message_count,
             timestamp_received_ns,
         );
-        let msg: WireMessage = serde_json::from_value(raw_value).context("parse wire message")?;
+        let msg: WireMessage = match serde_json::from_value(raw_value) {
+            Ok(message) => message,
+            Err(error) => {
+                error!(
+                    conn = context.index,
+                    message_index,
+                    %error,
+                    raw_message,
+                    "wire parent rejected; receive_sequence gap retained",
+                );
+                continue;
+            }
+        };
         // Per-type counters need to be incremented from the wire message
         // before fan-out (price_change still counts as one wire arrival per
         // entry, matching `connection.py::_handle_price_change`).
         match &msg {
             WireMessage::Book(_) => {
-                stats.books.fetch_add(1, Ordering::Relaxed);
+                context.stats.books.fetch_add(1, Ordering::Relaxed);
             }
             WireMessage::PriceChange(pc) => {
-                stats
+                context.stats
                     .price_changes
                     .fetch_add(pc.price_changes.len() as u64, Ordering::Relaxed);
             }
             WireMessage::LastTradePrice(_) => {
-                stats.trades.fetch_add(1, Ordering::Relaxed);
+                context.stats.trades.fetch_add(1, Ordering::Relaxed);
             }
             WireMessage::TickSizeChange(_) => {
-                stats.tick_changes.fetch_add(1, Ordering::Relaxed);
+                context.stats.tick_changes.fetch_add(1, Ordering::Relaxed);
             }
         }
         let mut staged: Vec<Event> = Vec::new();
@@ -630,14 +658,21 @@ mod tests {
         stats: &ConnStats,
         events: &mut Vec<EventRecord>,
     ) -> Result<()> {
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let collector = CollectorContext::new();
+        let context = SessionContext {
+            index: 0,
+            connection_id: 0,
+            connection_epoch: 1,
+            event_tx: &event_tx,
+            collector: &collector,
+            stats,
+        };
         handle_text(
             text,
             sub,
-            stats,
             events,
-            &CollectorContext::new(),
-            0,
-            1,
+            &context,
             0,
             123,
         )
@@ -713,6 +748,29 @@ mod tests {
         handle(raw, &sub, &stats, &mut buf).unwrap();
         assert_eq!(buf.len(), 2);
         assert_eq!(stats.tick_changes.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn handle_text_keeps_valid_parents_around_an_unsupported_parent() {
+        let stats = ConnStats::default();
+        let mut buf = Vec::new();
+        let sub = sub_state(&["a"]);
+        let raw = r#"[
+            {"event_type": "tick_size_change", "asset_id": "a", "market": "m",
+             "old_tick_size": "0.01", "new_tick_size": "0.001", "timestamp": "1"},
+            {"event_type": "future_event", "asset_id": "a", "market": "m",
+             "timestamp": "2"},
+            {"event_type": "tick_size_change", "asset_id": "a", "market": "m",
+             "old_tick_size": "0.02", "new_tick_size": "0.002", "timestamp": "3"}
+        ]"#;
+
+        handle(raw, &sub, &stats, &mut buf).unwrap();
+
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0].message_index, 0);
+        assert_eq!(buf[1].message_index, 2);
+        assert_eq!(buf[0].message_count, 3);
+        assert_eq!(buf[1].receive_sequence, buf[0].receive_sequence + 2);
     }
 
     #[tokio::test]
