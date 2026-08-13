@@ -58,6 +58,21 @@ and nested values; it does not change the logical Arrow types described below.
 Readers should rely on those logical types and let their Parquet library decode
 the physical encodings.
 
+## Archive destinations
+
+`EXPORT_BACKEND=r2` uploads objects to the S3-compatible endpoint configured by
+the `R2_*` variables. `EXPORT_BACKEND=local` instead stores the same keys below
+`LOCAL_EXPORT_DIR`; it requires no R2 credentials. Local files are first
+written beside their destination under a temporary name and then atomically
+replaced. In both modes `manifest.json` is written last and remains the only
+completion marker for an hour.
+
+The repository's `run_local.sh` selects the local backend and maps the
+container's `/exports` directory to `.data/parquet` on the host. Set
+`EXPORT_ONCE=true` when invoking the exporter directly to backfill every
+currently eligible missing hour and exit instead of entering the continuous
+export loop.
+
 ## Type and identifier conventions
 
 All seven files begin with the same non-null columns, in this order:

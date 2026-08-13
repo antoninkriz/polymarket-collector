@@ -1,6 +1,7 @@
 services:
 
   obdata-polymarket-r2-archive-exporter:
+    user: "${LOCAL_RUN_UID:-1000}:${LOCAL_RUN_GID:-1000}"
     environment:
       EXPORT_BACKEND: local
       LOCAL_EXPORT_DIR: /exports

@@ -42,14 +42,43 @@ docker compose -f docker-compose.polymarket.yml up -d --build
 Services use `network_mode: host` and expect Redis on `localhost:6380` and
 ClickHouse on `localhost:8124`, as provided by the infra compose file.
 
-### Feed only — zero config, no accounts, no ClickHouse
+### Complete local pipeline with local Parquet
 
-Each secret is only needed by the service that uses it: R2 credentials by the
-archive exporter, `CLICKHOUSE_PASSWORD` by the ClickHouse writer. The live feed
-itself needs neither — no `.env` at all:
+The local runner starts Redis, ClickHouse, market discovery, WebSocket
+collection, the ClickHouse writer, and the archive exporter:
 
 ```sh
-docker compose -f docker-compose.infra.yml up -d obdata-redis
+./run_local.sh
+```
+
+It creates `.env` from `.env.example` when needed and writes the archive to
+`.data/parquet/YYYY-MM-DD/HH/EVENT_TYPE.parquet`. No R2 credentials are
+required. The files are written with the current host user ID, and an existing
+completed hour is recognized by its `manifest.json` when the stack restarts.
+
+Useful commands are:
+
+```sh
+./run_local.sh logs
+./run_local.sh status
+./run_local.sh down
+```
+
+`down` retains Redis, ClickHouse, and Parquet data under `.data`. The first
+Parquet files cannot be produced until the receive-time hour in which
+collection began is complete and a record from the following hour has reached
+ClickHouse. This can take a little over one hour.
+
+### Live stream without ClickHouse persistence
+
+The WebSocket publisher queries ClickHouse once at startup to recover the
+durable sequence-generation floor, even when the ClickHouse writer is not
+started. Run Redis and ClickHouse, then omit only the writer and exporter:
+
+```sh
+docker compose -f docker-compose.infra.yml up -d \
+  obdata-redis \
+  obdata-clickhouse
 docker compose -f docker-compose.polymarket.yml up -d --build \
   obdata-polymarket-active-markets \
   obdata-polymarket-orderbook-rust-pubsub
@@ -61,9 +90,8 @@ Then inspect the durable firehose (~10k+ events/sec across all markets):
 docker exec obdata-redis redis-cli XRANGE polymarket:events:v3 - + COUNT 1
 ```
 
-To also record into ClickHouse, set `CLICKHOUSE_PASSWORD`, start
-`obdata-clickhouse` from the infra compose, and add
-`obdata-polymarket-orderbook-rust-from-pubsub` to the `up` command.
+To persist events in ClickHouse, add
+`obdata-polymarket-orderbook-rust-from-pubsub` to the application `up` command.
 
 The v3 data contract and replay rules are documented in
 [`docs/POLYMARKET_V3.md`](docs/POLYMARKET_V3.md). The exact per-file Parquet
