@@ -44,6 +44,11 @@ R2_SECRET_KEY = os.environ.get("R2_SECRET_KEY", "")
 R2_BUCKET = os.environ.get("R2_BUCKET", "")
 EXPORT_BACKEND = os.environ.get("EXPORT_BACKEND", "r2").strip().lower()
 LOCAL_EXPORT_DIR = os.environ.get("LOCAL_EXPORT_DIR", "/exports")
+EXPORT_ONCE = os.environ.get("EXPORT_ONCE", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 # Export format
 PARQUET_COMPRESSION = "zstd"
@@ -731,6 +736,9 @@ def main() -> None:
         sys.exit(1)
 
     next_hour = backfill(client)
+    if EXPORT_ONCE:
+        log.info("One-shot export complete")
+        return
     run_loop(client, next_hour)
 
 

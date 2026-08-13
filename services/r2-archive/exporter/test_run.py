@@ -234,5 +234,21 @@ class ExportHourTest(unittest.TestCase):
             self.assertIn(metadata["file"], client.uploads)
 
 
+class MainTest(unittest.TestCase):
+    def test_one_shot_export_does_not_enter_run_loop(self) -> None:
+        with TemporaryDirectory() as directory:
+            with (
+                patch.object(exporter, "EXPORT_BACKEND", "local"),
+                patch.object(exporter, "LOCAL_EXPORT_DIR", directory),
+                patch.object(exporter, "EXPORT_ONCE", True),
+                patch.object(exporter, "backfill", return_value=None) as backfill,
+                patch.object(exporter, "run_loop") as run_loop,
+            ):
+                exporter.main()
+
+        backfill.assert_called_once()
+        run_loop.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
