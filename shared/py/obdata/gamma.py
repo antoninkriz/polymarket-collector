@@ -11,7 +11,7 @@ from typing import Optional
 import httpx
 
 from obdata.constants import GAMMA_API
-from obdata.orderbook.models import MarketSubscription
+from obdata.polymarket import MarketSubscription
 
 log = logging.getLogger(__name__)
 

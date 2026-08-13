@@ -11,7 +11,7 @@ from typing import Any, Optional
 import redis.asyncio as aioredis
 
 from obdata.constants import KEY_ACTIVE_MARKETS, KEY_ACTIVE_MARKETS_COUNT
-from obdata.orderbook.models import MarketSubscription
+from obdata.polymarket import MarketSubscription
 
 log = logging.getLogger(__name__)
 

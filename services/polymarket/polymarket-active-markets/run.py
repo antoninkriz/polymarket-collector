@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 from obdata.cache import CacheData, RedisMarketCache
 from obdata.constants import GAMMA_API, STREAM_MARKET_EVENTS, require_redis_url
 from obdata.messaging import RedisStreamPublisher
-from obdata.orderbook.models import MarketSubscription
+from obdata.polymarket import MarketSubscription
 
 from obdata.gamma import fetch_active_markets_from_gamma, parse_markets
 

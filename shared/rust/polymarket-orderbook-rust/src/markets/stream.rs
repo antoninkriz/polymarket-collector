@@ -11,9 +11,8 @@
 //! Each successfully processed message is XACK'd. With `--skip-backlog`, the
 //! cursor starts at `$` (drop pending messages and only process new ones).
 //!
-//! Mirrors `messaging.py::RedisStreamSubscriber` semantics: drain pending
-//! (unacked) messages from this consumer first, then switch to `">"` for
-//! new messages. The Python wrapper calls these "phase 1" and "phase 2".
+//! The consumer drains its pending (unacknowledged) messages first, then
+//! switches to `">"` for new messages.
 
 use std::sync::Arc;
 
