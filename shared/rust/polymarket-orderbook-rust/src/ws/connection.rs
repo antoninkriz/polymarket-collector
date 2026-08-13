@@ -528,6 +528,18 @@ fn handle_text(
         // Serialize from Value rather than from the typed struct so fields a
         // newer server adds remain available in raw_message.
         let raw_message = serde_json::to_string(&raw_value).context("serialize raw message")?;
+        // Allocate the collector merge order before typed parsing or event
+        // expansion. Parsing failures therefore leave an observable sequence
+        // gap in the process logs rather than allowing a later message to take
+        // this parent's position.
+        let message = collector.next_message(
+            connection_id,
+            connection_epoch,
+            frame_sequence,
+            message_index as u32,
+            message_count,
+            timestamp_received_ns,
+        );
         let msg: WireMessage = serde_json::from_value(raw_value).context("parse wire message")?;
         // Per-type counters need to be incremented from the wire message
         // before fan-out (price_change still counts as one wire arrival per
@@ -551,14 +563,6 @@ fn handle_text(
         let mut staged: Vec<Event> = Vec::new();
         explode(msg, &mut staged);
         let row_count = u32::try_from(staged.len()).context("too many rows in message")?;
-        let message = collector.next_message(
-            connection_id,
-            connection_epoch,
-            frame_sequence,
-            message_index as u32,
-            message_count,
-            timestamp_received_ns,
-        );
 
         // Preserve the original exploded index even when an unexpected asset
         // is filtered. A non-contiguous row_index then exposes the omission.
