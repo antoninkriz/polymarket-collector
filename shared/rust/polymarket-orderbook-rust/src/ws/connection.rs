@@ -276,11 +276,14 @@ impl Connection {
     }
 }
 
-/// Subscription state: durable intent and per-session sent set.
+/// Subscription state: durable intent and per-session reconstruction state.
 #[derive(Default)]
 pub(crate) struct SubState {
     pub desired: HashSet<String>,
     pub subscribed: HashSet<String>,
+    /// Assets for which this socket session has delivered a fresh book.
+    /// Price deltas are not reconstructible until that snapshot arrives.
+    pub initialized: HashSet<String>,
     /// Whether the initial subscribe message has been sent on the current
     /// session. The first message uses `{"type": "market"}`; subsequent
     /// ones use `{"operation": "subscribe"}`.
@@ -290,6 +293,7 @@ pub(crate) struct SubState {
 impl SubState {
     pub fn reset_session(&mut self) {
         self.subscribed.clear();
+        self.initialized.clear();
         self.initial_sent = false;
     }
 }
@@ -471,6 +475,10 @@ async fn run_session(
                             // newly desired
                         }
                         if sub.subscribed.insert(a.clone()) {
+                            // A new subscription needs its own fresh snapshot,
+                            // even if this asset was subscribed earlier in the
+                            // same socket session and then removed.
+                            sub.initialized.remove(a);
                             new_in_session.push(a.clone());
                         }
                     }
@@ -491,6 +499,7 @@ async fn run_session(
                     for a in &assets {
                         if sub.desired.remove(a) {
                             sub.subscribed.remove(a);
+                            sub.initialized.remove(a);
                             removed.push(a.clone());
                         }
                     }
@@ -518,7 +527,7 @@ async fn run_session(
 /// surviving events to `events_buf`. Updates per-period stats.
 fn handle_text(
     text: &str,
-    sub: &SubState,
+    sub: &mut SubState,
     events_buf: &mut Vec<EventRecord>,
     context: &SessionContext<'_>,
     timestamp_received_ns: i64,
@@ -564,9 +573,24 @@ fn handle_text(
         let mut staged: Vec<Event> = Vec::new();
         explode(msg, &mut staged);
         for ev in staged {
-            if sub.desired.contains(ev.asset_id()) {
-                events_buf.push(context.collector.record(ev, timestamp_received_ns));
+            let asset_id = ev.asset_id();
+            if !sub.desired.contains(asset_id) {
+                continue;
             }
+            match &ev {
+                Event::Book { .. } => {
+                    sub.initialized.insert(asset_id.to_owned());
+                }
+                Event::PriceChange { .. } if !sub.initialized.contains(asset_id) => {
+                    debug!(
+                        conn = context.index,
+                        asset_id, "dropping price delta before fresh book snapshot"
+                    );
+                    continue;
+                }
+                _ => {}
+            }
+            events_buf.push(context.collector.record(ev, timestamp_received_ns));
         }
     }
     Ok(())
@@ -618,7 +642,7 @@ mod tests {
 
     fn handle(
         text: &str,
-        sub: &SubState,
+        sub: &mut SubState,
         stats: &ConnStats,
         events: &mut Vec<EventRecord>,
     ) -> Result<()> {
@@ -637,6 +661,7 @@ mod tests {
         let mut s = SubState::default();
         for a in desired {
             s.desired.insert((*a).into());
+            s.initialized.insert((*a).into());
         }
         s
     }
@@ -645,12 +670,12 @@ mod tests {
     fn handle_text_filters_undesired_book_event() {
         let stats = ConnStats::default();
         let mut buf = Vec::new();
-        let sub = sub_state(&["wanted"]);
+        let mut sub = sub_state(&["wanted"]);
         let raw = r#"{
             "event_type": "book", "asset_id": "not-wanted", "market": "m",
             "bids": [], "asks": [], "timestamp": "1", "hash": "h"
         }"#;
-        handle(raw, &sub, &stats, &mut buf).unwrap();
+        handle(raw, &mut sub, &stats, &mut buf).unwrap();
         assert_eq!(buf.len(), 0, "undesired asset should be filtered");
         // The book counter still increments because the wire message arrived.
         assert_eq!(stats.books.load(Ordering::Relaxed), 1);
@@ -660,14 +685,14 @@ mod tests {
     fn handle_text_keeps_desired_book_event() {
         let stats = ConnStats::default();
         let mut buf = Vec::new();
-        let sub = sub_state(&["wanted"]);
+        let mut sub = sub_state(&["wanted"]);
         let raw = r#"{
             "event_type": "book", "asset_id": "wanted", "market": "m",
             "bids": [{"price": "0.4", "size": "10"}],
             "asks": [{"price": "0.5", "size": "10"}],
             "timestamp": "1", "hash": "h"
         }"#;
-        handle(raw, &sub, &stats, &mut buf).unwrap();
+        handle(raw, &mut sub, &stats, &mut buf).unwrap();
         assert_eq!(buf.len(), 1);
     }
 
@@ -675,7 +700,7 @@ mod tests {
     fn handle_text_explodes_price_change_and_filters_per_entry() {
         let stats = ConnStats::default();
         let mut buf = Vec::new();
-        let sub = sub_state(&["a1"]);
+        let mut sub = sub_state(&["a1"]);
         let raw = r#"{
             "event_type": "price_change", "market": "m", "timestamp": "1",
             "price_changes": [
@@ -684,7 +709,7 @@ mod tests {
                 {"asset_id": "a1", "price": "0.6", "size": "10", "side": "BUY", "hash": "h3"}
             ]
         }"#;
-        handle(raw, &sub, &stats, &mut buf).unwrap();
+        handle(raw, &mut sub, &stats, &mut buf).unwrap();
         assert_eq!(buf.len(), 2, "only a1 entries should survive filter");
         assert_eq!(
             stats.price_changes.load(Ordering::Relaxed),
@@ -694,17 +719,47 @@ mod tests {
     }
 
     #[test]
+    fn handle_text_requires_fresh_book_before_price_changes() {
+        let stats = ConnStats::default();
+        let mut buf = Vec::new();
+        let mut sub = sub_state(&["a"]);
+        sub.reset_session();
+        sub.desired.insert("a".into());
+
+        let price_change = r#"{
+            "event_type": "price_change", "market": "m", "timestamp": "1",
+            "price_changes": [
+                {"asset_id": "a", "price": "0.4", "size": "10", "side": "BUY", "hash": "h"}
+            ]
+        }"#;
+        handle(price_change, &mut sub, &stats, &mut buf).unwrap();
+        assert!(buf.is_empty(), "delta before snapshot must be discarded");
+
+        let book = r#"{
+            "event_type": "book", "asset_id": "a", "market": "m",
+            "bids": [], "asks": [], "timestamp": "2", "hash": "h"
+        }"#;
+        handle(book, &mut sub, &stats, &mut buf).unwrap();
+        handle(price_change, &mut sub, &stats, &mut buf).unwrap();
+        assert_eq!(buf.len(), 2, "snapshot followed by delta is reconstructible");
+
+        sub.reset_session();
+        handle(price_change, &mut sub, &stats, &mut buf).unwrap();
+        assert_eq!(buf.len(), 2, "reconnect must require another snapshot");
+    }
+
+    #[test]
     fn handle_text_handles_array_frame() {
         let stats = ConnStats::default();
         let mut buf = Vec::new();
-        let sub = sub_state(&["a"]);
+        let mut sub = sub_state(&["a"]);
         let raw = r#"[
             {"event_type": "tick_size_change", "asset_id": "a", "market": "m",
              "old_tick_size": "0.01", "new_tick_size": "0.001", "timestamp": "1"},
             {"event_type": "tick_size_change", "asset_id": "a", "market": "m",
              "old_tick_size": "0.02", "new_tick_size": "0.002", "timestamp": "2"}
         ]"#;
-        handle(raw, &sub, &stats, &mut buf).unwrap();
+        handle(raw, &mut sub, &stats, &mut buf).unwrap();
         assert_eq!(buf.len(), 2);
         assert_eq!(stats.tick_changes.load(Ordering::Relaxed), 2);
     }
@@ -713,7 +768,7 @@ mod tests {
     fn handle_text_keeps_valid_parents_around_an_unsupported_parent() {
         let stats = ConnStats::default();
         let mut buf = Vec::new();
-        let sub = sub_state(&["a"]);
+        let mut sub = sub_state(&["a"]);
         let raw = r#"[
             {"event_type": "tick_size_change", "asset_id": "a", "market": "m",
              "old_tick_size": "0.01", "new_tick_size": "0.001", "timestamp": "1"},
@@ -723,7 +778,7 @@ mod tests {
              "old_tick_size": "0.02", "new_tick_size": "0.002", "timestamp": "3"}
         ]"#;
 
-        handle(raw, &sub, &stats, &mut buf).unwrap();
+        handle(raw, &mut sub, &stats, &mut buf).unwrap();
 
         assert_eq!(buf.len(), 2);
         assert_eq!(buf[1].sequence, buf[0].sequence + 1);
