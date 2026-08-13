@@ -108,7 +108,10 @@ The publisher appends to Redis Streams and retries failed appends without
 discarding its batch. The consumer leaves entries pending until ClickHouse
 commits, and ClickHouse insert failures retry with backpressure. The exporter
 waits until a later receive-time hour has committed before publishing an
-immutable earlier hour.
+immutable earlier hour. A Parquet object is complete only when its sidecar
+manifest exists; the manifest records its row count, byte size, SHA-256 digest,
+source table, and replay ordering. This proves object integrity and resumable
+publication, not completeness relative to an unsequenced upstream feed.
 
 These mechanisms protect against subscriber downtime and ordinary transient
 Redis/ClickHouse failures. They do not turn the public feed into an exchange

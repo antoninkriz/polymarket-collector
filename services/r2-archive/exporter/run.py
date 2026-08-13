@@ -33,6 +33,7 @@ Profiles, selected via ``EXPORTER_PROFILE`` env (default ``polymarket_v3``):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -415,7 +416,7 @@ class R2Client:
                 raise
 
     def list_keys(self) -> set[str]:
-        """Return the set of exported parquet object keys."""
+        """Return the set of exported object keys."""
         keys: set[str] = set()
         kwargs: dict = {"Bucket": self._bucket, "Prefix": FILENAME_PREFIX}
         while True:
@@ -429,6 +430,16 @@ class R2Client:
         """Upload an in-memory blob to the bucket."""
         self._client.upload_fileobj(BytesIO(data), self._bucket, key)
 
+    def exists(self, key: str) -> bool:
+        """Return whether an object exists in the bucket."""
+        try:
+            self._client.head_object(Bucket=self._bucket, Key=key)
+            return True
+        except ClientError as e:
+            if e.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
+                return False
+            raise
+
 
 # ---------- Export orchestration ----------
 
@@ -436,6 +447,14 @@ class R2Client:
 def hour_to_filename(hour: datetime) -> str:
     """Convert a datetime to the standard snapshot filename."""
     return f"{FILENAME_PREFIX}{hour.strftime('%Y-%m-%dT%H')}.parquet"
+
+
+def hour_to_completion_key(hour: datetime) -> str:
+    """Return the object whose presence means an hour was fully published."""
+    filename = hour_to_filename(hour)
+    if PROFILE.name == "polymarket_v3":
+        return f"{filename}.manifest.json"
+    return filename
 
 
 def latest_exportable_hour() -> datetime | None:
@@ -468,27 +487,46 @@ def export_hour(client: R2Client, hour: datetime) -> bool:
         log.info("Skipping %s: 0 rows, will retry next tick", filename)
         return False
     client.upload(filename, data)
+    if PROFILE.name == "polymarket_v3":
+        row_count = pq.read_metadata(BytesIO(data)).num_rows
+        manifest = {
+            "schema_version": 3,
+            "file": filename,
+            "hour_utc": hour.isoformat(),
+            "row_count": row_count,
+            "byte_size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "source_table": CLICKHOUSE_TABLE,
+            "order_by": SELECT_ORDER_BY,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        manifest_data = json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        client.upload(hour_to_completion_key(hour), manifest_data)
     log.info("Uploaded %s (%.2f MB)", filename, len(data) / (1024 * 1024))
     return True
 
 
-def backfill(client: R2Client) -> None:
-    """Export every missing hour from ClickHouse to R2."""
+def backfill(client: R2Client) -> datetime | None:
+    """Export missing complete hours and return the next hour to attempt."""
     earliest = query_earliest_hour()
     if earliest is None:
         log.warning("No data in ClickHouse yet")
-        return
+        return None
 
     latest = latest_exportable_hour()
     if latest is None or latest < earliest:
         log.info("No complete ClickHouse hour is exportable yet")
-        return
+        return earliest
     existing = client.list_keys()
 
     missing: list[datetime] = []
     current = earliest
     while current <= latest:
-        if hour_to_filename(current) not in existing:
+        if hour_to_completion_key(current) not in existing:
             missing.append(current)
         current += timedelta(hours=1)
 
@@ -499,22 +537,22 @@ def backfill(client: R2Client) -> None:
 
     for i, hour in enumerate(missing, 1):
         try:
-            export_hour(client, hour)
+            if not export_hour(client, hour):
+                return hour
             log.info("Backfill progress: %d/%d", i, len(missing))
         except Exception as e:
             log.error("Failed to export %s: %s", hour.isoformat(), e)
+            return hour
+    return latest + timedelta(hours=1)
 
 
-def run_loop(client: R2Client) -> None:
+def run_loop(client: R2Client, next_hour: datetime | None) -> None:
     """Steady-state loop: export each new hour shortly after it completes.
 
     Advances only on successful upload — empty hours are re-polled on the
     next tick so gaps never produce zero-row objects in R2.
     """
     log.info("Entering steady-state loop (check every %ds)", LOOP_CHECK_INTERVAL_SECONDS)
-    latest = latest_exportable_hour()
-    next_hour = (latest + timedelta(hours=1)) if latest is not None else None
-
     while True:
         time.sleep(LOOP_CHECK_INTERVAL_SECONDS)
         now = datetime.now(timezone.utc)
@@ -530,6 +568,10 @@ def run_loop(client: R2Client) -> None:
             continue
         while next_hour <= latest:
             try:
+                completion_key = hour_to_completion_key(next_hour)
+                if client.exists(completion_key):
+                    next_hour += timedelta(hours=1)
+                    continue
                 if not export_hour(client, next_hour):
                     break
                 next_hour += timedelta(hours=1)
@@ -559,8 +601,8 @@ def main() -> None:
         R2_ENDPOINT, R2_BUCKET, PROFILE.name, CLICKHOUSE_TABLE, FILENAME_PREFIX, SELECT_ORDER_BY,
     )
 
-    backfill(client)
-    run_loop(client)
+    next_hour = backfill(client)
+    run_loop(client, next_hour)
 
 
 if __name__ == "__main__":
