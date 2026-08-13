@@ -1,0 +1,8 @@
+services:
+
+  obdata-polymarket-r2-archive-exporter:
+    environment:
+      EXPORT_BACKEND: local
+      LOCAL_EXPORT_DIR: /exports
+    volumes:
+      - ./.data/parquet:/exports
