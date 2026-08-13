@@ -1,33 +1,9 @@
 //! Wire-format event types for the Polymarket WSS market channel.
 //!
-//! Two layers:
-//!
-//! 1. [`WireMessage`] / [`WireFrame`] — what `serde` parses directly from
-//!    the wire JSON. Mirrors Polymarket's payload shapes 1:1, including the
-//!    `price_change` wrapper that contains an array of per-asset entries.
-//!    A frame can be either a single message or a JSON array of messages.
-//! 2. [`Event`] — the post-explode form that flows through the channel into
-//!    the ClickHouse sink. Each [`Event`] becomes exactly one row in the
-//!    `polymarket_orderbook` table. For `price_change`, one [`WireMessage`]
-//!    fans out into N [`Event::PriceChange`] values (one per entry), matching
-//!    what `sink.py::_serialize_event` does in the Python service.
-//!
-//! ## Wire vs storage shape (must match Python byte-for-byte)
-//!
-//! - Wire `bids`/`asks` come in as `[{"price": "0.41", "size": "100"}, ...]`
-//!   but the storage shape is `[["0.41", "100"], ...]`. [`Level`]'s custom
-//!   `Serialize` impl emits the array form; [`WireLevel`] parses the object form.
-//! - `Event` includes the source `timestamp` so the durable v3 Redis record
-//!   is self-contained. ClickHouse v3 also promotes its parsed value and
-//!   retains the original string as `timestamp_raw`.
-//! - Field order on each variant matches Python's dict insertion order in
-//!   `sink.py::_serialize_event`.
-//!
-//! When `EXCLUDE_HASH=true`, callers null out the `hash` field on
-//! `Event::Book` and `Event::PriceChange` before serializing.
-//! `LastTradePrice.transaction_hash` is a different concept and is never stripped.
-
-use std::fmt;
+//! [`WireMessage`] mirrors the incoming payload, including the
+//! `price_change` wrapper. [`Event`] is the normalized child stored in V3;
+//! one parent price change fans out in source order. Wire `bids` and `asks`
+//! use objects while [`Level`] stores compact two-element arrays.
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -35,29 +11,6 @@ use serde::{Deserialize, Serialize};
 // =====================================================================
 // Wire layer (deserialize-only)
 // =====================================================================
-
-/// A single WS frame from Polymarket. Frames are usually a single JSON
-/// object but the server occasionally sends a JSON array of objects, so
-/// we accept either.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum WireFrame {
-    Many(Vec<WireMessage>),
-    One(WireMessage),
-}
-
-impl IntoIterator for WireFrame {
-    type Item = WireMessage;
-    type IntoIter = std::vec::IntoIter<WireMessage>;
-
-    /// Iterate the messages in this frame.
-    fn into_iter(self) -> Self::IntoIter {
-        match self {
-            WireFrame::One(message) => vec![message].into_iter(),
-            WireFrame::Many(messages) => messages.into_iter(),
-        }
-    }
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
@@ -83,9 +36,6 @@ pub struct WireBook {
     pub timestamp: String,
     pub bids: Vec<WireLevel>,
     pub asks: Vec<WireLevel>,
-    /// Polymarket content hash. Parsed for legacy sinks; compact v3 storage
-    /// deliberately strips it because it is not a unique event identifier.
-    pub hash: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,9 +57,6 @@ pub struct WirePriceChangeEntry {
     pub best_bid: Option<Decimal>,
     #[serde(default, with = "rust_decimal::serde::str_option")]
     pub best_ask: Option<Decimal>,
-    /// Polymarket content hash. Parsed for legacy sinks; compact v3 storage
-    /// deliberately strips it because it is not a unique event identifier.
-    pub hash: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,8 +143,6 @@ pub enum Event {
         timestamp: String,
         bids: Vec<Level>,
         asks: Vec<Level>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        hash: Option<String>,
     },
     PriceChange {
         market: String,
@@ -213,8 +158,6 @@ pub enum Event {
             with = "rust_decimal::serde::str_option"
         )]
         best_ask: Option<Decimal>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        hash: Option<String>,
         #[serde(with = "rust_decimal::serde::str")]
         price: Decimal,
         #[serde(with = "rust_decimal::serde::str")]
@@ -245,111 +188,12 @@ pub enum Event {
 }
 
 impl Event {
-    /// Wire `event_type` value (also the value of the `event_type` ClickHouse column).
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Event::Book { .. } => "book",
-            Event::PriceChange { .. } => "price_change",
-            Event::LastTradePrice { .. } => "last_trade_price",
-            Event::TickSizeChange { .. } => "tick_size_change",
-        }
-    }
-
     pub fn asset_id(&self) -> &str {
         match self {
             Event::Book { asset_id, .. }
             | Event::PriceChange { asset_id, .. }
             | Event::LastTradePrice { asset_id, .. }
             | Event::TickSizeChange { asset_id, .. } => asset_id,
-        }
-    }
-
-    pub fn market(&self) -> &str {
-        match self {
-            Event::Book { market, .. }
-            | Event::PriceChange { market, .. }
-            | Event::LastTradePrice { market, .. }
-            | Event::TickSizeChange { market, .. } => market,
-        }
-    }
-
-    pub fn timestamp(&self) -> &str {
-        match self {
-            Event::Book { timestamp, .. }
-            | Event::PriceChange { timestamp, .. }
-            | Event::LastTradePrice { timestamp, .. }
-            | Event::TickSizeChange { timestamp, .. } => timestamp,
-        }
-    }
-
-    /// Strip orderbook hash fields. No-op for trades and tick changes.
-    /// `LastTradePrice.transaction_hash` is a different concept and is never stripped.
-    pub fn strip_hash(&mut self) {
-        match self {
-            Event::Book { hash, .. } => *hash = None,
-            Event::PriceChange { hash, .. } => *hash = None,
-            _ => {}
-        }
-    }
-}
-
-impl fmt::Display for Event {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Event::Book {
-                market,
-                asset_id,
-                bids,
-                asks,
-                ..
-            } => {
-                write!(
-                    f,
-                    "book market={} asset={} bids={} asks={}",
-                    market,
-                    asset_id,
-                    bids.len(),
-                    asks.len()
-                )
-            }
-            Event::PriceChange {
-                market,
-                asset_id,
-                price,
-                size,
-                side,
-                best_bid,
-                best_ask,
-                ..
-            } => write!(
-                f,
-                "price_change market={} asset={} side={} price={} size={} bid={:?} ask={:?}",
-                market, asset_id, side, price, size, best_bid, best_ask
-            ),
-            Event::LastTradePrice {
-                market,
-                asset_id,
-                price,
-                size,
-                side,
-                transaction_hash,
-                ..
-            } => write!(
-                f,
-                "last_trade_price market={} asset={} side={} price={} size={} tx={}",
-                market, asset_id, side, price, size, transaction_hash
-            ),
-            Event::TickSizeChange {
-                market,
-                asset_id,
-                old_tick_size,
-                new_tick_size,
-                ..
-            } => write!(
-                f,
-                "tick_size_change market={} asset={} old={} new={}",
-                market, asset_id, old_tick_size, new_tick_size
-            ),
         }
     }
 }
@@ -367,7 +211,6 @@ pub fn explode(msg: WireMessage, out: &mut Vec<Event>) {
             timestamp: b.timestamp,
             bids: b.bids.into_iter().map(Level::from).collect(),
             asks: b.asks.into_iter().map(Level::from).collect(),
-            hash: Some(b.hash),
         }),
         WireMessage::PriceChange(pc) => {
             for e in pc.price_changes {
@@ -377,7 +220,6 @@ pub fn explode(msg: WireMessage, out: &mut Vec<Event>) {
                     timestamp: pc.timestamp.clone(),
                     best_bid: e.best_bid,
                     best_ask: e.best_ask,
-                    hash: Some(e.hash),
                     price: e.price,
                     size: e.size,
                     side: e.side,
@@ -472,7 +314,6 @@ mod tests {
         assert_eq!(b.bids[0].size, dec("100"));
         assert_eq!(b.asks.len(), 1);
         assert_eq!(b.timestamp, "1757908892351");
-        assert_eq!(b.hash, "abc123");
     }
 
     #[test]
@@ -499,7 +340,6 @@ mod tests {
         assert_eq!(pc.price_changes.len(), 3);
         assert_eq!(pc.price_changes[0].side, "BUY");
         assert_eq!(pc.price_changes[2].best_ask, Some(dec("0.56")));
-        assert_eq!(pc.price_changes[2].hash, "h3");
     }
 
     #[test]
@@ -542,26 +382,6 @@ mod tests {
         assert_eq!(c.new_tick_size, dec("0.001"));
     }
 
-    #[test]
-    fn parse_wire_frame_single_object() {
-        let raw = r#"{"event_type": "tick_size_change", "asset_id": "a", "market": "m",
-            "old_tick_size": "0.01", "new_tick_size": "0.001", "timestamp": "1"}"#;
-        let frame: WireFrame = serde_json::from_str(raw).unwrap();
-        assert_eq!(frame.into_iter().count(), 1);
-    }
-
-    #[test]
-    fn parse_wire_frame_array() {
-        let raw = r#"[
-            {"event_type": "tick_size_change", "asset_id": "a", "market": "m",
-             "old_tick_size": "0.01", "new_tick_size": "0.001", "timestamp": "1"},
-            {"event_type": "tick_size_change", "asset_id": "b", "market": "m",
-             "old_tick_size": "0.02", "new_tick_size": "0.002", "timestamp": "2"}
-        ]"#;
-        let frame: WireFrame = serde_json::from_str(raw).unwrap();
-        assert_eq!(frame.into_iter().count(), 2);
-    }
-
     // ---- Explode --------------------------------------------------------
 
     #[test]
@@ -594,9 +414,14 @@ mod tests {
         explode(msg, &mut out);
         assert_eq!(out.len(), 3);
         for ev in &out {
-            assert_eq!(ev.market(), "m");
-            assert_eq!(ev.timestamp(), "1");
-            assert!(matches!(ev, Event::PriceChange { .. }));
+            assert!(matches!(
+                ev,
+                Event::PriceChange {
+                    market,
+                    timestamp,
+                    ..
+                } if market == "m" && timestamp == "1"
+            ));
         }
     }
 
@@ -610,38 +435,23 @@ mod tests {
     }
 
     #[test]
-    fn serialize_book_matches_python_shape() {
+    fn serialize_book_uses_compact_level_shape() {
         let ev = Event::Book {
             market: "0xm".into(),
             asset_id: "a1".into(),
             timestamp: "1757908892351".into(),
             bids: vec![Level::new(dec("0.41"), dec("100"))],
             asks: vec![Level::new(dec("0.42"), dec("200"))],
-            hash: Some("h".into()),
         };
         let v = to_value(&ev);
         assert_eq!(v["event_type"], "book");
         assert_eq!(v["market"], "0xm");
         assert_eq!(v["asset_id"], "a1");
-        // bids/asks must be array-of-arrays of strings (Python's _dec format).
+        // Stored depth is an array of [price, size] string pairs.
         assert_eq!(v["bids"], serde_json::json!([["0.41", "100"]]));
         assert_eq!(v["asks"], serde_json::json!([["0.42", "200"]]));
-        assert_eq!(v["hash"], "h");
-        assert_eq!(v["timestamp"], "1757908892351");
-    }
-
-    #[test]
-    fn serialize_book_omits_hash_when_none() {
-        let ev = Event::Book {
-            market: "0xm".into(),
-            asset_id: "a".into(),
-            timestamp: "1".into(),
-            bids: vec![],
-            asks: vec![],
-            hash: None,
-        };
-        let v = to_value(&ev);
         assert!(v.get("hash").is_none());
+        assert_eq!(v["timestamp"], "1757908892351");
     }
 
     #[test]
@@ -652,7 +462,6 @@ mod tests {
             timestamp: "1".into(),
             best_bid: Some(dec("0.40")),
             best_ask: Some(dec("0.42")),
-            hash: Some("h".into()),
             price: dec("0.41"),
             size: dec("100"),
             side: "BUY".into(),
@@ -664,7 +473,7 @@ mod tests {
         assert_eq!(v["price"], "0.41");
         assert_eq!(v["size"], "100");
         assert_eq!(v["side"], "BUY");
-        assert_eq!(v["hash"], "h");
+        assert!(v.get("hash").is_none());
         assert_eq!(v["timestamp"], "1");
     }
 
@@ -676,7 +485,6 @@ mod tests {
             timestamp: "1".into(),
             best_bid: None,
             best_ask: None,
-            hash: None,
             price: dec("0.5"),
             size: dec("10"),
             side: "SELL".into(),
@@ -684,7 +492,6 @@ mod tests {
         let v = to_value(&ev);
         assert!(v.get("best_bid").is_none());
         assert!(v.get("best_ask").is_none());
-        assert!(v.get("hash").is_none());
     }
 
     #[test]
@@ -725,62 +532,8 @@ mod tests {
         assert_eq!(v["timestamp"], "1");
     }
 
-    // ---- strip_hash -----------------------------------------------------
-
     #[test]
-    fn strip_hash_clears_book_and_price_change_only() {
-        let mut book = Event::Book {
-            market: "m".into(),
-            asset_id: "a".into(),
-            timestamp: "1".into(),
-            bids: vec![],
-            asks: vec![],
-            hash: Some("h".into()),
-        };
-        book.strip_hash();
-        assert!(matches!(book, Event::Book { hash: None, .. }));
-
-        let mut pc = Event::PriceChange {
-            market: "m".into(),
-            asset_id: "a".into(),
-            timestamp: "1".into(),
-            best_bid: None,
-            best_ask: None,
-            hash: Some("h".into()),
-            price: dec("0.5"),
-            size: dec("10"),
-            side: "BUY".into(),
-        };
-        pc.strip_hash();
-        assert!(matches!(pc, Event::PriceChange { hash: None, .. }));
-
-        // LastTradePrice's transaction_hash must NOT be stripped.
-        let mut t = Event::LastTradePrice {
-            market: "m".into(),
-            asset_id: "a".into(),
-            timestamp: "1".into(),
-            price: dec("0.5"),
-            size: dec("10"),
-            side: "BUY".into(),
-            fee_rate_bps: "10".into(),
-            transaction_hash: "0xtx".into(),
-        };
-        t.strip_hash();
-        if let Event::LastTradePrice {
-            transaction_hash, ..
-        } = &t
-        {
-            assert_eq!(
-                transaction_hash, "0xtx",
-                "transaction_hash should not be stripped"
-            );
-        }
-    }
-
-    // ---- accessors ------------------------------------------------------
-
-    #[test]
-    fn accessors_return_expected_values() {
+    fn asset_accessor_returns_expected_value() {
         let ev = Event::TickSizeChange {
             market: "m".into(),
             asset_id: "a".into(),
@@ -788,10 +541,7 @@ mod tests {
             old_tick_size: dec("0.01"),
             new_tick_size: dec("0.001"),
         };
-        assert_eq!(ev.kind(), "tick_size_change");
-        assert_eq!(ev.market(), "m");
         assert_eq!(ev.asset_id(), "a");
-        assert_eq!(ev.timestamp(), "12345");
     }
 
     #[test]

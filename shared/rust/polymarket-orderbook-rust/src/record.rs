@@ -74,18 +74,6 @@ pub struct EventRecord {
     pub event: Event,
 }
 
-impl EventRecord {
-    /// Build a record for legacy raw/typed sink callers. Production v3
-    /// ingestion uses [`CollectorContext::record`].
-    pub fn synthetic(event: Event) -> Self {
-        Self {
-            timestamp_received_ns: 0,
-            sequence: 0,
-            event,
-        }
-    }
-}
-
 /// Sample UTC wall time without truncating to ClickHouse insertion precision.
 pub fn now_ns() -> i64 {
     Utc::now()

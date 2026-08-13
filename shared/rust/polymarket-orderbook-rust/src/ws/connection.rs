@@ -28,7 +28,7 @@
 //! - Unsubscribes:                          `{"assets_ids": [...], "operation": "unsubscribe"}`
 //!
 //! Messages can arrive as a single JSON object or as a JSON array of objects;
-//! [`crate::events::WireFrame`] handles both.
+//! the connection parser normalizes both forms before deserialization.
 //!
 //! ## Failure mode for the event channel
 //!
@@ -741,7 +741,11 @@ mod tests {
         }"#;
         handle(book, &mut sub, &stats, &mut buf).unwrap();
         handle(price_change, &mut sub, &stats, &mut buf).unwrap();
-        assert_eq!(buf.len(), 2, "snapshot followed by delta is reconstructible");
+        assert_eq!(
+            buf.len(),
+            2,
+            "snapshot followed by delta is reconstructible"
+        );
 
         sub.reset_session();
         handle(price_change, &mut sub, &stats, &mut buf).unwrap();

@@ -155,9 +155,7 @@ impl Sink {
     fn serialize_batch(&self) -> Result<Vec<u8>> {
         let mut body = Vec::with_capacity(self.buffer.len() * 256);
         for item in &self.buffer {
-            let mut event = item.record.event.clone();
-            event.strip_hash();
-            let data = serde_json::to_string(&event).context("serialize v3 event")?;
+            let data = serde_json::to_string(&item.record.event).context("serialize v3 event")?;
             serde_json::to_writer(
                 &mut body,
                 &RawRow {
@@ -281,7 +279,7 @@ struct RawRow<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{Event, Level};
+    use crate::events::Event;
     use crate::record::CollectorContext;
     use rust_decimal::Decimal;
 
@@ -344,28 +342,6 @@ mod tests {
         let event: serde_json::Value = serde_json::from_str(row["data"].as_str().unwrap()).unwrap();
         assert_eq!(event["timestamp"], "not-interpreted-by-the-raw-sink");
         assert_eq!(event["transaction_hash"], "0xtx");
-    }
-
-    #[test]
-    fn strips_non_unique_book_hash() {
-        let mut sink = sink();
-        sink.buffer.push(item(
-            Event::Book {
-                market: "m".into(),
-                asset_id: "a".into(),
-                timestamp: "1".into(),
-                bids: vec![Level::new(dec("0.4"), dec("10"))],
-                asks: Vec::new(),
-                hash: Some("not-an-identity".into()),
-            },
-            0,
-        ));
-
-        let body = sink.serialize_batch().unwrap();
-        let row: serde_json::Value =
-            serde_json::from_slice(body.strip_suffix(b"\n").unwrap()).unwrap();
-        let event: serde_json::Value = serde_json::from_str(row["data"].as_str().unwrap()).unwrap();
-        assert!(event.get("hash").is_none());
     }
 
     #[test]
