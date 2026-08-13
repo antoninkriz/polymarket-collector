@@ -14,9 +14,20 @@ use tokio::sync::watch;
 use tracing::info;
 use uuid::Uuid;
 
+use polymarket_orderbook_rust::record::SEQUENCE_GENERATION_MAX;
+
 const ACQUIRE_SCRIPT: &str = r#"
 if redis.call('EXISTS', KEYS[1]) ~= 0 then
     return nil
+end
+local current = tonumber(redis.call('GET', KEYS[2]) or '0')
+local floor = tonumber(ARGV[3])
+if current < floor then
+    redis.call('SET', KEYS[2], floor)
+    current = floor
+end
+if current >= tonumber(ARGV[4]) then
+    return redis.error_reply('PUBLISHER_GENERATION_EXHAUSTED')
 end
 local generation = redis.call('INCR', KEYS[2])
 local token = tostring(generation) .. ':' .. ARGV[1]
@@ -43,6 +54,10 @@ pub struct PublisherLeaseConfig {
     pub redis_url: String,
     pub lease_key: String,
     pub generation_key: String,
+    /// Greatest generation already present in another durable store.
+    pub minimum_generation: u64,
+    /// Maximum time to wait for the new generation to reach Redis AOF.
+    pub persist_timeout: Duration,
     pub ttl: Duration,
     pub renew_interval: Duration,
 }
@@ -61,6 +76,14 @@ impl PublisherLease {
     pub async fn acquire(cfg: PublisherLeaseConfig) -> Result<Self> {
         ensure!(!cfg.ttl.is_zero(), "publisher lease TTL must be positive");
         ensure!(
+            !cfg.persist_timeout.is_zero(),
+            "publisher generation persistence timeout must be positive"
+        );
+        ensure!(
+            cfg.minimum_generation < SEQUENCE_GENERATION_MAX,
+            "publisher generation space is exhausted"
+        );
+        ensure!(
             !cfg.renew_interval.is_zero() && cfg.renew_interval < cfg.ttl,
             "publisher lease renewal interval must be positive and less than its TTL",
         );
@@ -75,6 +98,8 @@ impl PublisherLease {
             .key(&cfg.generation_key)
             .arg(instance_id)
             .arg(duration_ms(cfg.ttl)?)
+            .arg(cfg.minimum_generation)
+            .arg(SEQUENCE_GENERATION_MAX)
             .invoke_async(&mut conn)
             .await
             .context("acquire publisher lease")?;
@@ -84,9 +109,21 @@ impl PublisherLease {
                 cfg.lease_key,
             );
         };
+        let (local_fsyncs, _replica_fsyncs): (u64, u64) = redis::cmd("WAITAOF")
+            .arg(1)
+            .arg(0)
+            .arg(duration_ms(cfg.persist_timeout)?)
+            .query_async(&mut conn)
+            .await
+            .context("persist publisher generation to Redis AOF")?;
+        ensure!(
+            local_fsyncs >= 1,
+            "publisher generation was not persisted to Redis AOF before timeout"
+        );
         info!(
             lease_key = cfg.lease_key,
             generation,
+            minimum_generation = cfg.minimum_generation,
             ttl_ms = cfg.ttl.as_millis() as u64,
             "acquired authoritative publisher lease",
         );

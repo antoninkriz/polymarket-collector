@@ -1,6 +1,7 @@
 //! End-to-end Redis test for publisher exclusivity and fenced appends.
 //!
-//! Run with a disposable Redis on port 16380:
+//! Run with a disposable AOF-enabled Redis on port 16380:
+//! `redis-server --port 16380 --appendonly yes --dir /tmp/redis-lease-test`
 //! `cargo test --test lease_integration -- --ignored --nocapture`.
 
 use std::time::Duration;
@@ -20,6 +21,8 @@ fn lease_config(suffix: &str) -> PublisherLeaseConfig {
         redis_url: REDIS_URL.into(),
         lease_key: format!("test:polymarket:v3:lease:{suffix}"),
         generation_key: format!("test:polymarket:v3:generation:{suffix}"),
+        minimum_generation: 0,
+        persist_timeout: Duration::from_secs(2),
         ttl: Duration::from_millis(500),
         renew_interval: Duration::from_millis(100),
     }
@@ -112,6 +115,12 @@ async fn lease_is_exclusive_renewed_and_fences_stale_appends() -> Result<()> {
     assert_eq!(length, 1);
 
     assert!(successor.release().await?);
+    let mut recovery_cfg = cfg.clone();
+    recovery_cfg.minimum_generation = 10;
+    let mut recovered = PublisherLease::acquire(recovery_cfg).await?;
+    assert_eq!(recovered.generation(), 11);
+    assert!(recovered.release().await?);
+
     let _: i64 = redis::cmd("DEL")
         .arg(&[stream, cfg.lease_key, cfg.generation_key])
         .query_async(&mut conn)

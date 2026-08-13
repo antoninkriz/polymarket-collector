@@ -72,8 +72,17 @@ services:
       # Every stream append is atomically fenced by the current lease token.
       PUBLISHER_LEASE_KEY: polymarket:publisher:v3:lease
       PUBLISHER_LEASE_GENERATION_KEY: polymarket:publisher:v3:generation
+      # The publisher recovers its sequence-generation floor from ClickHouse
+      # before acquiring the lease, then fsyncs the new value to Redis AOF.
+      PUBLISHER_GENERATION_PERSIST_TIMEOUT_MS: "5000"
       PUBLISHER_LEASE_TTL_MS: "15000"
       PUBLISHER_LEASE_RENEW_MS: "5000"
+      CLICKHOUSE_HOST: localhost
+      CLICKHOUSE_PORT: "8124"
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DATABASE: default
+      CLICKHOUSE_TABLE: polymarket_orderbook_v3
       # WS pool
       SKIP_ACTIVE_MARKETS_CACHE: "false"
       QUEUE_SIZE: "5000000"

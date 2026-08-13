@@ -30,6 +30,7 @@ use polymarket_orderbook_rust::ws::pool::Pool;
 use polymarket_orderbook_rust_pubsub::config::Config;
 use polymarket_orderbook_rust_pubsub::lease::{PublisherLease, PublisherLeaseConfig};
 use polymarket_orderbook_rust_pubsub::pubsub_sink::{PubSubSink, PubSubSinkConfig};
+use polymarket_orderbook_rust_pubsub::sequence_watermark::clickhouse_generation_floor;
 
 #[derive(Debug, Parser)]
 #[command(name = "polymarket-orderbook-rust-pubsub")]
@@ -50,10 +51,16 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     let cfg = Config::from_env().context("load config from env")?;
+    let clickhouse_generation_floor = clickhouse_generation_floor(&cfg)
+        .await
+        .context("recover durable publisher generation")?;
+    let minimum_generation = clickhouse_generation_floor.max(cfg.publisher_generation_floor);
     let mut publisher_lease = PublisherLease::acquire(PublisherLeaseConfig {
         redis_url: cfg.redis_url.clone(),
         lease_key: cfg.publisher_lease_key.clone(),
         generation_key: cfg.publisher_lease_generation_key.clone(),
+        minimum_generation,
+        persist_timeout: cfg.publisher_generation_persist_timeout,
         ttl: cfg.publisher_lease_ttl,
         renew_interval: cfg.publisher_lease_renew_interval,
     })
@@ -70,6 +77,8 @@ async fn main() -> Result<()> {
         publish_batch_max = cfg.publish_batch_max,
         publish_linger_ms = cfg.publish_linger.as_millis() as u64,
         publisher_fence,
+        clickhouse_generation_floor,
+        configured_generation_floor = cfg.publisher_generation_floor,
         "starting polymarket-orderbook-rust-pubsub",
     );
 

@@ -14,7 +14,12 @@ use crate::events::Event;
 
 const SEQUENCE_LOCAL_BITS: u32 = 48;
 const SEQUENCE_LOCAL_MASK: u64 = (1_u64 << SEQUENCE_LOCAL_BITS) - 1;
-const SEQUENCE_GENERATION_MAX: u64 = u64::MAX >> SEQUENCE_LOCAL_BITS;
+pub const SEQUENCE_GENERATION_MAX: u64 = u64::MAX >> SEQUENCE_LOCAL_BITS;
+
+/// Extract the publisher generation packed into an existing sequence.
+pub fn sequence_generation(sequence: u64) -> u64 {
+    sequence >> SEQUENCE_LOCAL_BITS
+}
 
 /// Process-scoped sequencer. The Redis-issued publisher generation occupies
 /// the high bits, so a restarted authoritative collector continues after the
@@ -123,5 +128,7 @@ mod tests {
         assert!(old.sequence < new.sequence);
         assert_eq!(old.sequence, 7_u64 << SEQUENCE_LOCAL_BITS);
         assert_eq!(new.sequence, 8_u64 << SEQUENCE_LOCAL_BITS);
+        assert_eq!(sequence_generation(old.sequence), 7);
+        assert_eq!(sequence_generation(new.sequence), 8);
     }
 }

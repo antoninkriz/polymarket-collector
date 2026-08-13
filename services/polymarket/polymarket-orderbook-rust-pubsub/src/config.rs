@@ -23,8 +23,17 @@ pub struct Config {
     pub publish_linger: Duration,
     pub publisher_lease_key: String,
     pub publisher_lease_generation_key: String,
+    pub publisher_generation_floor: u64,
+    pub publisher_generation_persist_timeout: Duration,
     pub publisher_lease_ttl: Duration,
     pub publisher_lease_renew_interval: Duration,
+
+    // -- Durable sequence recovery -----------------------------------------
+    pub clickhouse_url: String,
+    pub clickhouse_user: String,
+    pub clickhouse_password: String,
+    pub clickhouse_database: String,
+    pub clickhouse_table: String,
 
     // -- Active markets pre-load --------------------------------------------
     pub skip_active_markets_cache: bool,
@@ -36,10 +45,16 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        let clickhouse_host = env_or("CLICKHOUSE_HOST", "localhost");
+        let clickhouse_port = env_parse("CLICKHOUSE_PORT", 8123_u16)?;
         let publisher_lease_ttl =
             Duration::from_millis(env_parse("PUBLISHER_LEASE_TTL_MS", 15_000_u64)?);
         let publisher_lease_renew_interval =
             Duration::from_millis(env_parse("PUBLISHER_LEASE_RENEW_MS", 5_000_u64)?);
+        let publisher_generation_persist_timeout = Duration::from_millis(env_parse(
+            "PUBLISHER_GENERATION_PERSIST_TIMEOUT_MS",
+            5_000_u64,
+        )?);
         anyhow::ensure!(
             !publisher_lease_ttl.is_zero(),
             "PUBLISHER_LEASE_TTL_MS must be positive",
@@ -48,6 +63,10 @@ impl Config {
             !publisher_lease_renew_interval.is_zero()
                 && publisher_lease_renew_interval < publisher_lease_ttl,
             "PUBLISHER_LEASE_RENEW_MS must be positive and less than PUBLISHER_LEASE_TTL_MS",
+        );
+        anyhow::ensure!(
+            !publisher_generation_persist_timeout.is_zero(),
+            "PUBLISHER_GENERATION_PERSIST_TIMEOUT_MS must be positive",
         );
 
         Ok(Self {
@@ -75,8 +94,16 @@ impl Config {
                 "PUBLISHER_LEASE_GENERATION_KEY",
                 "polymarket:publisher:v3:generation",
             ),
+            publisher_generation_floor: env_parse("PUBLISHER_GENERATION_FLOOR", 0_u64)?,
+            publisher_generation_persist_timeout,
             publisher_lease_ttl,
             publisher_lease_renew_interval,
+
+            clickhouse_url: format!("http://{clickhouse_host}:{clickhouse_port}"),
+            clickhouse_user: env_or("CLICKHOUSE_USER", "default"),
+            clickhouse_password: env_or("CLICKHOUSE_PASSWORD", ""),
+            clickhouse_database: env_or("CLICKHOUSE_DATABASE", "default"),
+            clickhouse_table: env_or("CLICKHOUSE_TABLE", "polymarket_orderbook_v3"),
 
             skip_active_markets_cache: env_bool("SKIP_ACTIVE_MARKETS_CACHE"),
 
@@ -140,8 +167,16 @@ mod tests {
         "LINGER_MS",
         "PUBLISHER_LEASE_KEY",
         "PUBLISHER_LEASE_GENERATION_KEY",
+        "PUBLISHER_GENERATION_FLOOR",
+        "PUBLISHER_GENERATION_PERSIST_TIMEOUT_MS",
         "PUBLISHER_LEASE_TTL_MS",
         "PUBLISHER_LEASE_RENEW_MS",
+        "CLICKHOUSE_HOST",
+        "CLICKHOUSE_PORT",
+        "CLICKHOUSE_USER",
+        "CLICKHOUSE_PASSWORD",
+        "CLICKHOUSE_DATABASE",
+        "CLICKHOUSE_TABLE",
     ];
 
     fn snapshot_env() -> Vec<(String, Option<String>)> {
@@ -214,6 +249,14 @@ mod tests {
         );
         assert_eq!(cfg.publisher_lease_ttl, Duration::from_secs(15));
         assert_eq!(cfg.publisher_lease_renew_interval, Duration::from_secs(5),);
+        assert_eq!(cfg.publisher_generation_floor, 0);
+        assert_eq!(
+            cfg.publisher_generation_persist_timeout,
+            Duration::from_secs(5),
+        );
+        assert_eq!(cfg.clickhouse_url, "http://localhost:8123");
+        assert_eq!(cfg.clickhouse_database, "default");
+        assert_eq!(cfg.clickhouse_table, "polymarket_orderbook_v3");
 
         restore_env(snap);
     }
@@ -232,6 +275,12 @@ mod tests {
         std::env::set_var("PUBLISHER_LEASE_GENERATION_KEY", "custom:generation");
         std::env::set_var("PUBLISHER_LEASE_TTL_MS", "9000");
         std::env::set_var("PUBLISHER_LEASE_RENEW_MS", "2000");
+        std::env::set_var("PUBLISHER_GENERATION_FLOOR", "23");
+        std::env::set_var("PUBLISHER_GENERATION_PERSIST_TIMEOUT_MS", "3000");
+        std::env::set_var("CLICKHOUSE_HOST", "clickhouse");
+        std::env::set_var("CLICKHOUSE_PORT", "8124");
+        std::env::set_var("CLICKHOUSE_DATABASE", "marketdata");
+        std::env::set_var("CLICKHOUSE_TABLE", "events_v3");
 
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.redis_url, "redis://r:6379");
@@ -243,6 +292,14 @@ mod tests {
         assert_eq!(cfg.publisher_lease_generation_key, "custom:generation");
         assert_eq!(cfg.publisher_lease_ttl, Duration::from_secs(9));
         assert_eq!(cfg.publisher_lease_renew_interval, Duration::from_secs(2),);
+        assert_eq!(cfg.publisher_generation_floor, 23);
+        assert_eq!(
+            cfg.publisher_generation_persist_timeout,
+            Duration::from_secs(3),
+        );
+        assert_eq!(cfg.clickhouse_url, "http://clickhouse:8124");
+        assert_eq!(cfg.clickhouse_database, "marketdata");
+        assert_eq!(cfg.clickhouse_table, "events_v3");
 
         restore_env(snap);
     }
