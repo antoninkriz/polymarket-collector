@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import click
-import httpx
+import httpx2
 from dotenv import load_dotenv
 
 from obdata.cache import CacheData, RedisMarketCache
@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 
 FETCH_BATCH_SIZE = 100
 DEFAULT_POLL_INTERVAL_SECONDS = 10
-REQUEST_TIMEOUT = httpx.Timeout(connect=3, read=20, write=5, pool=5)
+REQUEST_TIMEOUT = httpx2.Timeout(connect=3, read=20, write=5, pool=5)
 MAX_RETRIES = 3
 CLOSED_TIME_OVERLAP = timedelta(minutes=30)
 
@@ -103,8 +103,8 @@ async def _fetch_recently_closed_markets(
     total_fetched = 0
     stop = False
 
-    transport = httpx.AsyncHTTPTransport(retries=MAX_RETRIES)
-    async with httpx.AsyncClient(
+    transport = httpx2.AsyncHTTPTransport(retries=MAX_RETRIES, http2=True)
+    async with httpx2.AsyncClient(
         timeout=REQUEST_TIMEOUT, transport=transport
     ) as client:
         while not stop:
@@ -155,8 +155,8 @@ async def _fetch_new_markets(max_start_date: datetime) -> tuple[list[dict], int]
     offset = 0
     requests_made = 0
 
-    transport = httpx.AsyncHTTPTransport(retries=MAX_RETRIES)
-    async with httpx.AsyncClient(
+    transport = httpx2.AsyncHTTPTransport(retries=MAX_RETRIES, http2=True)
+    async with httpx2.AsyncClient(
         timeout=REQUEST_TIMEOUT, transport=transport
     ) as client:
         while True:
@@ -507,7 +507,7 @@ def main(poll_interval: int) -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
     asyncio.run(_run(poll_interval))
 
 

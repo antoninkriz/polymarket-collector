@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
-import httpx
+import httpx2
 
 from obdata.constants import GAMMA_API
 from obdata.polymarket import MarketSubscription
@@ -106,8 +106,8 @@ async def fetch_active_markets_from_gamma() -> ActiveMarkets:
     raw_markets: list[dict] = []
     cursor: Optional[str] = None
 
-    transport = httpx.AsyncHTTPTransport(retries=MAX_RETRIES)
-    async with httpx.AsyncClient(
+    transport = httpx2.AsyncHTTPTransport(retries=MAX_RETRIES, http2=True)
+    async with httpx2.AsyncClient(
         timeout=REQUEST_TIMEOUT_SECONDS, transport=transport
     ) as client:
         while True:
