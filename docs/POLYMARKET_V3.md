@@ -75,8 +75,45 @@ The `polymarket_orderbook_v3` table contains:
 
 The table uses `ReplacingMergeTree`. Its key includes the collector-generated
 `message_id, row_index` identity, retaining every distinct collector
-observation while collapsing retries of the same collector row. Hourly export
-queries use `FINAL`, so Parquet never depends on background merge timing.
+observation while collapsing retries of the same collector row.
+
+Use `polymarket_orderbook_v3_final` for interactive and downstream reads. It is
+the canonical view over the base table with `FINAL` applied, so correctness
+does not depend on background merge timing. The hourly exporter applies
+`FINAL` directly to the base table for the same reason. A direct query of
+`polymarket_orderbook_v3` is a physical-storage query and can temporarily show
+more than one copy of an at-least-once Redis delivery.
+
+Two diagnostic views distinguish those collector-owned retries from genuine
+repeated source observations:
+
+- `polymarket_orderbook_v3_ingestion_health` reports current hourly physical
+  rows, logical rows, transport-retry rows, publisher generations, and
+  collector sessions. A positive `transport_retry_rows` catches retries before
+  a background merge collapses them; ClickHouse insert-failure warnings are the
+  durable operational signal.
+- `polymarket_orderbook_v3_publisher_sessions` reports the accepted receive
+  interval and row/message counts for each fencing generation and session.
+
+Multiple publisher generations in one hour can be an ordinary restart; it is
+not by itself evidence of duplication. Intersecting session intervals warrant
+investigation (with the caveat that `timestamp_received` is a wall clock):
+
+```sql
+WITH sessions AS (
+    SELECT * FROM polymarket_orderbook_v3_publisher_sessions
+)
+SELECT
+    older.publisher_fence AS older_fence,
+    newer.publisher_fence AS newer_fence,
+    older.last_received,
+    newer.first_received
+FROM sessions AS older
+CROSS JOIN sessions AS newer
+WHERE older.publisher_fence < newer.publisher_fence
+  AND older.first_received <= newer.last_received
+  AND newer.first_received <= older.last_received;
+```
 
 ## Replay algorithm
 

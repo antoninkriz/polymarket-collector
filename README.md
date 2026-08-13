@@ -12,6 +12,7 @@ disconnect boundaries explicit rather than claiming an exchange audit log.
 Polymarket Gamma REST ──▶ polymarket-active-markets ──▶ Redis (active_markets cache + market_events stream)
 Polymarket WS ──▶ polymarket-orderbook-rust-pubsub ──▶ Redis Stream `polymarket:events:v3`
                   polymarket-orderbook-rust-from-pubsub ──▶ ClickHouse `polymarket_orderbook_v3`
+                                                            canonical: `polymarket_orderbook_v3_final`
                   r2-archive exporter (EXPORTER_PROFILE=polymarket_v3) ──▶ R2 hourly Parquet
 ```
 
@@ -23,6 +24,8 @@ Polymarket WS ──▶ polymarket-orderbook-rust-pubsub ──▶ Redis Stream 
   lease and fenced `XADD` enforce one authoritative publisher.
 - `services/polymarket/polymarket-orderbook-rust-from-pubsub` — Rust; consumes the
   stream and acknowledges rows only after the replayable v3 ClickHouse insert.
+  Read through the generated `_final` view to hide at-least-once transport
+  retries before background merges complete.
 - `services/r2-archive/exporter` — generic exporter, run with
   `EXPORTER_PROFILE=polymarket`, dumps hourly Parquet to the
   bucket named by `R2_BUCKET`.

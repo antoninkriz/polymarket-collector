@@ -30,6 +30,22 @@ const CH_DATABASE: &str = "default";
 const CH_TABLE: &str = "polymarket_orderbook_rust_test_typed_cli";
 const CH_V3_TABLE: &str = "polymarket_orderbook_rust_test_v3_cli";
 
+async fn drop_v3_objects(http: &Client) -> Result<()> {
+    for suffix in ["_final", "_ingestion_health", "_publisher_sessions"] {
+        query(
+            http,
+            &format!("DROP VIEW IF EXISTS {CH_DATABASE}.{CH_V3_TABLE}{suffix}"),
+        )
+        .await?;
+    }
+    query(
+        http,
+        &format!("DROP TABLE IF EXISTS {CH_DATABASE}.{CH_V3_TABLE}"),
+    )
+    .await?;
+    Ok(())
+}
+
 fn dec(s: &str) -> Decimal {
     s.parse().unwrap()
 }
@@ -238,11 +254,7 @@ async fn typed_sink_writes_to_clickhouse_end_to_end() -> Result<()> {
 #[ignore]
 async fn v3_sink_deduplicates_only_transport_retries() -> Result<()> {
     let http = Client::new();
-    query(
-        &http,
-        &format!("DROP TABLE IF EXISTS {CH_DATABASE}.{CH_V3_TABLE}"),
-    )
-    .await?;
+    drop_v3_objects(&http).await?;
 
     let sink = Sink::connect(SinkConfig {
         url: CH_URL.into(),
@@ -252,11 +264,18 @@ async fn v3_sink_deduplicates_only_transport_retries() -> Result<()> {
         table: CH_V3_TABLE.into(),
         drop_table_on_start: true,
         exclude_hash: false,
-        batch_size: 3,
+        batch_size: 1,
         flush_interval: Duration::from_millis(200),
         ttl_minutes: 0,
         schema: SinkSchema::V3,
     })
+    .await?;
+    // Keep the three one-row inserts as separate parts long enough to assert
+    // both the physical retry diagnostic and the FINAL read model.
+    query(
+        &http,
+        &format!("SYSTEM STOP MERGES {CH_DATABASE}.{CH_V3_TABLE}"),
+    )
     .await?;
 
     let trade = Event::LastTradePrice {
@@ -309,6 +328,36 @@ async fn v3_sink_deduplicates_only_transport_retries() -> Result<()> {
     .await?;
     assert_eq!(final_count.trim(), "2");
 
+    let canonical_count = query(
+        &http,
+        &format!("SELECT count() FROM {CH_DATABASE}.{CH_V3_TABLE}_final FORMAT TabSeparated"),
+    )
+    .await?;
+    assert_eq!(canonical_count.trim(), "2");
+
+    let health = query(
+        &http,
+        &format!(
+            "SELECT physical_rows, logical_rows, transport_retry_rows, \
+                    publisher_generations, collector_sessions \
+             FROM {CH_DATABASE}.{CH_V3_TABLE}_ingestion_health \
+             FORMAT TabSeparated"
+        ),
+    )
+    .await?;
+    assert_eq!(health.trim(), "3\t2\t1\t1\t1");
+
+    let sessions = query(
+        &http,
+        &format!(
+            "SELECT publisher_fence, messages, rows \
+             FROM {CH_DATABASE}.{CH_V3_TABLE}_publisher_sessions \
+             FORMAT TabSeparated"
+        ),
+    )
+    .await?;
+    assert_eq!(sessions.trim(), "7\t2\t2");
+
     let rows = query(
         &http,
         &format!(
@@ -339,6 +388,11 @@ async fn v3_sink_deduplicates_only_transport_retries() -> Result<()> {
     );
     assert!(ddl.contains("DateTime64(9, 'UTC')"), "DDL: {ddl}");
 
-    query(&http, &format!("DROP TABLE {CH_DATABASE}.{CH_V3_TABLE}")).await?;
+    query(
+        &http,
+        &format!("SYSTEM START MERGES {CH_DATABASE}.{CH_V3_TABLE}"),
+    )
+    .await?;
+    drop_v3_objects(&http).await?;
     Ok(())
 }

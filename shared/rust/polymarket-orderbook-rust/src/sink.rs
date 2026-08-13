@@ -544,6 +544,7 @@ impl Sink {
             ))
             .await
             .context("ensure v3 publisher fence column")?;
+            self.ensure_v3_views().await?;
         }
         info!(
             table = %self.cfg.table,
@@ -555,10 +556,82 @@ impl Sink {
     }
 
     async fn drop_table(&self) -> Result<()> {
+        if self.cfg.schema == SinkSchema::V3 {
+            for view in self.v3_view_names() {
+                self.exec(&format!("DROP VIEW IF EXISTS {view}"))
+                    .await
+                    .with_context(|| format!("drop v3 view {view}"))?;
+            }
+        }
         let sql = format!("DROP TABLE IF EXISTS {}", self.cfg.table);
         self.exec(&sql).await.context("drop table")?;
         info!(table = %self.cfg.table, "dropped table");
         Ok(())
+    }
+
+    async fn ensure_v3_views(&self) -> Result<()> {
+        let [canonical_view, health_view, sessions_view] = self.v3_view_names();
+
+        self.exec(&format!(
+            "CREATE OR REPLACE VIEW {canonical_view} AS \
+             SELECT * FROM {} FINAL",
+            self.cfg.table,
+        ))
+        .await
+        .with_context(|| format!("ensure canonical v3 view {canonical_view}"))?;
+
+        // This view deliberately reads the physical table without FINAL. A
+        // positive difference catches retries still present in separate parts;
+        // background merges eventually collapse them, so the sink's insert
+        // failure warnings remain the durable operational signal.
+        self.exec(&format!(
+            "CREATE OR REPLACE VIEW {health_view} AS \
+             SELECT \
+                 toStartOfHour(timestamp_received) AS receive_hour, \
+                 count() AS physical_rows, \
+                 uniqExact(tuple( \
+                     market, asset_id, collector_session_id, \
+                     message_id, row_index, receive_sequence \
+                 )) AS logical_rows, \
+                 physical_rows - logical_rows AS transport_retry_rows, \
+                 uniqExact(publisher_fence) AS publisher_generations, \
+                 uniqExact(collector_session_id) AS collector_sessions \
+             FROM {} \
+             GROUP BY receive_hour",
+            self.cfg.table,
+        ))
+        .await
+        .with_context(|| format!("ensure v3 ingestion-health view {health_view}"))?;
+
+        self.exec(&format!(
+            "CREATE OR REPLACE VIEW {sessions_view} AS \
+             SELECT \
+                 publisher_fence, \
+                 collector_session_id, \
+                 min(timestamp_received) AS first_received, \
+                 max(timestamp_received) AS last_received, \
+                 uniqExact(message_id) AS messages, \
+                 count() AS rows \
+             FROM {} FINAL \
+             GROUP BY publisher_fence, collector_session_id",
+            self.cfg.table,
+        ))
+        .await
+        .with_context(|| format!("ensure v3 publisher-sessions view {sessions_view}"))?;
+
+        info!(
+            canonical_view,
+            health_view, sessions_view, "ensured canonical and diagnostic v3 views",
+        );
+        Ok(())
+    }
+
+    fn v3_view_names(&self) -> [String; 3] {
+        [
+            format!("{}_final", self.cfg.table),
+            format!("{}_ingestion_health", self.cfg.table),
+            format!("{}_publisher_sessions", self.cfg.table),
+        ]
     }
 
     /// Execute a statement against the configured database.
