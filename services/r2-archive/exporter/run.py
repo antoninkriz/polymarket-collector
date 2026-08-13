@@ -2,7 +2,7 @@
 
 Each query applies ``FINAL`` to collapse collector-owned retries, projects one
 event type into its own schema, and orders rows by the shared collector
-sequence. PyArrow writes ZSTD level 1 with delta encoding on integer columns.
+sequence. PyArrow writes ZSTD level 9 with delta encoding on integer columns.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ R2_BUCKET = os.environ.get("R2_BUCKET", "")
 
 # Export format
 PARQUET_COMPRESSION = "zstd"
-PARQUET_COMPRESSION_LEVEL = 1
+PARQUET_COMPRESSION_LEVEL = 9
 DELTA_ENCODED_COLUMNS = (
     "timestamp",
     "timestamp_received",
@@ -340,7 +340,7 @@ def fetch_event_table(hour: datetime, event_type: str) -> pa.Table:
 
 
 def table_to_parquet(table: pa.Table) -> bytes:
-    """Encode a typed event table as ZSTD level 1 Parquet."""
+    """Encode a typed event table as ZSTD level 9 Parquet."""
     fields = [
         pa.field(
             field.name,

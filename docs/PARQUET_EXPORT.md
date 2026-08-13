@@ -26,7 +26,7 @@ filename is the event type, so Parquet files do not contain an `event_type`
 column. Every file is present even when it has zero rows. Treat the hour as
 complete only when `manifest.json` exists.
 
-Parquet files use ZSTD level 1 and are sorted by `sequence` ascending. To
+Parquet files use ZSTD level 9 and are sorted by `sequence` ascending. To
 recreate the complete observed stream, k-way merge the seven files on
 `sequence`.
 

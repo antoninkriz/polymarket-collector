@@ -103,7 +103,7 @@ acknowledges and removes a Redis Stream entry only after ClickHouse commits it.
 
 ## Parquet export
 
-The exporter reads the raw table with `FINAL` and writes one ZSTD level 1
+The exporter reads the raw table with `FINAL` and writes one ZSTD level 9
 Parquet file per event type and UTC receive-time hour:
 
 ```text
