@@ -399,7 +399,7 @@ impl Sink {
             SinkSchema::V3 => format!(
                 "INSERT INTO {} (\
                     schema_version, timestamp_received, timestamp, timestamp_raw, \
-                    collector_session_id, collector_session_started_at, \
+                    collector_session_id, collector_session_started_at, publisher_fence, \
                     connection_id, connection_epoch, frame_sequence, receive_sequence, \
                     message_id, message_index, message_count, row_index, row_count, \
                     transport_id, market, event_type, asset_id, hash, raw_message, \
@@ -494,6 +494,7 @@ impl Sink {
                     timestamp_raw                  String CODEC(ZSTD(3)),
                     collector_session_id           UUID CODEC(ZSTD(3)),
                     collector_session_started_at   DateTime64(9, 'UTC') CODEC(Delta, ZSTD(3)),
+                    publisher_fence                UInt64 CODEC(Delta, ZSTD(3)),
                     connection_id                  UInt32 CODEC(Delta, ZSTD(3)),
                     connection_epoch               UInt64 CODEC(Delta, ZSTD(3)),
                     frame_sequence                 UInt64 CODEC(Delta, ZSTD(3)),
@@ -531,6 +532,19 @@ impl Sink {
             ),
         };
         self.exec(&sql).await.context("ensure table")?;
+        if self.cfg.schema == SinkSchema::V3 {
+            // Keep an already-created v3 table forward-compatible while this
+            // branch is rolled out incrementally. Historical rows receive the
+            // neutral fence value 0.
+            self.exec(&format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS \
+                 publisher_fence UInt64 DEFAULT 0 CODEC(Delta, ZSTD(3)) \
+                 AFTER collector_session_started_at",
+                self.cfg.table,
+            ))
+            .await
+            .context("ensure v3 publisher fence column")?;
+        }
         info!(
             table = %self.cfg.table,
             schema = self.cfg.schema.label(),
@@ -723,6 +737,7 @@ fn v3_row_value(item: &SinkItem, timestamp_ms: i64) -> serde_json::Value {
         "timestamp_raw": event.timestamp(),
         "collector_session_id": record.collector_session_id.to_string(),
         "collector_session_started_at": record.collector_session_started_at_ns,
+        "publisher_fence": record.publisher_fence,
         "connection_id": record.connection_id,
         "connection_epoch": record.connection_epoch,
         "frame_sequence": record.frame_sequence,
@@ -965,7 +980,7 @@ mod tests {
     }
 
     fn v3_item(event: Event, row_index: u32, row_count: u32) -> SinkItem {
-        let collector = CollectorContext::new();
+        let collector = CollectorContext::with_publisher_fence(42);
         SinkItem {
             record: collector
                 .next_message(4, 2, 9, 0, 1, 1_757_908_892_351_123_456)
@@ -1165,6 +1180,7 @@ mod tests {
         let row: serde_json::Value =
             serde_json::from_slice(body.strip_suffix(b"\n").unwrap()).unwrap();
         assert_eq!(row["schema_version"], 3);
+        assert_eq!(row["publisher_fence"], 42);
         assert_eq!(row["timestamp_received"], 1_757_908_892_351_123_456_i64);
         assert_eq!(row["connection_epoch"], 2);
         assert_eq!(row["frame_sequence"], 9);

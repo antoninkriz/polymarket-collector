@@ -3,7 +3,7 @@ name = "polymarket-orderbook-rust-pubsub"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Polymarket orderbook → Redis pub/sub publisher"
+description = "Polymarket orderbook → fenced Redis Stream publisher"
 
 [[bin]]
 name = "polymarket-orderbook-rust-pubsub"
@@ -22,6 +22,7 @@ dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 opt-level = 3

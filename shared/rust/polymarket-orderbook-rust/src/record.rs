@@ -26,14 +26,21 @@ pub const SCHEMA_VERSION: u8 = 3;
 pub struct CollectorContext {
     session_id: Uuid,
     session_started_at_ns: i64,
+    publisher_fence: u64,
     next_receive_sequence: AtomicU64,
 }
 
 impl CollectorContext {
     pub fn new() -> Self {
+        Self::with_publisher_fence(0)
+    }
+
+    /// Create a collector bound to an externally acquired publisher fence.
+    pub fn with_publisher_fence(publisher_fence: u64) -> Self {
         Self {
             session_id: Uuid::new_v4(),
             session_started_at_ns: now_ns(),
+            publisher_fence,
             next_receive_sequence: AtomicU64::new(0),
         }
     }
@@ -51,6 +58,7 @@ impl CollectorContext {
         MessageContext {
             collector_session_id: self.session_id,
             collector_session_started_at_ns: self.session_started_at_ns,
+            publisher_fence: self.publisher_fence,
             connection_id,
             connection_epoch,
             frame_sequence,
@@ -74,6 +82,7 @@ impl Default for CollectorContext {
 pub struct MessageContext {
     collector_session_id: Uuid,
     collector_session_started_at_ns: i64,
+    publisher_fence: u64,
     connection_id: u32,
     connection_epoch: u64,
     frame_sequence: u64,
@@ -96,6 +105,7 @@ impl MessageContext {
             schema_version: SCHEMA_VERSION,
             collector_session_id: self.collector_session_id,
             collector_session_started_at_ns: self.collector_session_started_at_ns,
+            publisher_fence: self.publisher_fence,
             connection_id: self.connection_id,
             connection_epoch: self.connection_epoch,
             frame_sequence: self.frame_sequence,
@@ -118,6 +128,8 @@ pub struct EventRecord {
     pub schema_version: u8,
     pub collector_session_id: Uuid,
     pub collector_session_started_at_ns: i64,
+    /// Monotonic Redis-issued generation of the authoritative publisher.
+    pub publisher_fence: u64,
     pub connection_id: u32,
     pub connection_epoch: u64,
     pub frame_sequence: u64,
@@ -151,6 +163,7 @@ impl EventRecord {
             schema_version: SCHEMA_VERSION,
             collector_session_id: Uuid::nil(),
             collector_session_started_at_ns: 0,
+            publisher_fence: 0,
             connection_id: 0,
             connection_epoch: 0,
             frame_sequence: 0,

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use redis::aio::ConnectionManager;
+use redis::Script;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
@@ -18,9 +19,21 @@ use polymarket_orderbook_rust::record::EventRecord;
 pub struct PubSubSinkConfig {
     pub redis_url: String,
     pub stream: String,
+    pub publisher_lease_key: String,
+    pub publisher_lease_token: String,
     pub batch_max: usize,
     pub linger: Duration,
 }
+
+const FENCED_APPEND_SCRIPT: &str = r#"
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+    return redis.error_reply('PUBLISHER_LEASE_LOST')
+end
+for i = 2, #ARGV do
+    redis.call('XADD', KEYS[2], '*', 'payload', ARGV[i])
+end
+return #ARGV - 1
+"#;
 
 pub struct PubSubSink {
     cfg: PubSubSinkConfig,
@@ -104,18 +117,27 @@ impl PubSubSink {
 
         let mut retry_delay = Duration::from_millis(250);
         loop {
-            let mut pipe = redis::pipe();
+            let script = Script::new(FENCED_APPEND_SCRIPT);
+            let mut invocation = script.prepare_invoke();
+            invocation
+                .key(&self.cfg.publisher_lease_key)
+                .key(&self.cfg.stream)
+                .arg(&self.cfg.publisher_lease_token);
             for payload in &payloads {
-                pipe.cmd("XADD")
-                    .arg(&self.cfg.stream)
-                    .arg("*")
-                    .arg("payload")
-                    .arg(payload)
-                    .ignore();
+                invocation.arg(payload);
             }
-            let result: redis::RedisResult<()> = pipe.query_async(&mut self.conn).await;
+            let result: redis::RedisResult<u64> = invocation.invoke_async(&mut self.conn).await;
             match result {
-                Ok(()) => break,
+                Ok(appended) => {
+                    anyhow::ensure!(
+                        appended == batch_size as u64,
+                        "Redis appended {appended} of {batch_size} fenced records",
+                    );
+                    break;
+                }
+                Err(error) if error.to_string().contains("PUBLISHER_LEASE_LOST") => {
+                    anyhow::bail!("authoritative publisher lease was lost");
+                }
                 Err(error) => {
                     error!(
                         %error,

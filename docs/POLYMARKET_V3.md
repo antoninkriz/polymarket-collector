@@ -24,12 +24,19 @@ WebSocket connection. This preserves a parent `price_change` message containing
 updates for both assets and avoids an impossible merge of redundant socket
 deliveries.
 
+Before opening sockets, the collector acquires a renewable Redis lease and a
+monotonic fencing generation. A second collector refuses to start while that
+lease is held. Every event-stream append verifies the opaque lease token in the
+same Redis Lua operation as `XADD`, so a paused process cannot resume publishing
+after its lease expires and another generation takes over.
+
 The collector attaches these fields at the receive boundary:
 
 | Field | Meaning |
 |---|---|
 | `collector_session_id` | UUID created once per collector process. |
 | `collector_session_started_at` | UTC process-session start time, nanosecond precision. |
+| `publisher_fence` | Monotonic Redis-issued generation of the authoritative publisher. |
 | `connection_id` | Stable socket-task identity within the collector session. |
 | `connection_epoch` | Increments every time that socket reconnects. |
 | `frame_sequence` | Monotonic text-frame order for that socket task, across reconnects. |

@@ -21,6 +21,10 @@ pub struct Config {
     pub redis_event_stream: String,
     pub publish_batch_max: usize,
     pub publish_linger: Duration,
+    pub publisher_lease_key: String,
+    pub publisher_lease_generation_key: String,
+    pub publisher_lease_ttl: Duration,
+    pub publisher_lease_renew_interval: Duration,
 
     // -- Active markets pre-load --------------------------------------------
     pub skip_active_markets_cache: bool,
@@ -32,6 +36,20 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        let publisher_lease_ttl =
+            Duration::from_millis(env_parse("PUBLISHER_LEASE_TTL_MS", 15_000_u64)?);
+        let publisher_lease_renew_interval =
+            Duration::from_millis(env_parse("PUBLISHER_LEASE_RENEW_MS", 5_000_u64)?);
+        anyhow::ensure!(
+            !publisher_lease_ttl.is_zero(),
+            "PUBLISHER_LEASE_TTL_MS must be positive",
+        );
+        anyhow::ensure!(
+            !publisher_lease_renew_interval.is_zero()
+                && publisher_lease_renew_interval < publisher_lease_ttl,
+            "PUBLISHER_LEASE_RENEW_MS must be positive and less than PUBLISHER_LEASE_TTL_MS",
+        );
+
         Ok(Self {
             redis_url: require_env("REDIS_URL")?,
             redis_stream_market_events: env_or(
@@ -52,6 +70,13 @@ impl Config {
             redis_event_stream: env_or("REDIS_EVENT_STREAM", "polymarket:events:v3"),
             publish_batch_max: env_parse("MAX_BATCH", 200_usize)?,
             publish_linger: Duration::from_millis(env_parse("LINGER_MS", 2_u64)?),
+            publisher_lease_key: env_or("PUBLISHER_LEASE_KEY", "polymarket:publisher:v3:lease"),
+            publisher_lease_generation_key: env_or(
+                "PUBLISHER_LEASE_GENERATION_KEY",
+                "polymarket:publisher:v3:generation",
+            ),
+            publisher_lease_ttl,
+            publisher_lease_renew_interval,
 
             skip_active_markets_cache: env_bool("SKIP_ACTIVE_MARKETS_CACHE"),
 
@@ -113,6 +138,10 @@ mod tests {
         "MAX_ASSETS_PER_CONN",
         "MAX_BATCH",
         "LINGER_MS",
+        "PUBLISHER_LEASE_KEY",
+        "PUBLISHER_LEASE_GENERATION_KEY",
+        "PUBLISHER_LEASE_TTL_MS",
+        "PUBLISHER_LEASE_RENEW_MS",
     ];
 
     fn snapshot_env() -> Vec<(String, Option<String>)> {
@@ -178,6 +207,13 @@ mod tests {
         assert_eq!(cfg.max_assets_per_conn, 200);
         assert_eq!(cfg.publish_batch_max, 200);
         assert_eq!(cfg.publish_linger, Duration::from_millis(2));
+        assert_eq!(cfg.publisher_lease_key, "polymarket:publisher:v3:lease");
+        assert_eq!(
+            cfg.publisher_lease_generation_key,
+            "polymarket:publisher:v3:generation",
+        );
+        assert_eq!(cfg.publisher_lease_ttl, Duration::from_secs(15));
+        assert_eq!(cfg.publisher_lease_renew_interval, Duration::from_secs(5),);
 
         restore_env(snap);
     }
@@ -192,6 +228,10 @@ mod tests {
         std::env::set_var("MAX_ASSETS_PER_CONN", "100");
         std::env::set_var("ORDERBOOK_CONSUMER_GROUP", "g1");
         std::env::set_var("ORDERBOOK_CONSUMER_NAME", "c1");
+        std::env::set_var("PUBLISHER_LEASE_KEY", "custom:lease");
+        std::env::set_var("PUBLISHER_LEASE_GENERATION_KEY", "custom:generation");
+        std::env::set_var("PUBLISHER_LEASE_TTL_MS", "9000");
+        std::env::set_var("PUBLISHER_LEASE_RENEW_MS", "2000");
 
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.redis_url, "redis://r:6379");
@@ -199,6 +239,10 @@ mod tests {
         assert_eq!(cfg.max_assets_per_conn, 100);
         assert_eq!(cfg.stream_consumer_group, "g1");
         assert_eq!(cfg.stream_consumer_name, "c1");
+        assert_eq!(cfg.publisher_lease_key, "custom:lease");
+        assert_eq!(cfg.publisher_lease_generation_key, "custom:generation");
+        assert_eq!(cfg.publisher_lease_ttl, Duration::from_secs(9));
+        assert_eq!(cfg.publisher_lease_renew_interval, Duration::from_secs(2),);
 
         restore_env(snap);
     }

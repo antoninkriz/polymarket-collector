@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -30,6 +30,7 @@ use polymarket_orderbook_rust::record::EventRecord;
 use polymarket_orderbook_rust::ws::pool::Pool;
 
 use polymarket_orderbook_rust_pubsub::config::Config;
+use polymarket_orderbook_rust_pubsub::lease::{PublisherLease, PublisherLeaseConfig};
 use polymarket_orderbook_rust_pubsub::pubsub_sink::{PubSubSink, PubSubSinkConfig};
 
 #[derive(Debug, Parser)]
@@ -51,6 +52,16 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     let cfg = Config::from_env().context("load config from env")?;
+    let mut publisher_lease = PublisherLease::acquire(PublisherLeaseConfig {
+        redis_url: cfg.redis_url.clone(),
+        lease_key: cfg.publisher_lease_key.clone(),
+        generation_key: cfg.publisher_lease_generation_key.clone(),
+        ttl: cfg.publisher_lease_ttl,
+        renew_interval: cfg.publisher_lease_renew_interval,
+    })
+    .await
+    .context("acquire authoritative publisher lease")?;
+    let publisher_fence = publisher_lease.generation();
     info!(
         new_only = cli.new_only,
         skip_backlog = cli.skip_backlog,
@@ -60,12 +71,26 @@ async fn main() -> Result<()> {
         queue_size = cfg.queue_size,
         publish_batch_max = cfg.publish_batch_max,
         publish_linger_ms = cfg.publish_linger.as_millis() as u64,
+        publisher_fence,
         "starting polymarket-orderbook-rust-pubsub",
     );
+
+    let (lease_shutdown_tx, lease_shutdown_rx) = watch::channel(false);
+    let (lease_failure_tx, mut lease_failure_rx) = mpsc::channel::<String>(1);
+    let renewal_lease = publisher_lease.clone();
+    let lease_handle = tokio::spawn(async move {
+        let result = renewal_lease.renew_until_shutdown(lease_shutdown_rx).await;
+        if let Err(error) = &result {
+            let _ = lease_failure_tx.send(error.to_string()).await;
+        }
+        result
+    });
 
     let sink = PubSubSink::connect(PubSubSinkConfig {
         redis_url: cfg.redis_url.clone(),
         stream: cfg.redis_event_stream.clone(),
+        publisher_lease_key: publisher_lease.key().to_string(),
+        publisher_lease_token: publisher_lease.token().to_string(),
         batch_max: cfg.publish_batch_max,
         linger: cfg.publish_linger,
     })
@@ -73,11 +98,12 @@ async fn main() -> Result<()> {
     .context("connect Redis stream sink")?;
 
     let (event_tx, event_rx) = mpsc::channel::<EventRecord>(cfg.queue_size);
-    let sink_handle: JoinHandle<Result<()>> = tokio::spawn(sink.run(event_rx));
+    let mut sink_handle: JoinHandle<Result<()>> = tokio::spawn(sink.run(event_rx));
 
-    let pool = Arc::new(Mutex::new(Pool::new(
+    let pool = Arc::new(Mutex::new(Pool::new_with_publisher_fence(
         cfg.max_assets_per_conn,
         event_tx.clone(),
+        publisher_fence,
     )));
 
     if !cli.new_only {
@@ -118,8 +144,17 @@ async fn main() -> Result<()> {
         .await;
     });
 
-    wait_for_shutdown().await;
-    info!("shutdown signal received");
+    let mut sink_outcome = None;
+    tokio::select! {
+        _ = wait_for_shutdown() => info!("shutdown signal received"),
+        lease_error = lease_failure_rx.recv() => {
+            warn!(error = lease_error.unwrap_or_else(|| "lease monitor stopped".into()), "publisher lease failed; stopping collector");
+        }
+        outcome = &mut sink_handle => {
+            warn!(?outcome, "Redis event sink stopped; stopping collector");
+            sink_outcome = Some(outcome);
+        }
+    }
 
     stream_handle.abort();
     let _ = stream_handle.await;
@@ -144,10 +179,29 @@ async fn main() -> Result<()> {
     pool.shutdown().await.context("pool shutdown")?;
     info!("pool shut down");
 
-    match sink_handle.await {
+    let sink_outcome = match sink_outcome {
+        Some(outcome) => outcome,
+        None => sink_handle.await,
+    };
+    match sink_outcome {
         Ok(Ok(())) => info!("sink shut down cleanly"),
         Ok(Err(e)) => warn!(error = %e, "sink ended with error"),
         Err(e) => warn!(error = %e, "sink task panicked"),
+    }
+
+    let _ = lease_shutdown_tx.send(true);
+    match lease_handle.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(%error, "publisher lease renewal stopped with error"),
+        Err(error) => warn!(%error, "publisher lease renewal task failed"),
+    }
+    match publisher_lease.release().await {
+        Ok(true) => info!(publisher_fence, "released authoritative publisher lease"),
+        Ok(false) => warn!(
+            publisher_fence,
+            "publisher lease was no longer owned at shutdown"
+        ),
+        Err(error) => warn!(%error, publisher_fence, "failed to release publisher lease"),
     }
 
     info!("shutdown complete");

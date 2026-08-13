@@ -181,6 +181,7 @@ PROFILES: dict[str, Profile] = {
             "timestamp",
             "timestamp_received",
             "collector_session_started_at",
+            "publisher_fence",
             "connection_id",
             "connection_epoch",
             "frame_sequence",

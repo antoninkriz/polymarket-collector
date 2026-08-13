@@ -70,6 +70,12 @@ services:
       REDIS_KEY_ACTIVE_MARKETS_COUNT: polymarket:active_markets:count
       # Durable event log consumed and acknowledged by the ClickHouse writer.
       REDIS_EVENT_STREAM: polymarket:events:v3
+      # Exactly one authoritative publisher may hold this renewable lease.
+      # Every stream append is atomically fenced by the current lease token.
+      PUBLISHER_LEASE_KEY: polymarket:publisher:v3:lease
+      PUBLISHER_LEASE_GENERATION_KEY: polymarket:publisher:v3:generation
+      PUBLISHER_LEASE_TTL_MS: "15000"
+      PUBLISHER_LEASE_RENEW_MS: "5000"
       # WS pool
       SKIP_ACTIVE_MARKETS_CACHE: "false"
       QUEUE_SIZE: "5000000"

@@ -74,7 +74,15 @@ pub struct Pool {
 
 impl Pool {
     pub fn new(max_assets_per_conn: usize, event_tx: mpsc::Sender<EventRecord>) -> Self {
-        let collector = Arc::new(CollectorContext::new());
+        Self::new_with_publisher_fence(max_assets_per_conn, event_tx, 0)
+    }
+
+    pub fn new_with_publisher_fence(
+        max_assets_per_conn: usize,
+        event_tx: mpsc::Sender<EventRecord>,
+        publisher_fence: u64,
+    ) -> Self {
+        let collector = Arc::new(CollectorContext::with_publisher_fence(publisher_fence));
         let health_counters = Arc::new(HealthCounters::default());
         let (status_event_tx, status_event_rx) = mpsc::unbounded_channel();
         let (asset_conns_tx, asset_conns_rx) = watch::channel(HashMap::new());

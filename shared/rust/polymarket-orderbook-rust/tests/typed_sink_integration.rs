@@ -269,7 +269,7 @@ async fn v3_sink_deduplicates_only_transport_retries() -> Result<()> {
         fee_rate_bps: "10".into(),
         transaction_hash: "0xsame-transaction".into(),
     };
-    let collector = CollectorContext::new();
+    let collector = CollectorContext::with_publisher_fence(7);
     let first = collector
         .next_message(4, 1, 10, 0, 1, 1_757_908_892_351_123_456)
         .record(
@@ -312,7 +312,7 @@ async fn v3_sink_deduplicates_only_transport_retries() -> Result<()> {
     let rows = query(
         &http,
         &format!(
-            "SELECT receive_sequence, toUnixTimestamp64Nano(timestamp_received), transaction_hash \
+            "SELECT publisher_fence, receive_sequence, toUnixTimestamp64Nano(timestamp_received), transaction_hash \
              FROM {CH_DATABASE}.{CH_V3_TABLE} FINAL \
              ORDER BY receive_sequence FORMAT TabSeparated"
         ),
@@ -320,8 +320,8 @@ async fn v3_sink_deduplicates_only_transport_retries() -> Result<()> {
     .await?;
     let rows: Vec<&str> = rows.lines().collect();
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], "0\t1757908892351123456\t0xsame-transaction");
-    assert_eq!(rows[1], "1\t1757908892351123457\t0xsame-transaction");
+    assert_eq!(rows[0], "7\t0\t1757908892351123456\t0xsame-transaction");
+    assert_eq!(rows[1], "7\t1\t1757908892351123457\t0xsame-transaction");
 
     let ddl = query(
         &http,

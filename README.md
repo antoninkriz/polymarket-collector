@@ -19,7 +19,8 @@ Polymarket WS ──▶ polymarket-orderbook-rust-pubsub ──▶ Redis Stream 
   maintains the Redis active-markets cache and lifecycle event stream.
 - `services/polymarket/polymarket-orderbook-rust-pubsub` — Rust; the only service
   holding Polymarket WS connections. Captures v3 receipt/order metadata and
-  appends all four event variants to a durable Redis Stream.
+  appends all four event variants to a durable Redis Stream. A renewable Redis
+  lease and fenced `XADD` enforce one authoritative publisher.
 - `services/polymarket/polymarket-orderbook-rust-from-pubsub` — Rust; consumes the
   stream and acknowledges rows only after the replayable v3 ClickHouse insert.
 - `services/r2-archive/exporter` — generic exporter, run with
