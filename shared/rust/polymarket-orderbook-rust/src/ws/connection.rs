@@ -497,7 +497,11 @@ fn handle_text(
         let mut staged: Vec<Event> = Vec::new();
         explode(msg, &mut staged);
         for ev in staged {
-            let asset_id = ev.asset_id();
+            let Some(asset_id) = ev.asset_id() else {
+                // Market-scoped lifecycle events are enabled and routed in a
+                // later layer; do not pretend they belong to one token.
+                continue;
+            };
             if !sub.desired.contains(asset_id) {
                 continue;
             }

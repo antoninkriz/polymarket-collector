@@ -8,6 +8,17 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+fn deserialize_decimal_string_option<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    Option::<String>::deserialize(deserializer)?
+        .map(|value| value.parse::<Decimal>().map_err(D::Error::custom))
+        .transpose()
+}
+
 // =====================================================================
 // Wire layer (deserialize-only)
 // =====================================================================
@@ -19,6 +30,9 @@ pub enum WireMessage {
     PriceChange(WirePriceChange),
     LastTradePrice(WireLastTradePrice),
     TickSizeChange(WireTickSizeChange),
+    BestBidAsk(WireBestBidAsk),
+    NewMarket(WireNewMarket),
+    MarketResolved(WireMarketResolved),
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,9 +67,9 @@ pub struct WirePriceChangeEntry {
     #[serde(with = "rust_decimal::serde::str")]
     pub size: Decimal,
     pub side: String,
-    #[serde(default, with = "rust_decimal::serde::str_option")]
+    #[serde(default, deserialize_with = "deserialize_decimal_string_option")]
     pub best_bid: Option<Decimal>,
-    #[serde(default, with = "rust_decimal::serde::str_option")]
+    #[serde(default, deserialize_with = "deserialize_decimal_string_option")]
     pub best_ask: Option<Decimal>,
 }
 
@@ -82,6 +96,47 @@ pub struct WireTickSizeChange {
     pub old_tick_size: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
     pub new_tick_size: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WireBestBidAsk {
+    pub market: String,
+    pub asset_id: String,
+    pub timestamp: String,
+    #[serde(default, deserialize_with = "deserialize_decimal_string_option")]
+    pub best_bid: Option<Decimal>,
+    #[serde(default, deserialize_with = "deserialize_decimal_string_option")]
+    pub best_ask: Option<Decimal>,
+    #[serde(default, deserialize_with = "deserialize_decimal_string_option")]
+    pub spread: Option<Decimal>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WireNewMarket {
+    pub id: String,
+    pub market: String,
+    pub timestamp: String,
+    #[serde(default)]
+    pub assets_ids: Vec<String>,
+    #[serde(default)]
+    pub outcomes: Vec<String>,
+    #[serde(default)]
+    pub question: Option<String>,
+    #[serde(default)]
+    pub slug: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WireMarketResolved {
+    pub id: String,
+    pub market: String,
+    pub timestamp: String,
+    #[serde(default)]
+    pub assets_ids: Vec<String>,
+    #[serde(default)]
+    pub winning_asset_id: Option<String>,
+    #[serde(default)]
+    pub winning_outcome: Option<String>,
 }
 
 // =====================================================================
@@ -185,15 +240,61 @@ pub enum Event {
         #[serde(with = "rust_decimal::serde::str")]
         new_tick_size: Decimal,
     },
+    BestBidAsk {
+        market: String,
+        asset_id: String,
+        timestamp: String,
+        #[serde(
+            skip_serializing_if = "Option::is_none",
+            with = "rust_decimal::serde::str_option"
+        )]
+        best_bid: Option<Decimal>,
+        #[serde(
+            skip_serializing_if = "Option::is_none",
+            with = "rust_decimal::serde::str_option"
+        )]
+        best_ask: Option<Decimal>,
+        #[serde(
+            skip_serializing_if = "Option::is_none",
+            with = "rust_decimal::serde::str_option"
+        )]
+        spread: Option<Decimal>,
+    },
+    NewMarket {
+        id: String,
+        market: String,
+        timestamp: String,
+        assets_ids: Vec<String>,
+        outcomes: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        question: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        slug: Option<String>,
+    },
+    MarketResolved {
+        id: String,
+        market: String,
+        timestamp: String,
+        assets_ids: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        winning_asset_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        winning_outcome: Option<String>,
+    },
 }
 
 impl Event {
-    pub fn asset_id(&self) -> &str {
+    /// Return the token ID for token-scoped events. Market lifecycle events
+    /// intentionally return `None`: exploding one lifecycle notification
+    /// into one row per token would fabricate duplicate events.
+    pub fn asset_id(&self) -> Option<&str> {
         match self {
             Event::Book { asset_id, .. }
             | Event::PriceChange { asset_id, .. }
             | Event::LastTradePrice { asset_id, .. }
-            | Event::TickSizeChange { asset_id, .. } => asset_id,
+            | Event::TickSizeChange { asset_id, .. }
+            | Event::BestBidAsk { asset_id, .. } => Some(asset_id),
+            Event::NewMarket { .. } | Event::MarketResolved { .. } => None,
         }
     }
 }
@@ -242,6 +343,31 @@ pub fn explode(msg: WireMessage, out: &mut Vec<Event>) {
             timestamp: c.timestamp,
             old_tick_size: c.old_tick_size,
             new_tick_size: c.new_tick_size,
+        }),
+        WireMessage::BestBidAsk(b) => out.push(Event::BestBidAsk {
+            market: b.market,
+            asset_id: b.asset_id,
+            timestamp: b.timestamp,
+            best_bid: b.best_bid,
+            best_ask: b.best_ask,
+            spread: b.spread,
+        }),
+        WireMessage::NewMarket(m) => out.push(Event::NewMarket {
+            id: m.id,
+            market: m.market,
+            timestamp: m.timestamp,
+            assets_ids: m.assets_ids,
+            outcomes: m.outcomes,
+            question: m.question,
+            slug: m.slug,
+        }),
+        WireMessage::MarketResolved(m) => out.push(Event::MarketResolved {
+            id: m.id,
+            market: m.market,
+            timestamp: m.timestamp,
+            assets_ids: m.assets_ids,
+            winning_asset_id: m.winning_asset_id,
+            winning_outcome: m.winning_outcome,
         }),
     }
 }
@@ -380,6 +506,66 @@ mod tests {
         };
         assert_eq!(c.old_tick_size, dec("0.01"));
         assert_eq!(c.new_tick_size, dec("0.001"));
+    }
+
+    #[test]
+    fn parse_wire_best_bid_ask_with_empty_side() {
+        let raw = r#"{
+            "event_type": "best_bid_ask",
+            "asset_id": "a1",
+            "market": "0xm",
+            "best_bid": "0.41",
+            "best_ask": null,
+            "spread": null,
+            "timestamp": "1757908892351"
+        }"#;
+        let msg: WireMessage = serde_json::from_str(raw).unwrap();
+        let WireMessage::BestBidAsk(b) = msg else {
+            panic!("expected best bid/ask")
+        };
+        assert_eq!(b.best_bid, Some(dec("0.41")));
+        assert_eq!(b.best_ask, None);
+        assert_eq!(b.spread, None);
+    }
+
+    #[test]
+    fn parse_wire_new_market() {
+        let raw = r#"{
+            "event_type": "new_market",
+            "id": "123456",
+            "question": "Will it rain?",
+            "market": "0xmarket",
+            "slug": "will-it-rain",
+            "assets_ids": ["yes", "no"],
+            "outcomes": ["Yes", "No"],
+            "timestamp": "1757908892351"
+        }"#;
+        let msg: WireMessage = serde_json::from_str(raw).unwrap();
+        let WireMessage::NewMarket(m) = msg else {
+            panic!("expected new market")
+        };
+        assert_eq!(m.id, "123456");
+        assert_eq!(m.assets_ids, ["yes", "no"]);
+        assert_eq!(m.outcomes, ["Yes", "No"]);
+    }
+
+    #[test]
+    fn parse_wire_market_resolved() {
+        let raw = r#"{
+            "event_type": "market_resolved",
+            "id": "123456",
+            "market": "0xmarket",
+            "assets_ids": ["yes", "no"],
+            "winning_asset_id": "yes",
+            "winning_outcome": "Yes",
+            "timestamp": "1757908892351"
+        }"#;
+        let msg: WireMessage = serde_json::from_str(raw).unwrap();
+        let WireMessage::MarketResolved(m) = msg else {
+            panic!("expected resolved market")
+        };
+        assert_eq!(m.winning_asset_id.as_deref(), Some("yes"));
+        assert_eq!(m.winning_outcome.as_deref(), Some("Yes"));
     }
 
     // ---- Explode --------------------------------------------------------
@@ -541,7 +727,20 @@ mod tests {
             old_tick_size: dec("0.01"),
             new_tick_size: dec("0.001"),
         };
-        assert_eq!(ev.asset_id(), "a");
+        assert_eq!(ev.asset_id(), Some("a"));
+    }
+
+    #[test]
+    fn lifecycle_event_has_no_synthetic_asset_id() {
+        let ev = Event::MarketResolved {
+            id: "123456".into(),
+            market: "m".into(),
+            timestamp: "1".into(),
+            assets_ids: vec!["yes".into(), "no".into()],
+            winning_asset_id: Some("yes".into()),
+            winning_outcome: Some("Yes".into()),
+        };
+        assert_eq!(ev.asset_id(), None);
     }
 
     #[test]
