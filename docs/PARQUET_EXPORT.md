@@ -49,6 +49,7 @@ Other types used below are:
 | `transaction_hash` | Raw 32 bytes decoded from the source `0x` hexadecimal transaction hash (`fixed_size_binary[32]`). |
 | price, best price, spread, or tick size | Arrow `decimal32(9, 4)`, stored as Parquet physical `INT32` with a decimal logical annotation. Read as an exact decimal, never as binary floating point. |
 | size | Arrow `decimal64(18, 6)`, stored as Parquet physical `INT64` with a decimal logical annotation. Read as an exact decimal. |
+| orderbook levels | `list<struct<price: decimal32(9, 4), size: decimal64(18, 6)>>`; the list, struct, and both values are non-null. |
 | string | Arrow UTF-8 string. |
 | list | Arrow list whose element type is shown in the file schema. |
 
@@ -72,19 +73,20 @@ Columns after the common prefix:
 | Column | Arrow type | Nullable | Meaning |
 |---|---|---:|---|
 | `asset_id` | `fixed_size_binary[32]` | no | Outcome token whose orderbook is represented. |
-| `bids` | `string` | no | Compact JSON array of aggregated bid levels. |
-| `asks` | `string` | no | Compact JSON array of aggregated ask levels. |
+| `bids` | `list<struct<price: decimal32(9, 4), size: decimal64(18, 6)>>` | no | Aggregated bid levels in source order. |
+| `asks` | `list<struct<price: decimal32(9, 4), size: decimal64(18, 6)>>` | no | Aggregated ask levels in source order. |
 
-`bids` and `asks` are JSON strings, not Arrow list columns. Each contains
-two-string level arrays in source order:
+An orderbook level is the Arrow/Parquet equivalent of a typed tuple
+`(price, size)`. Arrow names the tuple members `price` and `size`, so readers
+typically expose one level like this:
 
 ```json
-[["0.48","30"],["0.49","20"]]
+{"price":0.4800,"size":30.000000}
 ```
 
-Each level is `[price, size]`; both values remain decimal strings inside the
-JSON. Empty sides are encoded as `[]`. The upstream book-content `hash` is not
-exported because it is neither a unique event ID nor needed for reconstruction.
+The values are exact decimals, not JSON strings or floating-point numbers.
+Empty sides are empty lists. The upstream book-content `hash` is not exported
+because it is neither a unique event ID nor needed for reconstruction.
 
 ## `price_change.parquet`
 

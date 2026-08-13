@@ -49,7 +49,16 @@ DELTA_ENCODED_COLUMNS = (
     "sequence",
     "fee_rate_bps",
 )
-PARQUET_DECIMAL_TYPES: dict[str, pa.DataType] = {
+ORDER_LEVEL_TYPE = pa.struct(
+    [
+        pa.field("price", pa.decimal32(9, 4), nullable=False),
+        pa.field("size", pa.decimal64(18, 6), nullable=False),
+    ]
+)
+ORDER_LEVELS_TYPE = pa.list_(pa.field("item", ORDER_LEVEL_TYPE, nullable=False))
+PARQUET_COLUMN_TYPES: dict[str, pa.DataType] = {
+    "bids": ORDER_LEVELS_TYPE,
+    "asks": ORDER_LEVELS_TYPE,
     "price": pa.decimal32(9, 4),
     "best_bid": pa.decimal32(9, 4),
     "best_ask": pa.decimal32(9, 4),
@@ -107,8 +116,8 @@ EVENT_PROJECTIONS: dict[str, EventProjection] = {
         aliases=(ASSET_ID_ALIAS,),
         columns=(
             ASSET_ID_COLUMN,
-            "JSONExtractRaw(data, 'bids') AS bids",
-            "JSONExtractRaw(data, 'asks') AS asks",
+            "JSONExtract(data, 'bids', 'Array(Tuple(price Decimal32(4), size Decimal64(6)))') AS bids",
+            "JSONExtract(data, 'asks', 'Array(Tuple(price Decimal32(4), size Decimal64(6)))') AS asks",
         ),
         validations=(ASSET_ID_VALIDATION,),
     ),
@@ -335,7 +344,7 @@ def table_to_parquet(table: pa.Table) -> bytes:
     fields = [
         pa.field(
             field.name,
-            PARQUET_DECIMAL_TYPES.get(field.name, field.type),
+            PARQUET_COLUMN_TYPES.get(field.name, field.type),
             nullable=field.nullable,
             metadata=field.metadata,
         )
@@ -343,9 +352,10 @@ def table_to_parquet(table: pa.Table) -> bytes:
     ]
     target_schema = pa.schema(fields, metadata=table.schema.metadata)
     if not table.schema.equals(target_schema):
-        # ClickHouse's Arrow stream exposes Decimal32/Decimal64 as decimal128.
-        # Narrow them losslessly before Parquet serialization so readers see
-        # the intended widths and Parquet can use physical INT32/INT64.
+        # ClickHouse's Arrow stream exposes Decimal32/Decimal64 as decimal128,
+        # including decimals nested in snapshot levels. Narrow them losslessly
+        # before Parquet serialization so readers see the intended widths and
+        # Parquet can use physical INT32/INT64.
         table = table.cast(target_schema, safe=True)
 
     delta_cols = [c for c in DELTA_ENCODED_COLUMNS if c in table.column_names]

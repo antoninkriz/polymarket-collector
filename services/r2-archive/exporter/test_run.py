@@ -46,6 +46,15 @@ class ExportPathsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             exporter.event_to_key(hour, "unknown")
 
+    def test_book_query_projects_typed_levels(self) -> None:
+        hour = datetime(2026, 8, 13, 4, tzinfo=timezone.utc)
+        query = exporter.build_event_query(hour, "book")
+
+        level_type = "Array(Tuple(price Decimal32(4), size Decimal64(6)))"
+        self.assertIn(f"JSONExtract(data, 'bids', '{level_type}') AS bids", query)
+        self.assertIn(f"JSONExtract(data, 'asks', '{level_type}') AS asks", query)
+        self.assertNotIn("JSONExtractRaw(data, 'bids')", query)
+
 
 class ParquetSchemaTest(unittest.TestCase):
     def test_decimals_are_narrow_and_integer_backed(self) -> None:
@@ -66,15 +75,53 @@ class ParquetSchemaTest(unittest.TestCase):
             for name in decimal32_columns
         ]
         fields.append(pa.field("size", pa.decimal128(18, 6), nullable=False))
+        source_level_type = pa.struct(
+            [
+                pa.field("price", pa.decimal128(9, 4), nullable=False),
+                pa.field("size", pa.decimal128(18, 6), nullable=False),
+            ]
+        )
+        source_levels_type = pa.list_(
+            pa.field("item", source_level_type, nullable=False)
+        )
+        fields.extend(
+            [
+                pa.field("bids", source_levels_type, nullable=False),
+                pa.field("asks", source_levels_type, nullable=False),
+            ]
+        )
         source_schema = pa.schema(fields)
         arrays = [
             pa.array(
                 [None if field.nullable else Decimal("0.1234")],
                 type=field.type,
             )
-            for field in fields[:-1]
+            for field in fields[: len(decimal32_columns)]
         ]
-        arrays.append(pa.array([Decimal("123.456789")], type=fields[-1].type))
+        arrays.extend(
+            [
+                pa.array(
+                    [Decimal("123.456789")],
+                    type=pa.decimal128(18, 6),
+                ),
+                pa.array(
+                    [
+                        [
+                            {
+                                "price": Decimal("0.4800"),
+                                "size": Decimal("30.000000"),
+                            },
+                            {
+                                "price": Decimal("0.4900"),
+                                "size": Decimal("20.125000"),
+                            },
+                        ]
+                    ],
+                    type=source_levels_type,
+                ),
+                pa.array([[]], type=source_levels_type),
+            ]
+        )
         source = pa.Table.from_arrays(arrays, schema=source_schema)
 
         data = exporter.table_to_parquet(source)
@@ -83,16 +130,27 @@ class ParquetSchemaTest(unittest.TestCase):
         for name in decimal32_columns:
             self.assertEqual(arrow_schema.field(name).type, pa.decimal32(9, 4))
         self.assertEqual(arrow_schema.field("size").type, pa.decimal64(18, 6))
+        self.assertEqual(arrow_schema.field("bids").type, exporter.ORDER_LEVELS_TYPE)
+        self.assertEqual(arrow_schema.field("asks").type, exporter.ORDER_LEVELS_TYPE)
 
         physical_types = {
             parquet_file.metadata.schema.column(
                 i
-            ).name: parquet_file.metadata.schema.column(i).physical_type
+            ).path: parquet_file.metadata.schema.column(i).physical_type
             for i in range(parquet_file.metadata.num_columns)
         }
         for name in decimal32_columns:
             self.assertEqual(physical_types[name], "INT32")
         self.assertEqual(physical_types["size"], "INT64")
+        for side in ("bids", "asks"):
+            self.assertEqual(
+                physical_types[f"{side}.list.element.price"],
+                "INT32",
+            )
+            self.assertEqual(
+                physical_types[f"{side}.list.element.size"],
+                "INT64",
+            )
 
         round_trip = parquet_file.read()
         self.assertEqual(round_trip.schema, arrow_schema)
@@ -101,6 +159,14 @@ class ParquetSchemaTest(unittest.TestCase):
             round_trip.column("size")[0].as_py(),
             Decimal("123.456789"),
         )
+        self.assertEqual(
+            round_trip.column("bids")[0].as_py(),
+            [
+                {"price": Decimal("0.4800"), "size": Decimal("30.000000")},
+                {"price": Decimal("0.4900"), "size": Decimal("20.125000")},
+            ],
+        )
+        self.assertEqual(round_trip.column("asks")[0].as_py(), [])
 
 
 class ExportHourTest(unittest.TestCase):
