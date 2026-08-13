@@ -30,6 +30,34 @@ Parquet files use ZSTD level 9 and are sorted by `sequence` ascending. To
 recreate the complete observed stream, k-way merge the seven files on
 `sequence`.
 
+## Parquet storage encodings
+
+The exporter writes Parquet data pages v2 with the following storage settings:
+
+| Columns or leaf values | Parquet physical type | Current value encoding |
+|---|---|---|
+| `timestamp_received`, `sequence`, `timestamp` | `INT64` | `DELTA_BINARY_PACKED` |
+| `fee_rate_bps` | `INT32` | `DELTA_BINARY_PACKED` |
+| Other top-level scalar columns | As specified by the file schema below | `RLE_DICTIONARY` requested; `PLAIN` fallback allowed |
+| `bids.list.element.price`, `asks.list.element.price` | `INT32` | `PLAIN` |
+| `bids.list.element.size`, `asks.list.element.size` | `INT64` | `PLAIN` |
+| Other nested list leaves, such as `assets_ids.list.element` and `outcomes.list.element` | As specified by the file schema below | `PLAIN` |
+
+Every column is compressed with ZSTD level 9. Decimal values use
+`store_decimal_as_integer`, which is why precision-nine decimals have physical
+type `INT32` and precision-18 decimals have physical type `INT64` instead of
+`FIXED_LEN_BYTE_ARRAY`.
+
+Dictionary encoding is a writer preference, not part of the logical file
+contract. PyArrow may fall back to `PLAIN` within a row group when a dictionary
+becomes too large. Parquet metadata can therefore list both `RLE_DICTIONARY`
+and `PLAIN` for a dictionary-enabled column because the dictionary page itself
+uses `PLAIN` and because value pages may fall back to it. `RLE` is also used for
+Parquet definition and repetition levels, including the structure of optional
+and nested values; it does not change the logical Arrow types described below.
+Readers should rely on those logical types and let their Parquet library decode
+the physical encodings.
+
 ## Type and identifier conventions
 
 All seven files begin with the same non-null columns, in this order:

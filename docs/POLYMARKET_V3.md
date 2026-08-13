@@ -123,8 +123,9 @@ The date is ISO ordered and the hour is always zero-padded from `00` through
 repeated as a Parquet column.
 
 The complete per-file data dictionary—including column order, Arrow types,
-nullability, identifier encoding, field semantics, and the manifest contract—is
-in [`PARQUET_EXPORT.md`](PARQUET_EXPORT.md).
+nullability, identifier encoding, Parquet value encodings, field semantics,
+and the manifest contract—is in
+[`PARQUET_EXPORT.md`](PARQUET_EXPORT.md).
 
 Every file has these non-null common columns:
 
