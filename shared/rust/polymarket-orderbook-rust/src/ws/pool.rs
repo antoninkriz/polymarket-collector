@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::events::Market;
+use crate::events::{Market, MarketLifecycle};
 use crate::record::{CollectorContext, EventRecord};
 use crate::ws::connection::{Command, ConnStatus, Connection};
 
@@ -59,6 +59,7 @@ pub struct Pool {
     /// Stable ID of the one socket allowed to emit connection-wide market
     /// lifecycle events. The leader remains alive even with no data assets.
     lifecycle_conn_id: Option<usize>,
+    lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycle>>,
     health_counters: Arc<HealthCounters>,
     monitor_join: Option<JoinHandle<()>>,
     status_event_tx: mpsc::UnboundedSender<(usize, ConnStatus)>,
@@ -74,6 +75,29 @@ impl Pool {
         max_assets_per_conn: usize,
         event_tx: mpsc::Sender<EventRecord>,
         publisher_generation: u64,
+    ) -> Self {
+        Self::build(max_assets_per_conn, event_tx, publisher_generation, None)
+    }
+
+    pub fn new_with_lifecycle(
+        max_assets_per_conn: usize,
+        event_tx: mpsc::Sender<EventRecord>,
+        publisher_generation: u64,
+        lifecycle_tx: mpsc::UnboundedSender<MarketLifecycle>,
+    ) -> Self {
+        Self::build(
+            max_assets_per_conn,
+            event_tx,
+            publisher_generation,
+            Some(lifecycle_tx),
+        )
+    }
+
+    fn build(
+        max_assets_per_conn: usize,
+        event_tx: mpsc::Sender<EventRecord>,
+        publisher_generation: u64,
+        lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycle>>,
     ) -> Self {
         let collector = Arc::new(CollectorContext::with_publisher_generation(
             publisher_generation,
@@ -98,6 +122,7 @@ impl Pool {
             asset_to_conn: HashMap::new(),
             next_conn_id: 0,
             lifecycle_conn_id: None,
+            lifecycle_tx,
             health_counters,
             monitor_join,
             status_event_tx,
@@ -372,6 +397,7 @@ impl Pool {
             Arc::clone(&self.collector),
             self.status_event_tx.clone(),
             lifecycle_leader,
+            self.lifecycle_tx.clone(),
         );
         let join = tokio::spawn(connection.run(cmd_rx));
         self.connections.push(ConnHandle {

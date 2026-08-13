@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use polymarket_orderbook_rust::events::Market;
+use polymarket_orderbook_rust::events::{Market, MarketLifecycle};
 use polymarket_orderbook_rust::markets;
 use polymarket_orderbook_rust::markets::stream::StreamConfig;
 use polymarket_orderbook_rust::record::EventRecord;
@@ -100,12 +100,19 @@ async fn main() -> Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<EventRecord>(cfg.queue_size);
     let mut sink_handle: JoinHandle<Result<()>> = tokio::spawn(sink.run(event_rx));
 
-    let pool = Arc::new(Mutex::new(Pool::new_with_publisher_generation(
+    let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+    let pool = Arc::new(Mutex::new(Pool::new_with_lifecycle(
         cfg.max_assets_per_conn,
         event_tx.clone(),
         publisher_fence,
+        lifecycle_tx,
     )));
     pool.lock().await.start().await;
+
+    let lifecycle_pool = Arc::clone(&pool);
+    let lifecycle_handle = tokio::spawn(async move {
+        run_websocket_lifecycle(lifecycle_rx, lifecycle_pool).await;
+    });
 
     if !cli.new_only {
         let markets = preload_markets(&cfg).await?;
@@ -160,6 +167,10 @@ async fn main() -> Result<()> {
     stream_handle.abort();
     let _ = stream_handle.await;
     info!("stream listener stopped");
+
+    lifecycle_handle.abort();
+    let _ = lifecycle_handle.await;
+    info!("WebSocket lifecycle listener stopped");
 
     stats_handle.abort();
     let _ = stats_handle.await;
@@ -250,6 +261,39 @@ async fn wait_for_shutdown() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+async fn run_websocket_lifecycle(
+    mut lifecycle_rx: mpsc::UnboundedReceiver<MarketLifecycle>,
+    pool: Arc<Mutex<Pool>>,
+) {
+    while let Some(update) = lifecycle_rx.recv().await {
+        let result = match update {
+            MarketLifecycle::NewMarket {
+                market,
+                assets_ids,
+                outcomes,
+            } => {
+                let Some(market) =
+                    markets::binary_market_from_outcomes(market, &outcomes, &assets_ids)
+                else {
+                    warn!(
+                        asset_count = assets_ids.len(),
+                        outcome_count = outcomes.len(),
+                        "ignoring non-binary WebSocket new_market"
+                    );
+                    continue;
+                };
+                pool.lock().await.subscribe_markets(vec![market]).await
+            }
+            MarketLifecycle::MarketResolved { market } => {
+                pool.lock().await.unsubscribe_markets(vec![market]).await
+            }
+        };
+        if let Err(error) = result {
+            warn!(%error, "failed to apply WebSocket market lifecycle update");
+        }
     }
 }
 

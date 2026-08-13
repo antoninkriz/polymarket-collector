@@ -48,7 +48,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
-use crate::events::{explode, Event, WireMessage};
+use crate::events::{explode, Event, MarketLifecycle, WireMessage};
 use crate::record::{now_ns, CollectorContext, EventRecord};
 use crate::ws::WS_MARKET_URL;
 
@@ -89,6 +89,7 @@ pub struct Connection {
     /// Lifecycle messages are broadcast to every custom-enabled socket. Only
     /// the pool's designated leader admits them to storage.
     pub lifecycle_leader: bool,
+    pub lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycle>>,
 }
 
 impl Connection {
@@ -98,6 +99,7 @@ impl Connection {
         collector: Arc<CollectorContext>,
         status_tx: mpsc::UnboundedSender<(usize, ConnStatus)>,
         lifecycle_leader: bool,
+        lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycle>>,
     ) -> Self {
         Self {
             index,
@@ -105,6 +107,7 @@ impl Connection {
             collector,
             status_tx,
             lifecycle_leader,
+            lifecycle_tx,
         }
     }
 
@@ -124,6 +127,7 @@ impl Connection {
             collector,
             status_tx,
             lifecycle_leader,
+            lifecycle_tx,
         } = self;
         let mut sub = SubState::default();
         let mut backoff = Duration::from_secs(1);
@@ -198,6 +202,7 @@ impl Connection {
                 event_tx: &event_tx,
                 collector: &collector,
                 lifecycle_leader,
+                lifecycle_tx: lifecycle_tx.as_ref(),
             };
             let outcome = run_session(
                 ws_stream,
@@ -278,6 +283,7 @@ struct SessionContext<'a> {
     event_tx: &'a mpsc::Sender<EventRecord>,
     collector: &'a CollectorContext,
     lifecycle_leader: bool,
+    lifecycle_tx: Option<&'a mpsc::UnboundedSender<MarketLifecycle>>,
 }
 
 /// Run a single connected WebSocket session: send the initial subscription,
@@ -505,7 +511,7 @@ fn handle_text(
         let mut staged: Vec<Event> = Vec::new();
         explode(msg, &mut staged);
         for ev in staged {
-            if let Some(asset_id) = ev.asset_id() {
+            let lifecycle = if let Some(asset_id) = ev.asset_id() {
                 if !sub.desired.contains(asset_id) {
                     continue;
                 }
@@ -522,13 +528,24 @@ fn handle_text(
                     }
                     _ => {}
                 }
+                None
             } else if !context.lifecycle_leader {
                 // Lifecycle events are connection-wide when the custom
                 // feature is enabled. Admitting them on every data socket
                 // would duplicate one upstream notification N times.
                 continue;
-            }
+            } else {
+                ev.market_lifecycle()
+            };
             events_buf.push(context.collector.record(ev, timestamp_received_ns));
+            if let (Some(lifecycle_tx), Some(lifecycle)) = (context.lifecycle_tx, lifecycle) {
+                if lifecycle_tx.send(lifecycle).is_err() {
+                    warn!(
+                        conn = context.index,
+                        "market lifecycle controller stopped; event remains stored"
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -598,6 +615,7 @@ mod tests {
             event_tx: &event_tx,
             collector: &collector,
             lifecycle_leader: false,
+            lifecycle_tx: None,
         };
         handle_text(text, sub, events, &context, 123)
     }
@@ -754,10 +772,39 @@ mod tests {
             event_tx: &event_tx,
             collector: &collector,
             lifecycle_leader: true,
+            lifecycle_tx: None,
         };
         handle_text(raw, &mut sub, &mut buf, &context, 123).unwrap();
         assert_eq!(buf.len(), 1);
         assert!(matches!(buf[0].event, Event::NewMarket { .. }));
+    }
+
+    #[test]
+    fn lifecycle_leader_forwards_pool_update() {
+        let raw = r#"{
+            "event_type": "market_resolved", "id": "1", "market": "m",
+            "assets_ids": ["yes", "no"], "winning_asset_id": "yes",
+            "winning_outcome": "Yes", "timestamp": "1"
+        }"#;
+        let mut sub = sub_state(&[]);
+        let mut buf = Vec::new();
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let collector = CollectorContext::new();
+        let context = SessionContext {
+            index: 0,
+            event_tx: &event_tx,
+            collector: &collector,
+            lifecycle_leader: true,
+            lifecycle_tx: Some(&lifecycle_tx),
+        };
+
+        handle_text(raw, &mut sub, &mut buf, &context, 123).unwrap();
+
+        assert_eq!(
+            lifecycle_rx.try_recv().unwrap(),
+            MarketLifecycle::MarketResolved { market: "m".into() }
+        );
     }
 
     #[test]

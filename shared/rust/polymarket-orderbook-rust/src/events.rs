@@ -283,6 +283,19 @@ pub enum Event {
     },
 }
 
+/// Pool mutation requested by a connection-wide market lifecycle event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarketLifecycle {
+    NewMarket {
+        market: String,
+        assets_ids: Vec<String>,
+        outcomes: Vec<String>,
+    },
+    MarketResolved {
+        market: String,
+    },
+}
+
 impl Event {
     /// Return the token ID for token-scoped events. Market lifecycle events
     /// intentionally return `None`: exploding one lifecycle notification
@@ -295,6 +308,25 @@ impl Event {
             | Event::TickSizeChange { asset_id, .. }
             | Event::BestBidAsk { asset_id, .. } => Some(asset_id),
             Event::NewMarket { .. } | Event::MarketResolved { .. } => None,
+        }
+    }
+
+    pub fn market_lifecycle(&self) -> Option<MarketLifecycle> {
+        match self {
+            Event::NewMarket {
+                market,
+                assets_ids,
+                outcomes,
+                ..
+            } => Some(MarketLifecycle::NewMarket {
+                market: market.clone(),
+                assets_ids: assets_ids.clone(),
+                outcomes: outcomes.clone(),
+            }),
+            Event::MarketResolved { market, .. } => Some(MarketLifecycle::MarketResolved {
+                market: market.clone(),
+            }),
+            _ => None,
         }
     }
 }
@@ -741,6 +773,10 @@ mod tests {
             winning_outcome: Some("Yes".into()),
         };
         assert_eq!(ev.asset_id(), None);
+        assert_eq!(
+            ev.market_lifecycle(),
+            Some(MarketLifecycle::MarketResolved { market: "m".into() })
+        );
     }
 
     #[test]
