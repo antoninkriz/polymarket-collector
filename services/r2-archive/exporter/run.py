@@ -117,7 +117,9 @@ FORMAT ArrowStream
 def _ch_query(query: str, timeout: int = 60) -> requests.Response:
     """POST a query to ClickHouse and return the response."""
     auth = (CLICKHOUSE_USER, CLICKHOUSE_PASSWORD) if CLICKHOUSE_PASSWORD else None
-    resp = requests.post(CLICKHOUSE_HTTP_URL, data=query.encode(), auth=auth, timeout=timeout)
+    resp = requests.post(
+        CLICKHOUSE_HTTP_URL, data=query.encode(), auth=auth, timeout=timeout
+    )
     resp.raise_for_status()
     return resp
 
@@ -137,13 +139,18 @@ def query_earliest_hour() -> datetime | None:
             text = resp.text.strip()
             if not text or text.startswith("1970"):
                 return None
-            return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc
+            )
         except Exception as e:
             if attempt == QUERY_MAX_RETRIES:
                 raise
             log.warning(
                 "ClickHouse query failed (attempt %d/%d): %s — retrying in %ds",
-                attempt, QUERY_MAX_RETRIES, e, QUERY_RETRY_DELAY_SECONDS,
+                attempt,
+                QUERY_MAX_RETRIES,
+                e,
+                QUERY_RETRY_DELAY_SECONDS,
             )
             time.sleep(QUERY_RETRY_DELAY_SECONDS)
     return None
@@ -160,13 +167,18 @@ def query_latest_received_hour() -> datetime | None:
             text = resp.text.strip()
             if not text or text.startswith("1970"):
                 return None
-            return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc
+            )
         except Exception as e:
             if attempt == QUERY_MAX_RETRIES:
                 raise
             log.warning(
                 "ClickHouse watermark query failed (attempt %d/%d): %s — retrying in %ds",
-                attempt, QUERY_MAX_RETRIES, e, QUERY_RETRY_DELAY_SECONDS,
+                attempt,
+                QUERY_MAX_RETRIES,
+                e,
+                QUERY_RETRY_DELAY_SECONDS,
             )
             time.sleep(QUERY_RETRY_DELAY_SECONDS)
     return None
@@ -198,7 +210,7 @@ def fetch_hour_parquet(hour: datetime) -> bytes | None:
         out,
         compression=PARQUET_COMPRESSION,
         compression_level=PARQUET_COMPRESSION_LEVEL,
-        use_dictionary=dict_cols,
+        use_dictionary=dict_cols,  # pyright: ignore[reportArgumentType]
         column_encoding={c: "DELTA_BINARY_PACKED" for c in delta_cols},
         data_page_version="2.0",
     )
@@ -211,7 +223,9 @@ def fetch_hour_parquet(hour: datetime) -> bytes | None:
 class R2Client:
     """Thin S3-compatible client for Cloudflare R2."""
 
-    def __init__(self, endpoint: str, access_key: str, secret_key: str, bucket: str) -> None:
+    def __init__(
+        self, endpoint: str, access_key: str, secret_key: str, bucket: str
+    ) -> None:
         self._bucket = bucket
         self._client = boto3.client(
             "s3",
@@ -343,7 +357,10 @@ def backfill(client: R2Client) -> datetime | None:
 
     log.info(
         "Backfill: %d missing hours (%s to %s), %d already exported",
-        len(missing), earliest.isoformat(), latest.isoformat(), len(existing),
+        len(missing),
+        earliest.isoformat(),
+        latest.isoformat(),
+        len(existing),
     )
 
     for i, hour in enumerate(missing, 1):
@@ -363,7 +380,9 @@ def run_loop(client: R2Client, next_hour: datetime | None) -> None:
     Advances only on successful upload — empty hours are re-polled on the
     next tick so gaps never produce zero-row objects in R2.
     """
-    log.info("Entering steady-state loop (check every %ds)", LOOP_CHECK_INTERVAL_SECONDS)
+    log.info(
+        "Entering steady-state loop (check every %ds)", LOOP_CHECK_INTERVAL_SECONDS
+    )
     while True:
         time.sleep(LOOP_CHECK_INTERVAL_SECONDS)
         now = datetime.now(timezone.utc)

@@ -83,7 +83,7 @@ def _extract_winning_outcome(market_data: dict) -> tuple[Optional[str], Optional
 
 async def _fetch_recently_closed_markets(
     active_markets: dict[str, MarketSubscription],
-) -> tuple[list[dict], int]:
+) -> tuple[list[dict], int, int]:
     """Fetch closed markets paged newest-first; return those in active_markets.
 
     Queries Gamma with closed=true ordered by closedTime descending and pages
@@ -104,7 +104,9 @@ async def _fetch_recently_closed_markets(
     stop = False
 
     transport = httpx.AsyncHTTPTransport(retries=MAX_RETRIES)
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, transport=transport) as client:
+    async with httpx.AsyncClient(
+        timeout=REQUEST_TIMEOUT, transport=transport
+    ) as client:
         while not stop:
             params = {
                 **base_params,
@@ -154,7 +156,9 @@ async def _fetch_new_markets(max_start_date: datetime) -> tuple[list[dict], int]
     requests_made = 0
 
     transport = httpx.AsyncHTTPTransport(retries=MAX_RETRIES)
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, transport=transport) as client:
+    async with httpx.AsyncClient(
+        timeout=REQUEST_TIMEOUT, transport=transport
+    ) as client:
         while True:
             params = {
                 **base_params,
@@ -196,17 +200,19 @@ def _serialize_resolved_event(market_data: dict) -> dict[str, str]:
 
     return {
         "event_type": "market_resolved",
-        "payload": json.dumps({
-            "id": str(market_data.get("id", "")),
-            "question": market_data.get("question", ""),
-            "market": market,
-            "slug": market_data.get("slug", ""),
-            "assets_ids": token_ids,
-            "outcomes": outcomes,
-            "timestamp": str(int(time.time() * 1000)),
-            "winning_asset_id": winning_asset_id,
-            "winning_outcome": winning_outcome,
-        }),
+        "payload": json.dumps(
+            {
+                "id": str(market_data.get("id", "")),
+                "question": market_data.get("question", ""),
+                "market": market,
+                "slug": market_data.get("slug", ""),
+                "assets_ids": token_ids,
+                "outcomes": outcomes,
+                "timestamp": str(int(time.time() * 1000)),
+                "winning_asset_id": winning_asset_id,
+                "winning_outcome": winning_outcome,
+            }
+        ),
     }
 
 
@@ -218,10 +224,12 @@ async def _save_cache(
     active_markets: dict[str, MarketSubscription],
 ) -> None:
     """Persist the current active market set to Redis."""
-    await cache.save(CacheData(
-        fetched_at=datetime.now(timezone.utc),
-        markets=list(active_markets.values()),
-    ))
+    await cache.save(
+        CacheData(
+            fetched_at=datetime.now(timezone.utc),
+            markets=list(active_markets.values()),
+        )
+    )
 
 
 # -- Background tasks ---------------------------------------------------------
@@ -254,7 +262,11 @@ async def _resolution_poller(
     """
     while True:
         try:
-            closed_markets, requests_made, total_fetched = await _fetch_recently_closed_markets(
+            (
+                closed_markets,
+                requests_made,
+                total_fetched,
+            ) = await _fetch_recently_closed_markets(
                 active_markets,
             )
 
@@ -312,15 +324,17 @@ def _serialize_new_market_event(market_data: dict) -> dict[str, str]:
 
     return {
         "event_type": "new_market",
-        "payload": json.dumps({
-            "id": str(market_data.get("id", "")),
-            "question": market_data.get("question", ""),
-            "market": market_data.get("conditionId", ""),
-            "slug": market_data.get("slug", ""),
-            "assets_ids": token_ids,
-            "outcomes": outcomes,
-            "timestamp": str(int(time.time() * 1000)),
-        }),
+        "payload": json.dumps(
+            {
+                "id": str(market_data.get("id", "")),
+                "question": market_data.get("question", ""),
+                "market": market_data.get("conditionId", ""),
+                "slug": market_data.get("slug", ""),
+                "assets_ids": token_ids,
+                "outcomes": outcomes,
+                "timestamp": str(int(time.time() * 1000)),
+            }
+        ),
     }
 
 
@@ -384,7 +398,10 @@ async def _new_markets_poller(
                 if raw is not None:
                     await publisher.publish(_serialize_new_market_event(raw))
 
-            if parsed.max_start_date is not None and parsed.max_start_date > current_max:
+            if (
+                parsed.max_start_date is not None
+                and parsed.max_start_date > current_max
+            ):
                 current_max = parsed.max_start_date
 
             if added > 0:
@@ -444,13 +461,16 @@ async def _run(poll_interval: int) -> None:
     )
     await publisher.connect()
 
+    tasks: list[asyncio.Task[None]] = []
     try:
         resolution_task = asyncio.create_task(
             _resolution_poller(active_markets, publisher, cache, poll_interval),
             name="resolution-poller",
         )
         markets_task = asyncio.create_task(
-            _new_markets_poller(active_markets, publisher, cache, result.max_start_date, poll_interval),
+            _new_markets_poller(
+                active_markets, publisher, cache, result.max_start_date, poll_interval
+            ),
             name="markets-poller",
         )
         stats_task = asyncio.create_task(

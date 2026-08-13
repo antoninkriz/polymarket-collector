@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 import redis.asyncio as aioredis
+from redis.typing import EncodableT, FieldT
 
 from obdata.constants import REDIS_URL
 
@@ -53,11 +54,12 @@ class RedisStreamPublisher:
         if not self._redis:
             raise RuntimeError("Not connected")
 
-        msg_id: str = await self._redis.xadd(
+        fields: dict[FieldT, EncodableT] = {key: value for key, value in data.items()}
+        msg_id = await self._redis.xadd(
             self._stream,
-            data,
+            fields,
             maxlen=self._maxlen,
             approximate=True,
         )
         log.debug("Published to %s: id=%s", self._stream, msg_id)
-        return msg_id
+        return msg_id.decode() if isinstance(msg_id, bytes) else msg_id

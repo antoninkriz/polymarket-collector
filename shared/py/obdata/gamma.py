@@ -107,7 +107,9 @@ async def fetch_active_markets_from_gamma() -> ActiveMarkets:
     cursor: Optional[str] = None
 
     transport = httpx.AsyncHTTPTransport(retries=MAX_RETRIES)
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, transport=transport) as client:
+    async with httpx.AsyncClient(
+        timeout=REQUEST_TIMEOUT_SECONDS, transport=transport
+    ) as client:
         while True:
             params = dict(base_params)
             if cursor:
