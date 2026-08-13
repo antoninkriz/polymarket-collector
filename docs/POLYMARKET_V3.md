@@ -44,6 +44,20 @@ bits contain the process-local event order. This keeps restarts monotonic in one
 column. The generation is an internal fencing mechanism, not another exported
 provenance field.
 
+At startup the publisher reads the generation in ClickHouse's maximum stored
+`sequence`, takes the greater of that value and `PUBLISHER_GENERATION_FLOOR`,
+and atomically advances the Redis generation above that floor while acquiring
+the publisher lease. It does not open WebSockets until Redis confirms that the
+new generation has reached its append-only file. The supplied Redis service
+therefore runs with AOF enabled. An ordinary process restart, or loss of only
+the Redis generation key, cannot reuse an exported sequence.
+
+If both Redis and ClickHouse are lost while R2 survives, find the greatest
+`max_sequence` across the retained hourly manifests, shift it right by 48 bits,
+and set `PUBLISHER_GENERATION_FLOOR` to at least that generation before starting
+the publisher. This is an explicit disaster-recovery override; starting with a
+lower floor could reuse sequence values already present in Parquet.
+
 ## Collection rules
 
 Each binary market and both of its outcome assets have exactly one
