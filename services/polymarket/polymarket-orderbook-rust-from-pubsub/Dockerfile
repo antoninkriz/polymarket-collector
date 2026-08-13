@@ -10,6 +10,7 @@ WORKDIR /build
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        cmake \
         pkg-config \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -18,10 +19,11 @@ COPY shared/rust/polymarket-orderbook-rust/Cargo.toml ./shared/rust/polymarket-o
 COPY shared/rust/polymarket-orderbook-rust/src ./shared/rust/polymarket-orderbook-rust/src
 
 COPY services/polymarket/polymarket-orderbook-rust-from-pubsub/Cargo.toml ./services/polymarket/polymarket-orderbook-rust-from-pubsub/Cargo.toml
+COPY services/polymarket/polymarket-orderbook-rust-from-pubsub/Cargo.lock ./services/polymarket/polymarket-orderbook-rust-from-pubsub/Cargo.lock
 COPY services/polymarket/polymarket-orderbook-rust-from-pubsub/src ./services/polymarket/polymarket-orderbook-rust-from-pubsub/src
 
 WORKDIR /build/services/polymarket/polymarket-orderbook-rust-from-pubsub
-RUN cargo build --release \
+RUN cargo build --release --locked \
     && strip target/release/polymarket-orderbook-rust-from-pubsub
 
 

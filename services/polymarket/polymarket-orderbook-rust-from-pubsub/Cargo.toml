@@ -2,7 +2,7 @@
 name = "polymarket-orderbook-rust-from-pubsub"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Polymarket orderbook → ClickHouse writer fed from Redis pub/sub"
 
 [[bin]]
@@ -12,13 +12,13 @@ path = "src/main.rs"
 [dependencies]
 polymarket-orderbook-rust = { path = "../../../shared/rust/polymarket-orderbook-rust" }
 
-tokio = { version = "1.42", features = ["full"] }
-redis = { version = "0.27", features = ["tokio-comp"] }
-serde_json = "1"
-dotenvy = "0.15"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-anyhow = "1"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+redis = { version = "1.5.0", default-features = false, features = ["script", "streams", "tokio-comp"] }
+serde_json = "1.0.151"
+dotenvy = "0.15.7"
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json"] }
+anyhow = "1.0.104"
 
 [profile.release]
 opt-level = 3

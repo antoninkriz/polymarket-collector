@@ -538,7 +538,7 @@ where
     };
     let text = payload.to_string();
     write
-        .send(Message::Text(text))
+        .send(Message::Text(text.into()))
         .await
         .map_err(|e| anyhow::anyhow!("ws send: {e}"))?;
     info!(conn = index, count = assets.len(), "subscribed assets");
@@ -553,7 +553,7 @@ where
     let payload = serde_json::json!({"assets_ids": assets, "operation": "unsubscribe"});
     let text = payload.to_string();
     write
-        .send(Message::Text(text))
+        .send(Message::Text(text.into()))
         .await
         .map_err(|e| anyhow::anyhow!("ws send: {e}"))?;
     info!(conn = index, count = assets.len(), "unsubscribed assets");

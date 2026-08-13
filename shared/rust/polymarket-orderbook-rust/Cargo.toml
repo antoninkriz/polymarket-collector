@@ -2,7 +2,7 @@
 name = "polymarket-orderbook-rust"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Polymarket orderbook library: WS connection pool, REST client, ClickHouse sink, and shared event types used by the polymarket-orderbook-rust-pubsub and polymarket-orderbook-rust-from-pubsub binaries"
 
 [lib]
@@ -10,29 +10,29 @@ path = "src/lib.rs"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.42", features = ["full"] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-futures-util = "0.3"
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 
 # HTTP client (used for both ClickHouse inserts and Gamma API)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["gzip", "json", "query", "rustls"] }
 
 # Redis (cache + streams)
-redis = { version = "0.27", features = ["tokio-comp", "streams"] }
+redis = { version = "1.5.0", default-features = false, features = ["streams", "tokio-comp"] }
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-rust_decimal = { version = "1.36", features = ["serde-with-str"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+rust_decimal = { version = "1.42.1", default-features = false, features = ["serde-with-str", "std"] }
 
 # Logging / tracing
-tracing = "0.1"
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 
 # Errors
-anyhow = "1"
+anyhow = "1.0.104"
 
 # Misc
-chrono = "0.4"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 
 [profile.release]
 opt-level = 3
