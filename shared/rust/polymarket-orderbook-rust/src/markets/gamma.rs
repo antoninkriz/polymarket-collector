@@ -49,7 +49,12 @@ pub async fn fetch_active_markets(http: &reqwest::Client) -> Result<Vec<Market>>
             }
         }
 
-        info!(offset, fetched = page_size, total = all.len(), "gamma page fetched");
+        info!(
+            offset,
+            fetched = page_size,
+            total = all.len(),
+            "gamma page fetched"
+        );
 
         if page_size < FETCH_BATCH_SIZE {
             break;

@@ -46,7 +46,10 @@ pub async fn load(redis_url: &str, key: &str) -> Result<Vec<Market>> {
         .map(|e| Market::new(e.market, e.yes_asset_id, e.no_asset_id))
         .collect();
 
-    info!(count = markets.len(), key, "loaded markets from Redis cache");
+    info!(
+        count = markets.len(),
+        key, "loaded markets from Redis cache"
+    );
     Ok(markets)
 }
 

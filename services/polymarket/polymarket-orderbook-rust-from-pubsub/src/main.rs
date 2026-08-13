@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -24,16 +23,10 @@ use polymarket_orderbook_rust_from_pubsub::pubsub_subscriber::{
     self, PubSubSubscriberConfig, SubscriberStats,
 };
 
-#[derive(Debug, Parser)]
-#[command(name = "polymarket-orderbook-rust-from-pubsub")]
-#[command(about = "Polymarket orderbook → ClickHouse writer fed from Redis Streams")]
-struct Cli {}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     init_tracing();
-    let _ = Cli::parse();
     let cfg = Config::from_env().context("load config from env")?;
 
     info!(

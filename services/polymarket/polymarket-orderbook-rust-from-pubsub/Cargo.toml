@@ -13,14 +13,12 @@ path = "src/main.rs"
 polymarket-orderbook-rust = { path = "../../../shared/rust/polymarket-orderbook-rust" }
 
 tokio = { version = "1.42", features = ["full"] }
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "0.27", features = ["tokio-comp"] }
 serde_json = "1"
-clap = { version = "4.5", features = ["derive"] }
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 anyhow = "1"
-futures-util = "0.3"
 
 [profile.release]
 opt-level = 3

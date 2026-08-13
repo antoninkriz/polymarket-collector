@@ -15,7 +15,6 @@ pub mod stream;
 
 use crate::events::Market;
 
-#[allow(dead_code)]
 pub fn binary_market_from_outcomes(
     market_hash: String,
     outcomes: &[String],

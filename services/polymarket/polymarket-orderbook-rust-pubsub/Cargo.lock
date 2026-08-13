@@ -1104,7 +1104,6 @@ dependencies = [
  "polymarket-orderbook-rust",
  "redis",
  "reqwest",
- "serde",
  "serde_json",
  "tokio",
  "tracing",

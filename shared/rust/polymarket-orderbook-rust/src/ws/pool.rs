@@ -10,7 +10,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::{ensure, Result};
 use tokio::sync::{mpsc, watch};
@@ -19,15 +18,13 @@ use tracing::{debug, info, warn};
 
 use crate::events::Market;
 use crate::record::{CollectorContext, EventRecord};
-use crate::ws::connection::{Command, ConnStats, ConnStatus, Connection};
+use crate::ws::connection::{Command, ConnStatus, Connection};
 
 const COMMAND_CHANNEL_SIZE: usize = 64;
 
 struct ConnHandle {
     conn_id: usize,
     assets: HashSet<String>,
-    #[allow(dead_code)]
-    stats: Arc<ConnStats>,
     cmd_tx: mpsc::Sender<Command>,
     join: JoinHandle<Result<()>>,
 }
@@ -36,21 +33,15 @@ pub struct PoolStats {
     pub market_count: usize,
     pub connection_count: usize,
     pub asset_down_events: u64,
-    /// Retained for metrics compatibility. V3 has no ambiguous degraded
-    /// state because an asset has exactly one authoritative connection.
-    pub asset_degraded_events: u64,
     pub conn_down_events: u64,
     pub conns_down: usize,
     pub assets_down: usize,
-    pub assets_degraded: usize,
 }
 
 #[derive(Default)]
 pub struct HealthCounters {
     pub asset_down_events: AtomicU64,
-    pub asset_down_total_ms: AtomicU64,
     pub conn_down_events: AtomicU64,
-    pub conn_down_total_ms: AtomicU64,
     pub conns_down: AtomicU64,
     pub assets_down: AtomicU64,
 }
@@ -114,7 +105,7 @@ impl Pool {
         self.markets.len()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn connection_count(&self) -> usize {
         self.connections.len()
     }
@@ -127,14 +118,12 @@ impl Pool {
                 .health_counters
                 .asset_down_events
                 .load(Ordering::Relaxed),
-            asset_degraded_events: 0,
             conn_down_events: self
                 .health_counters
                 .conn_down_events
                 .load(Ordering::Relaxed),
             conns_down: self.health_counters.conns_down.load(Ordering::Relaxed) as usize,
             assets_down: self.health_counters.assets_down.load(Ordering::Relaxed) as usize,
-            assets_degraded: 0,
         }
     }
 
@@ -365,12 +354,10 @@ impl Pool {
             Arc::clone(&self.collector),
             self.status_event_tx.clone(),
         );
-        let stats = Arc::clone(&connection.stats);
         let join = tokio::spawn(connection.run(cmd_rx));
         self.connections.push(ConnHandle {
             conn_id,
             assets: HashSet::new(),
-            stats,
             cmd_tx,
             join,
         });
@@ -393,8 +380,7 @@ async fn run_health_monitor(
 ) {
     let mut asset_conns: HashMap<String, usize> = HashMap::new();
     let mut conn_status: HashMap<usize, ConnStatus> = HashMap::new();
-    let mut conn_down_since: HashMap<usize, Instant> = HashMap::new();
-    let mut asset_down_since: HashMap<String, Instant> = HashMap::new();
+    let mut down_assets: HashSet<String> = HashSet::new();
 
     loop {
         tokio::select! {
@@ -406,18 +392,11 @@ async fn run_health_monitor(
                 if old_status == new_status {
                     continue;
                 }
-                let now = Instant::now();
                 match new_status {
                     ConnStatus::Disconnected => {
-                        conn_down_since.insert(conn_id, now);
                         counters.conn_down_events.fetch_add(1, Ordering::Relaxed);
                     }
-                    ConnStatus::Connected => {
-                        if let Some(since) = conn_down_since.remove(&conn_id) {
-                            counters.conn_down_total_ms
-                                .fetch_add(since.elapsed().as_millis() as u64, Ordering::Relaxed);
-                        }
-                    }
+                    ConnStatus::Connected => {}
                 }
 
                 for (asset, assigned_conn) in &asset_conns {
@@ -426,15 +405,13 @@ async fn run_health_monitor(
                     }
                     match new_status {
                         ConnStatus::Disconnected => {
-                            if asset_down_since.insert(asset.clone(), now).is_none() {
+                            if down_assets.insert(asset.clone()) {
                                 counters.asset_down_events.fetch_add(1, Ordering::Relaxed);
                                 warn!(asset, conn = conn_id, "[ASSET-DATA-GAP] authoritative connection down");
                             }
                         }
                         ConnStatus::Connected => {
-                            if let Some(since) = asset_down_since.remove(asset) {
-                                counters.asset_down_total_ms
-                                    .fetch_add(since.elapsed().as_millis() as u64, Ordering::Relaxed);
+                            if down_assets.remove(asset) {
                                 info!(asset, conn = conn_id, "asset connection restored; waiting for book snapshot");
                             }
                         }
@@ -447,7 +424,7 @@ async fn run_health_monitor(
                     break;
                 }
                 asset_conns = asset_conns_rx.borrow_and_update().clone();
-                asset_down_since.retain(|asset, _| asset_conns.contains_key(asset));
+                down_assets.retain(|asset| asset_conns.contains_key(asset));
                 update_gauges(&counters, &asset_conns, &conn_status);
             }
         }

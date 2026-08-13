@@ -39,7 +39,6 @@
 //! and we return cleanly.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -73,47 +72,6 @@ const PING_INTERVAL: Duration = Duration::from_secs(10);
 const PONG_TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
 
-/// Stats exposed to the pool for periodic logging. All counters are
-/// atomically updated by the connection's task; the pool reads them via
-/// `Arc::clone`.
-#[derive(Default, Debug)]
-pub struct ConnStats {
-    pub books: AtomicU64,
-    pub price_changes: AtomicU64,
-    pub trades: AtomicU64,
-    pub tick_changes: AtomicU64,
-    pub reconnects: AtomicU64,
-    /// Current size of `desired` (durable subscription set).
-    pub desired_count: AtomicUsize,
-}
-
-impl ConnStats {
-    /// Drain per-period counters and return their previous values. Lifetime
-    /// counters (`reconnects`, `desired_count`) are not affected.
-    ///
-    /// Currently unused — `main::stats_loop` no longer logs per-conn stats
-    /// because that line spammed at 100+ connections. Kept for the day we
-    /// re-enable per-conn logging.
-    #[allow(dead_code)]
-    pub fn drain_period(&self) -> PeriodStats {
-        PeriodStats {
-            books: self.books.swap(0, Ordering::Relaxed),
-            price_changes: self.price_changes.swap(0, Ordering::Relaxed),
-            trades: self.trades.swap(0, Ordering::Relaxed),
-            tick_changes: self.tick_changes.swap(0, Ordering::Relaxed),
-        }
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PeriodStats {
-    pub books: u64,
-    pub price_changes: u64,
-    pub trades: u64,
-    pub tick_changes: u64,
-}
-
 /// Commands sent from the pool into a connection task. Shutdown is signalled
 /// by closing the command channel (dropping every sender), which makes
 /// `recv()` return `None`; no explicit `Shutdown` variant is needed.
@@ -128,7 +86,6 @@ pub struct Connection {
     pub event_tx: mpsc::Sender<EventRecord>,
     pub collector: Arc<CollectorContext>,
     pub status_tx: mpsc::UnboundedSender<(usize, ConnStatus)>,
-    pub stats: Arc<ConnStats>,
 }
 
 impl Connection {
@@ -143,12 +100,11 @@ impl Connection {
             event_tx,
             collector,
             status_tx,
-            stats: Arc::new(ConnStats::default()),
         }
     }
 
-    /// Run the connect → listen → reconnect loop until `Command::Shutdown`
-    /// is received or the command channel is closed. Returns an error only
+    /// Run the connect → listen → reconnect loop until the command channel
+    /// is closed. Returns an error only
     /// if the event channel sender is dropped (i.e. the sink died) — in
     /// that case the caller should shut down all connections.
     ///
@@ -162,7 +118,6 @@ impl Connection {
             event_tx,
             collector,
             status_tx,
-            stats,
         } = self;
         let mut sub = SubState::default();
         let mut backoff = Duration::from_secs(1);
@@ -218,7 +173,6 @@ impl Connection {
             let connect_time = Instant::now();
             if let Some(last) = last_message_time {
                 let gap = connect_time.duration_since(last);
-                stats.reconnects.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     conn = index,
                     gap_seconds = gap.as_secs_f64(),
@@ -237,7 +191,6 @@ impl Connection {
                 index,
                 event_tx: &event_tx,
                 collector: &collector,
-                stats: &stats,
             };
             let outcome = run_session(
                 ws_stream,
@@ -306,7 +259,7 @@ enum SessionOutcome {
     Closed,
     /// Event channel closed (sink died). Connection should shut down.
     ChannelClosed,
-    /// Pool sent `Command::Shutdown` or the command channel was dropped.
+    /// The pool dropped the command channel.
     Shutdown,
     /// Some other error during the session — reconnect with backoff.
     Error(anyhow::Error),
@@ -317,7 +270,6 @@ struct SessionContext<'a> {
     index: usize,
     event_tx: &'a mpsc::Sender<EventRecord>,
     collector: &'a CollectorContext,
-    stats: &'a ConnStats,
 }
 
 /// Run a single connected WebSocket session: send the initial subscription,
@@ -482,10 +434,6 @@ async fn run_session(
                             new_in_session.push(a.clone());
                         }
                     }
-                    context
-                        .stats
-                        .desired_count
-                        .store(sub.desired.len(), Ordering::Relaxed);
                     if new_in_session.is_empty() {
                         continue;
                     }
@@ -503,10 +451,6 @@ async fn run_session(
                             removed.push(a.clone());
                         }
                     }
-                    context
-                        .stats
-                        .desired_count
-                        .store(sub.desired.len(), Ordering::Relaxed);
                     if removed.is_empty() {
                         continue;
                     }
@@ -524,7 +468,7 @@ async fn run_session(
 }
 
 /// Parse a text frame, explode it, filter by `desired`, and append the
-/// surviving events to `events_buf`. Updates per-period stats.
+/// surviving events to `events_buf`.
 fn handle_text(
     text: &str,
     sub: &mut SubState,
@@ -550,26 +494,6 @@ fn handle_text(
                 continue;
             }
         };
-        // Per-type counters need to be incremented from the wire message
-        // before fan-out (price_change still counts as one wire arrival per
-        // entry, matching `connection.py::_handle_price_change`).
-        match &msg {
-            WireMessage::Book(_) => {
-                context.stats.books.fetch_add(1, Ordering::Relaxed);
-            }
-            WireMessage::PriceChange(pc) => {
-                context
-                    .stats
-                    .price_changes
-                    .fetch_add(pc.price_changes.len() as u64, Ordering::Relaxed);
-            }
-            WireMessage::LastTradePrice(_) => {
-                context.stats.trades.fetch_add(1, Ordering::Relaxed);
-            }
-            WireMessage::TickSizeChange(_) => {
-                context.stats.tick_changes.fetch_add(1, Ordering::Relaxed);
-            }
-        }
         let mut staged: Vec<Event> = Vec::new();
         explode(msg, &mut staged);
         for ev in staged {
@@ -640,19 +564,13 @@ where
 mod tests {
     use super::*;
 
-    fn handle(
-        text: &str,
-        sub: &mut SubState,
-        stats: &ConnStats,
-        events: &mut Vec<EventRecord>,
-    ) -> Result<()> {
+    fn handle(text: &str, sub: &mut SubState, events: &mut Vec<EventRecord>) -> Result<()> {
         let (event_tx, _event_rx) = mpsc::channel(1);
         let collector = CollectorContext::new();
         let context = SessionContext {
             index: 0,
             event_tx: &event_tx,
             collector: &collector,
-            stats,
         };
         handle_text(text, sub, events, &context, 123)
     }
@@ -668,22 +586,18 @@ mod tests {
 
     #[test]
     fn handle_text_filters_undesired_book_event() {
-        let stats = ConnStats::default();
         let mut buf = Vec::new();
         let mut sub = sub_state(&["wanted"]);
         let raw = r#"{
             "event_type": "book", "asset_id": "not-wanted", "market": "m",
             "bids": [], "asks": [], "timestamp": "1", "hash": "h"
         }"#;
-        handle(raw, &mut sub, &stats, &mut buf).unwrap();
+        handle(raw, &mut sub, &mut buf).unwrap();
         assert_eq!(buf.len(), 0, "undesired asset should be filtered");
-        // The book counter still increments because the wire message arrived.
-        assert_eq!(stats.books.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn handle_text_keeps_desired_book_event() {
-        let stats = ConnStats::default();
         let mut buf = Vec::new();
         let mut sub = sub_state(&["wanted"]);
         let raw = r#"{
@@ -692,13 +606,12 @@ mod tests {
             "asks": [{"price": "0.5", "size": "10"}],
             "timestamp": "1", "hash": "h"
         }"#;
-        handle(raw, &mut sub, &stats, &mut buf).unwrap();
+        handle(raw, &mut sub, &mut buf).unwrap();
         assert_eq!(buf.len(), 1);
     }
 
     #[test]
     fn handle_text_explodes_price_change_and_filters_per_entry() {
-        let stats = ConnStats::default();
         let mut buf = Vec::new();
         let mut sub = sub_state(&["a1"]);
         let raw = r#"{
@@ -709,18 +622,12 @@ mod tests {
                 {"asset_id": "a1", "price": "0.6", "size": "10", "side": "BUY", "hash": "h3"}
             ]
         }"#;
-        handle(raw, &mut sub, &stats, &mut buf).unwrap();
+        handle(raw, &mut sub, &mut buf).unwrap();
         assert_eq!(buf.len(), 2, "only a1 entries should survive filter");
-        assert_eq!(
-            stats.price_changes.load(Ordering::Relaxed),
-            3,
-            "wire count is 3"
-        );
     }
 
     #[test]
     fn handle_text_requires_fresh_book_before_price_changes() {
-        let stats = ConnStats::default();
         let mut buf = Vec::new();
         let mut sub = sub_state(&["a"]);
         sub.reset_session();
@@ -732,15 +639,15 @@ mod tests {
                 {"asset_id": "a", "price": "0.4", "size": "10", "side": "BUY", "hash": "h"}
             ]
         }"#;
-        handle(price_change, &mut sub, &stats, &mut buf).unwrap();
+        handle(price_change, &mut sub, &mut buf).unwrap();
         assert!(buf.is_empty(), "delta before snapshot must be discarded");
 
         let book = r#"{
             "event_type": "book", "asset_id": "a", "market": "m",
             "bids": [], "asks": [], "timestamp": "2", "hash": "h"
         }"#;
-        handle(book, &mut sub, &stats, &mut buf).unwrap();
-        handle(price_change, &mut sub, &stats, &mut buf).unwrap();
+        handle(book, &mut sub, &mut buf).unwrap();
+        handle(price_change, &mut sub, &mut buf).unwrap();
         assert_eq!(
             buf.len(),
             2,
@@ -748,13 +655,12 @@ mod tests {
         );
 
         sub.reset_session();
-        handle(price_change, &mut sub, &stats, &mut buf).unwrap();
+        handle(price_change, &mut sub, &mut buf).unwrap();
         assert_eq!(buf.len(), 2, "reconnect must require another snapshot");
     }
 
     #[test]
     fn handle_text_handles_array_frame() {
-        let stats = ConnStats::default();
         let mut buf = Vec::new();
         let mut sub = sub_state(&["a"]);
         let raw = r#"[
@@ -763,14 +669,12 @@ mod tests {
             {"event_type": "tick_size_change", "asset_id": "a", "market": "m",
              "old_tick_size": "0.02", "new_tick_size": "0.002", "timestamp": "2"}
         ]"#;
-        handle(raw, &mut sub, &stats, &mut buf).unwrap();
+        handle(raw, &mut sub, &mut buf).unwrap();
         assert_eq!(buf.len(), 2);
-        assert_eq!(stats.tick_changes.load(Ordering::Relaxed), 2);
     }
 
     #[test]
     fn handle_text_keeps_valid_parents_around_an_unsupported_parent() {
-        let stats = ConnStats::default();
         let mut buf = Vec::new();
         let mut sub = sub_state(&["a"]);
         let raw = r#"[
@@ -782,7 +686,7 @@ mod tests {
              "old_tick_size": "0.02", "new_tick_size": "0.002", "timestamp": "3"}
         ]"#;
 
-        handle(raw, &mut sub, &stats, &mut buf).unwrap();
+        handle(raw, &mut sub, &mut buf).unwrap();
 
         assert_eq!(buf.len(), 2);
         assert_eq!(buf[1].sequence, buf[0].sequence + 1);
@@ -833,19 +737,5 @@ mod tests {
             !should_exit,
             "must not exit while buffered work remains, even with senders dropped",
         );
-    }
-
-    #[test]
-    fn drain_period_resets_counters() {
-        let stats = ConnStats::default();
-        stats.books.store(5, Ordering::Relaxed);
-        stats.price_changes.store(7, Ordering::Relaxed);
-        stats.reconnects.store(3, Ordering::Relaxed);
-        let p = stats.drain_period();
-        assert_eq!(p.books, 5);
-        assert_eq!(p.price_changes, 7);
-        assert_eq!(stats.books.load(Ordering::Relaxed), 0);
-        // Lifetime counter is unaffected.
-        assert_eq!(stats.reconnects.load(Ordering::Relaxed), 3);
     }
 }

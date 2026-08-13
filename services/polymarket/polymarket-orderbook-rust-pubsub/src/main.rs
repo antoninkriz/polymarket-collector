@@ -321,7 +321,6 @@ async fn stats_loop(
             cache_active_markets,
             connections = stats.connection_count,
             asset_down_events = stats.asset_down_events,
-            asset_degraded_events = stats.asset_degraded_events,
             conn_down_events = stats.conn_down_events,
             "[QUEUE-STATS]",
         );
@@ -331,7 +330,6 @@ async fn stats_loop(
             event = "pool_stats",
             conns_down = stats.conns_down,
             assets_down = stats.assets_down,
-            assets_degraded = stats.assets_degraded,
             meta = %serde_json::json!({
                 "iter": iteration,
                 "subscribed_markets": stats.market_count,
@@ -341,7 +339,6 @@ async fn stats_loop(
                 "queue_max": queue_max,
                 "queue_pct": format!("{:.1}", queue_pct),
                 "asset_down_events_total": stats.asset_down_events,
-                "asset_degraded_events_total": stats.asset_degraded_events,
                 "conn_down_events_total": stats.conn_down_events,
             }),
             "pool_stats",
