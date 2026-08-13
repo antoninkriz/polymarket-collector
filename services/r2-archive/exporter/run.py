@@ -6,9 +6,15 @@ dictionary encoding elsewhere, and uploads to R2. ClickHouse's own
 FORMAT Parquet writer never emits DELTA, so we fetch FORMAT ArrowStream
 and re-encode client-side (pass 6 in docs/data-dump-optimizations.md).
 
-Profiles, selected via ``EXPORTER_PROFILE`` env (default ``polymarket``):
+Profiles, selected via ``EXPORTER_PROFILE`` env (default ``polymarket_v3``):
 
-* ``polymarket`` — rewrites the raw-JSON ``polymarket_orderbook_rust``
+* ``polymarket_v3`` — exports the replayable typed
+  ``polymarket_orderbook_v3`` table. ``FINAL`` removes only collector-owned
+  transport retries, and rows are ordered by collector session and receive
+  sequence without regrouping the two market assets.
+
+* ``polymarket`` — legacy v2 compatibility profile. Rewrites the raw-JSON
+  ``polymarket_orderbook_rust``
   source table into Schema D in the same SELECT: event-specific fields
   as ``Nullable(...)`` only on owning event types, ``bids`` / ``asks``
   as a single ``Nullable(String)`` holding the raw JSON depth (``NULL``
@@ -51,7 +57,7 @@ CLICKHOUSE_HOST = os.environ.get("CLICKHOUSE_HOST", "localhost")
 CLICKHOUSE_PORT = int(os.environ.get("CLICKHOUSE_PORT", "8123"))
 CLICKHOUSE_USER = os.environ.get("CLICKHOUSE_USER", "default")
 CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "")
-CLICKHOUSE_TABLE = os.environ.get("CLICKHOUSE_TABLE", "polymarket_orderbook_rust")
+CLICKHOUSE_TABLE = os.environ.get("CLICKHOUSE_TABLE", "polymarket_orderbook_v3")
 CLICKHOUSE_HTTP_URL = f"http://{CLICKHOUSE_HOST}:{CLICKHOUSE_PORT}/"
 
 # Cloudflare R2
@@ -158,7 +164,41 @@ ORDER BY {order_by}
 FORMAT ArrowStream
 """
 
+POLYMARKET_V3_SELECT_TEMPLATE = """
+SELECT * FROM {source_table} FINAL
+WHERE timestamp_received >= toDateTime64('{target}', 9, 'UTC')
+  AND timestamp_received <  toDateTime64('{target}', 9, 'UTC') + INTERVAL 1 HOUR
+ORDER BY {order_by}
+FORMAT ArrowStream
+"""
+
 PROFILES: dict[str, Profile] = {
+    "polymarket_v3": Profile(
+        name="polymarket_v3",
+        default_filename_prefix="polymarket_orderbook_v3_",
+        delta_encoded_columns=(
+            "timestamp",
+            "timestamp_received",
+            "collector_session_started_at",
+            "connection_id",
+            "connection_epoch",
+            "frame_sequence",
+            "receive_sequence",
+            "message_index",
+            "message_count",
+            "row_index",
+            "row_count",
+            "fee_rate_bps",
+        ),
+        default_select_order_by=(
+            "collector_session_started_at",
+            "collector_session_id",
+            "receive_sequence",
+            "message_index",
+            "row_index",
+        ),
+        select_template=POLYMARKET_V3_SELECT_TEMPLATE,
+    ),
     "polymarket": Profile(
         name="polymarket",
         default_filename_prefix="polymarket_orderbook_",
@@ -212,7 +252,7 @@ PROFILES: dict[str, Profile] = {
     ),
 }
 
-EXPORTER_PROFILE = os.environ.get("EXPORTER_PROFILE", "polymarket")
+EXPORTER_PROFILE = os.environ.get("EXPORTER_PROFILE", "polymarket_v3")
 if EXPORTER_PROFILE not in PROFILES:
     raise SystemExit(
         f"Unknown EXPORTER_PROFILE={EXPORTER_PROFILE!r}; "
@@ -247,8 +287,6 @@ def _env_column_list(name: str, default: tuple[str, ...]) -> list[str]:
         columns.append(column)
 
     return columns
-
-
 SELECT_ORDER_BY = _env_column_list("SELECT_ORDER_BY", PROFILE.default_select_order_by)
 
 
@@ -284,6 +322,29 @@ def query_earliest_hour() -> datetime | None:
                 raise
             log.warning(
                 "ClickHouse query failed (attempt %d/%d): %s — retrying in %ds",
+                attempt, QUERY_MAX_RETRIES, e, QUERY_RETRY_DELAY_SECONDS,
+            )
+            time.sleep(QUERY_RETRY_DELAY_SECONDS)
+    return None
+
+
+def query_latest_received_hour() -> datetime | None:
+    """Return the hour containing the latest committed receive timestamp."""
+    for attempt in range(1, QUERY_MAX_RETRIES + 1):
+        try:
+            resp = _ch_query(
+                f"SELECT toStartOfHour(max(timestamp_received)) FROM {CLICKHOUSE_TABLE} "
+                "FORMAT TabSeparated"
+            )
+            text = resp.text.strip()
+            if not text or text.startswith("1970"):
+                return None
+            return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except Exception as e:
+            if attempt == QUERY_MAX_RETRIES:
+                raise
+            log.warning(
+                "ClickHouse watermark query failed (attempt %d/%d): %s — retrying in %ds",
                 attempt, QUERY_MAX_RETRIES, e, QUERY_RETRY_DELAY_SECONDS,
             )
             time.sleep(QUERY_RETRY_DELAY_SECONDS)
@@ -377,13 +438,21 @@ def hour_to_filename(hour: datetime) -> str:
     return f"{FILENAME_PREFIX}{hour.strftime('%Y-%m-%dT%H')}.parquet"
 
 
-def latest_exportable_hour() -> datetime:
-    """Return the latest hour that is fully complete.
+def latest_exportable_hour() -> datetime | None:
+    """Return the latest hour proven complete by wall time and data watermark.
 
-    Computed as ``current_hour - EXPORT_LAG_HOURS`` (default 1 hour).
+    Redis Stream consumption and ClickHouse insertion are ordered. Seeing a
+    committed record in hour H therefore proves all earlier stream records
+    were inserted. We still apply ``EXPORT_LAG_HOURS`` against wall time, then
+    take the more conservative of the two bounds.
     """
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    return now - timedelta(hours=EXPORT_LAG_HOURS)
+    wall_bound = now - timedelta(hours=EXPORT_LAG_HOURS)
+    latest_received_hour = query_latest_received_hour()
+    if latest_received_hour is None:
+        return None
+    watermark_bound = latest_received_hour - timedelta(hours=1)
+    return min(wall_bound, watermark_bound)
 
 
 def export_hour(client: R2Client, hour: datetime) -> bool:
@@ -411,6 +480,9 @@ def backfill(client: R2Client) -> None:
         return
 
     latest = latest_exportable_hour()
+    if latest is None or latest < earliest:
+        log.info("No complete ClickHouse hour is exportable yet")
+        return
     existing = client.list_keys()
 
     missing: list[datetime] = []
@@ -440,12 +512,20 @@ def run_loop(client: R2Client) -> None:
     next tick so gaps never produce zero-row objects in R2.
     """
     log.info("Entering steady-state loop (check every %ds)", LOOP_CHECK_INTERVAL_SECONDS)
-    next_hour = latest_exportable_hour() + timedelta(hours=1)
+    latest = latest_exportable_hour()
+    next_hour = (latest + timedelta(hours=1)) if latest is not None else None
 
     while True:
         time.sleep(LOOP_CHECK_INTERVAL_SECONDS)
         now = datetime.now(timezone.utc)
         latest = latest_exportable_hour()
+        if latest is None:
+            continue
+        if next_hour is None:
+            earliest = query_earliest_hour()
+            if earliest is None:
+                continue
+            next_hour = earliest
         if now.minute < EXPORT_DELAY_MINUTES:
             continue
         while next_hour <= latest:
