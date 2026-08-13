@@ -13,7 +13,7 @@
 //! ```
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -249,24 +249,37 @@ async fn preload_markets(cfg: &Config) -> Result<Vec<Market>> {
         return Ok(markets);
     }
 
+    let minimum_cache_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs()
+        .saturating_sub(1);
+    let updated_at_key = format!("{}:updated_at", cfg.redis_key_active_markets);
     let mut waiting_logged = false;
     loop {
-        match markets::redis_cache::load(&cfg.redis_url, &cfg.redis_key_active_markets)
+        let updated_at = markets::redis_cache::last_updated(&cfg.redis_url, &updated_at_key)
             .await
-            .context("load active markets from redis")?
-        {
-            Some(markets) => return Ok(markets),
-            None => {
-                if !waiting_logged {
-                    warn!(
-                        key = cfg.redis_key_active_markets,
-                        "active markets cache not ready; waiting"
-                    );
-                    waiting_logged = true;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            .context("load active markets cache timestamp")?;
+        if updated_at.is_some_and(|timestamp| timestamp >= minimum_cache_timestamp) {
+            if let Some(markets) =
+                markets::redis_cache::load(&cfg.redis_url, &cfg.redis_key_active_markets)
+                    .await
+                    .context("load active markets from redis")?
+            {
+                return Ok(markets);
             }
         }
+
+        if !waiting_logged {
+            warn!(
+                key = cfg.redis_key_active_markets,
+                ?updated_at,
+                minimum_cache_timestamp,
+                "fresh active markets cache not ready; waiting"
+            );
+            waiting_logged = true;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 

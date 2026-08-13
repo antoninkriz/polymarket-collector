@@ -10,7 +10,11 @@ from typing import Any
 
 import redis.asyncio as aioredis
 
-from obdata.constants import KEY_ACTIVE_MARKETS, KEY_ACTIVE_MARKETS_COUNT
+from obdata.constants import (
+    KEY_ACTIVE_MARKETS,
+    KEY_ACTIVE_MARKETS_COUNT,
+    KEY_ACTIVE_MARKETS_UPDATED_AT,
+)
 from obdata.polymarket import MarketSubscription
 
 log = logging.getLogger(__name__)
@@ -58,6 +62,7 @@ class RedisMarketCache:
         pipe = self._redis.pipeline()
         pipe.set(KEY_ACTIVE_MARKETS, json.dumps(payload))
         pipe.set(KEY_ACTIVE_MARKETS_COUNT, str(len(data.markets)))
+        pipe.set(KEY_ACTIVE_MARKETS_UPDATED_AT, str(int(data.fetched_at.timestamp())))
         await pipe.execute()
 
         log.debug(

@@ -29,6 +29,7 @@ KEY_ACTIVE_MARKETS = os.environ.get(
 KEY_ACTIVE_MARKETS_COUNT = os.environ.get(
     "REDIS_KEY_ACTIVE_MARKETS_COUNT", "polymarket:active_markets:count"
 )
+KEY_ACTIVE_MARKETS_UPDATED_AT = f"{KEY_ACTIVE_MARKETS}:updated_at"
 
 
 def require_redis_url() -> str:

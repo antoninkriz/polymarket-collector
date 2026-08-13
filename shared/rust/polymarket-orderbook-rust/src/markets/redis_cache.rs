@@ -54,6 +54,19 @@ pub async fn load(redis_url: &str, key: &str) -> Result<Option<Vec<Market>>> {
     Ok(Some(markets))
 }
 
+/// Return the Unix timestamp of the latest atomic cache update.
+pub async fn last_updated(redis_url: &str, key: &str) -> Result<Option<u64>> {
+    let client = redis::Client::open(redis_url).context("open redis client")?;
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .context("connect redis")?;
+
+    let raw: Option<String> = conn.get(key).await.context("redis GET")?;
+    raw.map(|value| value.parse().context("parse cache update timestamp"))
+        .transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
