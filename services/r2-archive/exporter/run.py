@@ -61,7 +61,9 @@ WITH
     JSONExtractString(data, 'market') AS market_text,
     JSONExtractString(data, 'event_type') AS event_type,
     JSONExtractString(data, 'asset_id') AS asset_id_text,
-    JSONExtractString(data, 'transaction_hash') AS transaction_hash_text
+    JSONExtract(data, 'assets_ids', 'Array(String)') AS assets_ids_text,
+    JSONExtractString(data, 'transaction_hash') AS transaction_hash_text,
+    JSONExtractString(data, 'winning_asset_id') AS winning_asset_id_text
 SELECT
     timestamp_received,
     sequence,
@@ -74,10 +76,23 @@ SELECT
         32
     ) AS market,
     event_type,
-    toFixedString(
-        unhex(leftPad(hex(toUInt256OrZero(asset_id_text)), 64, '0')),
-        32
+    if(
+        empty(asset_id_text),
+        NULL,
+        toFixedString(
+            unhex(leftPad(hex(toUInt256OrZero(asset_id_text)), 64, '0')),
+            32
+        )
     ) AS asset_id,
+
+    arrayMap(
+        value -> toFixedString(
+            unhex(leftPad(hex(toUInt256OrZero(value)), 64, '0')),
+            32
+        ),
+        assets_ids_text
+    ) AS assets_ids,
+    JSONExtract(data, 'outcomes', 'Array(String)') AS outcomes,
 
     if(event_type = 'book', JSONExtractRaw(data, 'bids'), NULL) AS bids,
     if(event_type = 'book', JSONExtractRaw(data, 'asks'), NULL) AS asks,
@@ -89,10 +104,12 @@ SELECT
     if(event_type IN ('price_change', 'last_trade_price'),
        JSONExtractString(data, 'side'), NULL) AS side,
 
-    if(event_type = 'price_change',
-       toDecimal32OrZero(JSONExtractString(data, 'best_bid'), 4), NULL) AS best_bid,
-    if(event_type = 'price_change',
-       toDecimal32OrZero(JSONExtractString(data, 'best_ask'), 4), NULL) AS best_ask,
+    if(event_type IN ('price_change', 'best_bid_ask'),
+       toDecimal32OrNull(JSONExtractString(data, 'best_bid'), 4), NULL) AS best_bid,
+    if(event_type IN ('price_change', 'best_bid_ask'),
+       toDecimal32OrNull(JSONExtractString(data, 'best_ask'), 4), NULL) AS best_ask,
+    if(event_type = 'best_bid_ask',
+       toDecimal32OrNull(JSONExtractString(data, 'spread'), 4), NULL) AS spread,
 
     if(event_type = 'last_trade_price',
        toUInt16OrZero(JSONExtractString(data, 'fee_rate_bps')), NULL) AS fee_rate_bps,
@@ -107,7 +124,18 @@ SELECT
        AS old_tick_size,
     if(event_type = 'tick_size_change',
        toDecimal32OrZero(JSONExtractString(data, 'new_tick_size'), 4), NULL)
-       AS new_tick_size
+       AS new_tick_size,
+
+    if(
+        empty(winning_asset_id_text),
+        NULL,
+        toFixedString(
+            unhex(leftPad(hex(toUInt256OrZero(winning_asset_id_text)), 64, '0')),
+            32
+        )
+    ) AS winning_asset_id,
+    if(event_type = 'market_resolved',
+       JSONExtractString(data, 'winning_outcome'), NULL) AS winning_outcome
 FROM {source_table} FINAL
 WHERE timestamp_received >= toDateTime64('{target}', 9, 'UTC')
   AND timestamp_received <  toDateTime64('{target}', 9, 'UTC') + INTERVAL 1 HOUR
@@ -116,9 +144,32 @@ WHERE timestamp_received >= toDateTime64('{target}', 9, 'UTC')
       'invalid Polymarket condition ID'
   ) = 0
   AND throwIf(
-      NOT match(asset_id_text, '^(0|[1-9][0-9]{{0,77}})$')
-          OR toString(toUInt256OrZero(asset_id_text)) != asset_id_text,
+      event_type IN (
+          'book', 'price_change', 'last_trade_price',
+          'tick_size_change', 'best_bid_ask'
+      )
+      AND (
+          NOT match(asset_id_text, '^(0|[1-9][0-9]{{0,77}})$')
+          OR toString(toUInt256OrZero(asset_id_text)) != asset_id_text
+      ),
       'invalid Polymarket asset ID'
+  ) = 0
+  AND throwIf(
+      arrayExists(
+          value -> NOT match(value, '^(0|[1-9][0-9]{{0,77}})$')
+              OR toString(toUInt256OrZero(value)) != value,
+          assets_ids_text
+      ),
+      'invalid Polymarket lifecycle asset ID'
+  ) = 0
+  AND throwIf(
+      NOT empty(winning_asset_id_text)
+      AND (
+          NOT match(winning_asset_id_text, '^(0|[1-9][0-9]{{0,77}})$')
+          OR toString(toUInt256OrZero(winning_asset_id_text))
+              != winning_asset_id_text
+      ),
+      'invalid Polymarket winning asset ID'
   ) = 0
   AND throwIf(
       event_type = 'last_trade_price'

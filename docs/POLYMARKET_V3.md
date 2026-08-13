@@ -21,9 +21,11 @@ connection or collector identifier, transport identifier, or session metadata.
 Those fields are not needed to reconstruct an observed market stream.
 
 `data` is one normalized child event encoded as JSON. It contains the source
-`timestamp`, `market`, `event_type`, `asset_id`, and fields owned by that event
-type. The non-unique Polymarket `hash` is stripped. A multi-entry
-`price_change` parent becomes consecutive child events in its original order.
+`timestamp`, `market`, `event_type`, and fields owned by that event type. Token
+events contain `asset_id`; market lifecycle events contain the full
+`assets_ids` list instead of fabricating one row per token. The non-unique
+Polymarket `hash` is stripped. A multi-entry `price_change` parent becomes
+consecutive child events in its original order.
 
 ## Why `sequence` exists
 
@@ -48,6 +50,18 @@ Each binary market and both of its outcome assets have exactly one
 authoritative WebSocket route. A Redis lease prevents a second publisher from
 writing concurrently, and its fencing token is checked atomically with every
 stream append.
+
+Every subscription enables Polymarket's `custom_feature_enabled` wire option.
+`best_bid_ask` remains token-scoped and is accepted only from that token's
+authoritative route. `new_market` and `market_resolved` are connection-wide, so
+only one designated lifecycle connection stores and acts on them; accepting
+them from every pooled socket would duplicate each notification by the number
+of connections. The lifecycle connection stays subscribed with an empty token
+set when necessary, including `--new-only` operation and reconnects.
+
+WebSocket lifecycle events add and remove subscriptions immediately. The
+Gamma pollers remain an idempotent reconciliation path for startup state,
+missed notifications, and upstream lifecycle-feed outages.
 
 `timestamp_received` is sampled immediately after tungstenite yields a text
 frame, before JSON parsing, fan-out, Redis, or ClickHouse work. All children of
@@ -85,22 +99,28 @@ orders by `(market, sequence)`, and writes ZSTD level 1 Parquet:
 | `timestamp` | `timestamp[ms, UTC]` | no |
 | `market` | `fixed_size_binary[32]` | no |
 | `event_type` | `string` | no |
-| `asset_id` | `fixed_size_binary[32]` | no |
+| `asset_id` | `fixed_size_binary[32]` | yes |
+| `assets_ids` | `list<fixed_size_binary[32]>` | no |
+| `outcomes` | `list<string>` | no |
 | `bids`, `asks` | JSON `string` | yes |
-| `price`, `best_bid`, `best_ask` | `decimal(9, 4)` | yes |
+| `price`, `best_bid`, `best_ask`, `spread` | `decimal(9, 4)` | yes |
 | `size` | `decimal(18, 6)` | yes |
 | `side` | `string` | yes |
 | `fee_rate_bps` | `uint16` | yes |
 | `transaction_hash` | `fixed_size_binary[32]` | yes |
 | `old_tick_size`, `new_tick_size` | `decimal(9, 4)` | yes |
+| `winning_asset_id` | `fixed_size_binary[32]` | yes |
+| `winning_outcome` | `string` | yes |
 
 Market condition IDs and transaction hashes are decoded from hexadecimal;
-decimal token IDs are decoded as unsigned 256-bit integers. All three therefore
-use the same 32-byte big-endian representation as `pmxtdata`'s processed
-identifier columns.
+every singular or list-valued token ID is decoded as an unsigned 256-bit
+integer. These identifier columns therefore use the same 32-byte big-endian
+representation as `pmxtdata`'s processed identifier columns.
 The export aborts rather than padding malformed hexadecimal IDs or wrapping an
-out-of-range decimal token ID. Event-specific columns are null when they do not
-apply.
+out-of-range decimal token ID. `assets_ids` and `outcomes` are empty lists for
+non-lifecycle events; scalar event-specific columns are null when they do not
+apply. A missing side of `best_bid_ask` remains null rather than being changed
+to a zero price.
 
 The sidecar manifest is only an upload-completion marker with row count, byte
 size, digest, source table, and sort order. It is not inserted into the data.
@@ -116,6 +136,10 @@ For one market:
 4. Deliver `last_trade_price` rows in `sequence` order. Never deduplicate them
    by transaction hash or payload values.
 
+`best_bid_ask` is an independently observed top-of-book notification, not a
+depth delta, and is not applied during orderbook reconstruction. Lifecycle rows
+are market-scoped and therefore have null `asset_id`.
+
 No connection epoch is required in the file because reconnect deltas are
 withheld until a new snapshot makes the stream self-initializing again.
 
@@ -123,10 +147,12 @@ withheld until a new snapshot makes the stream self-initializing again.
 
 V3 reproduces what the collector accepted; it is not an exchange audit log.
 Polymarket provides no replay cursor or source sequence, so a disconnect or
-collector outage can contain an unknowable gap. Unsupported parent event types
-are logged and omitted. The userspace receive timestamp includes network-stack,
-TLS, and scheduling latency. Consumers must not infer upstream completeness or
-exchange order that the public feed does not expose.
+collector outage can contain an unknowable gap. The Gamma reconciliation path
+can restore the active subscription set, but cannot recreate a missed source
+lifecycle row. Unsupported parent event types are logged and omitted. The
+userspace receive timestamp includes network-stack, TLS, and scheduling
+latency. Consumers must not infer upstream completeness or exchange order that
+the public feed does not expose.
 
 The compact layout is incompatible with earlier experimental v3 tables. Deploy
 it to an empty table, or archive and recreate the old table explicitly;

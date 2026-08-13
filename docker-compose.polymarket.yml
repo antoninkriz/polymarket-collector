@@ -7,10 +7,9 @@ name: obdata-polymarket
 #     cache and lifecycle event stream that the pubsub publisher consumes.
 #
 #   obdata-polymarket-orderbook-rust-pubsub
-#     Subscribes to the Polymarket WS, publishes all 4 event variants
-#     (book/price_change/last_trade_price/tick_size_change) as v3 records on
-#     durable Redis Stream `polymarket:events:v3`. Only service holding a
-#     Polymarket WS connection.
+#     Subscribes to the Polymarket WS and publishes all standard and custom
+#     market event variants as v3 records on durable Redis Stream
+#     `polymarket:events:v3`. Only service holding a Polymarket WS connection.
 #
 #   obdata-polymarket-orderbook-rust-from-pubsub
 #     Consumes `polymarket:events:v3` and acknowledges records only after
