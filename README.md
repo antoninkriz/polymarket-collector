@@ -32,17 +32,17 @@ Every completed UTC receive-time hour is a self-contained directory:
 | `market_resolved.parquet` | A resolved market and its winning asset/outcome when supplied. |
 | `manifest.json` | The completion marker and integrity index for the entire hour. |
 
-Every event row carries `timestamp_received`, `sequence`, Polymarket's source
-`timestamp`, and a 32-byte `market` condition ID. Token files also carry a
-32-byte `asset_id`. Prices and sizes are exact decimals, orderbook sides are
-typed lists of `(price, size)` structs, and nullable columns reflect genuine
-source nullability rather than a union of unrelated event schemas.
+Key format rules:
 
-Files are clustered by `(market, asset_id, sequence)`—or `(market, sequence)`
-for lifecycle events—for compact storage and fast selective reads. Global
-replay order is always `sequence`. Treat an hour as complete only when its
-manifest exists. The full schema, encoding, and integrity contract is in
-[`docs/PARQUET_EXPORT.md`](docs/PARQUET_EXPORT.md).
+- **Common columns:** `timestamp_received`, `sequence`, source `timestamp`, and
+  a 32-byte `market`; token files add a 32-byte `asset_id`.
+- **Exact values:** prices and sizes are decimals, and book sides are typed
+  lists of `(price, size)` structs.
+- **Physical order:** `(market, asset_id, sequence)` for token events and
+  `(market, sequence)` for lifecycle events.
+- **Replay order:** always `sequence`, even across different files.
+- **Completion:** trust an hour only when `manifest.json` exists.
+- **Full specification:** [`docs/PARQUET_EXPORT.md`](docs/PARQUET_EXPORT.md).
 
 ## Architecture
 
@@ -59,49 +59,46 @@ Redis restart cache ─────┘                        │              �
 ### Publisher — discovery, collection, and order
 
 [`polymarket-orderbook-rust-pubsub`](services/polymarket/polymarket-orderbook-rust-pubsub)
-owns the live market universe, authoritative WebSocket subscriptions, receive
-timestamps, and collector sequencing. It listens for `new_market` on three
-lifecycle sockets and subscribes the new assets immediately, which avoids
-waiting for a polling cycle on short-lived markets.
 
-A validated Redis restart cache restores known markets quickly. One
-rate-limited Gamma client then reconciles the universe with 10-second new-market
-polls, 30-second resolution polls, and full keyset scans every 30 minutes.
-WebSocket lifecycle messages remain the low-latency primary source.
+- Owns market state, authoritative WebSocket subscriptions, receive timestamps,
+  and collector sequencing.
+- Listens for `new_market` on three lifecycle sockets and subscribes its assets
+  immediately—important for short-lived markets.
+- Restores known markets from a validated Redis cache after restart.
+- Reconciles through one rate-limited Gamma client: new markets every 10
+  seconds, resolutions every 30 seconds, and a full scan every 30 minutes.
 
 ### Redis Stream — the durable handoff
 
-Redis decouples live collection from ClickHouse restarts and transient write
-latency. A renewable lease and fencing generation allow exactly one publisher
-to append to `polymarket:events:v3`. Redis AOF is enabled, and stream records
-remain pending until the writer confirms their ClickHouse commit.
-
-This boundary protects the WebSocket process from short storage interruptions;
-it is not intended to hold hours of peak traffic in RAM. All in-process queues
-are bounded, backpressured, and report high-water marks.
+- Separates live WebSocket collection from ClickHouse restarts and write
+  latency.
+- Uses a renewable lease and fencing generation so exactly one publisher can
+  append to `polymarket:events:v3`.
+- Keeps records pending until ClickHouse commits; Redis AOF is enabled.
+- Absorbs short storage interruptions. It is not sized as a multi-hour RAM
+  backlog.
 
 ### Writer and ClickHouse — a compact raw window
 
 [`polymarket-orderbook-rust-from-pubsub`](services/polymarket/polymarket-orderbook-rust-from-pubsub)
-batches stream records into `polymarket_orderbook_v3`. The table stores only
-nanosecond receive time, collector sequence, and normalized event JSON in
-hourly partitions. `ReplacingMergeTree` keyed by sequence collapses retries of
-the same collector record without attempting unsafe payload-based
-deduplication.
 
-ClickHouse is a queryable export buffer, not the permanent archive. After an
-hour's manifest and all seven objects have been validated, old partitions are
-removed according to `CLICKHOUSE_RETENTION_HOURS` (three hours by default).
-The newest partition is always retained for restart sequence recovery.
+- Batches Redis records into `polymarket_orderbook_v3`.
+- Stores only receive time, collector sequence, and normalized JSON in hourly
+  partitions.
+- Collapses delivery retries by `sequence`; it never deduplicates by payload.
+- Keeps ClickHouse as a short queryable export window. Validated archived
+  partitions expire after three hours by default, while the newest is retained
+  for sequence recovery.
 
 ### Exporter — typed, immutable hours
 
-The [`Rust exporter`](services/r2-archive/exporter) streams ClickHouse Arrow
-batches into event-specific Parquet files without buffering a full hour in
-memory. It writes ZSTD level 9 files, publishes `manifest.json` last, and
-supports atomic local output or bounded multipart uploads to an existing R2
-bucket. Interrupted hours are safe to retry because an incomplete directory
-has no completion manifest.
+The [`Rust exporter`](services/r2-archive/exporter):
+
+- Streams Arrow batches into event-specific Parquet without buffering an hour.
+- Writes ZSTD level 9 files and publishes `manifest.json` last.
+- Supports atomic local output and bounded multipart uploads to an existing R2
+  bucket.
+- Safely retries interrupted hours; an incomplete directory has no manifest.
 
 ### Correctness model
 
@@ -125,13 +122,14 @@ is in [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md).
 
 ### Run the complete pipeline locally
 
-The local runner needs Linux plus Docker Compose or Podman Compose. It creates
-`.env` from `.env.example` when needed, starts Redis and ClickHouse, builds all
-three Rust services, and overrides the exporter to use local storage:
+Requires Linux plus Docker Compose or Podman Compose:
 
 ```sh
 ./run_local.sh
 ```
+
+This creates `.env` when needed, starts the complete stack, builds the Rust
+services, and exports to `.data/parquet` without R2 credentials.
 
 Use a specific container runtime when both are installed:
 
@@ -162,9 +160,12 @@ The supplied ports are loopback-only:
 
 ### Run in production
 
-The production path uses R2. Create the bucket first, copy the environment
-template, set a strong ClickHouse password and all four `R2_*` values, then
-protect the credential file:
+Production uses an existing R2 bucket. Prepare the environment:
+
+1. Create the R2 bucket.
+2. Set a strong `CLICKHOUSE_PASSWORD`.
+3. Set `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY`, and `R2_SECRET_KEY`.
+4. Restrict access to `.env`.
 
 ```sh
 cp .env.example .env
@@ -180,16 +181,14 @@ docker compose -f docker-compose.polymarket.yml \
   up -d --build --remove-orphans
 ```
 
-The application containers use host networking so they can reach the
-loopback-bound Redis and ClickHouse ports. All long-running services use
-`restart: unless-stopped`. Keep those database ports private; remote access
-should go through an authenticated tunnel or a firewall-restricted endpoint.
+Production notes:
 
-`EXPORT_BACKEND=r2` requires `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY`, and
-`R2_SECRET_KEY`. Set `CLICKHOUSE_RETENTION_HOURS=0` only when every raw
-ClickHouse partition should be retained. Do not use `run_local.sh` for an R2
-deployment: its local Compose overlay intentionally changes the archive
-backend to `.data/parquet`.
+- Application containers use host networking to reach loopback Redis and
+  ClickHouse. Keep those ports private.
+- Services use `restart: unless-stopped`.
+- `CLICKHOUSE_RETENTION_HOURS=0` retains every raw partition.
+- Do not use `run_local.sh` for R2: its local overlay switches the exporter to
+  `.data/parquet`.
 
 ### Monitor the pipeline
 
@@ -230,21 +229,28 @@ For an archive-level check, verify that each expected hour has a readable
 `manifest.json`, that its seven listed objects exist, and that consumers verify
 the recorded SHA-256 digests before trusting the hour.
 
-### Capacity planning
+### System requirements
 
-Traffic changes with the number and activity of Polymarket markets. The
-following reference was measured on 2026-08-14 while collecting the full
-universe: approximately 160,000 binary markets, 320,000 assets, 1,280 WebSocket
-connections, and 94.5 million normalized events per hour (about 26,000/s).
+| | Minimum | Recommended |
+|---|---:|---:|
+| CPU | 4 modern vCPUs | 8 modern vCPUs |
+| RAM | 16 GiB | 32 GiB |
+| Local disk with R2 | 50 GiB SSD | 100 GiB NVMe |
+| Network | 100 Mbit/s symmetric | 200 Mbit/s symmetric; 1 Gbit/s for comfortable recovery |
+| Local archive | Add 22 GB/day retained | Add 0.65 TB per 30 days plus headroom |
 
-| Resource | Reference workload | Practical starting point |
+> **Reference workload:** measured on 2026-08-14 with approximately 160,000
+> binary markets, 320,000 assets, 1,280 WebSocket connections, and 94.5 million
+> normalized events per hour (about 26,000/s). Polymarket traffic varies.
+
+| Resource | Measured reference | Explanation |
 |---|---|---|
-| CPU | Roughly one aggregate core in steady state; ClickHouse merges, cold subscription, and hourly export are bursty. | 8 modern vCPUs recommended; 4 is a tight minimum. |
-| RAM | About 6–7 GiB across publisher, writer, Redis, ClickHouse, and an idle exporter; the publisher accounted for roughly 3–4 GiB. | 16 GiB minimum for a healthy full-universe pipeline; 32 GiB recommended. |
-| ClickHouse disk | About 3.4–3.8 GiB per raw receive hour. The default rolling window normally occupies roughly 15–20 GiB including the current partition and headroom. | Fast SSD/NVMe with at least 100 GiB free when exporting to R2. |
-| Parquet archive | About 0.8–0.9 GB per hour, or 20–22 GB/day at the reference rate. | For local retention, budget roughly 0.65 TB per 30 days plus filesystem headroom. |
-| Incoming network | Roughly 60–75 Mbit/s of sustained upstream data in the measured run, with snapshot and reconnect bursts. | At least 200 Mbit/s reliable inbound; 1 Gbit/s gives comfortable recovery headroom. |
-| Outgoing network | Subscription/control traffic was below 1 Mbit/s. R2 data averages about 2 Mbit/s over a day but uploads each hour in a burst. | At least 100 Mbit/s outbound for timely R2 uploads; 200 Mbit/s symmetric is a sensible baseline. |
+| CPU | Roughly one aggregate core in steady state. | ClickHouse merges, cold subscription, and hourly export are bursty; 4 vCPUs is tight and 8 leaves useful headroom. |
+| RAM | About 6–7 GiB total; the publisher used roughly 3–4 GiB. | 16 GiB supports a healthy full-universe pipeline; 32 GiB provides safer burst and backlog capacity. |
+| ClickHouse disk | About 3.4–3.8 GiB per raw hour; the rolling window normally uses 15–20 GiB. | SSD latency matters during simultaneous writes, merges, and export. Container images and temporary files also need room. |
+| Parquet archive | About 0.8–0.9 GB/hour, or 20–22 GB/day. | Local retention needs roughly 0.65 TB per 30 days before filesystem headroom; R2 avoids that persistent local cost. |
+| Incoming network | Roughly 60–75 Mbit/s sustained, with snapshot and reconnect bursts. | 100 Mbit/s is a tight minimum. More bandwidth shortens full-universe and reconnect recovery. |
+| Outgoing network | Control traffic stayed below 1 Mbit/s; R2 averages about 2 Mbit/s but uploads hourly in bursts. | Faster outbound completes R2 uploads well before the next hour becomes eligible. |
 
 RAM sizing assumes the ClickHouse writer is healthy. A writer outage leaves
 the durable Redis Stream growing at approximately the uncompressed event rate:
