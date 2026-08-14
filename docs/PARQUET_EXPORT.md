@@ -88,6 +88,18 @@ container's `/exports` directory to `.data/parquet` on the host. Set
 currently eligible missing hour and exit instead of entering the continuous
 export loop.
 
+After changing only physical Parquet writer settings, completed local files can
+be rewritten in parallel with:
+
+```bash
+cd services/r2-archive/exporter
+python reencode_local.py ../../../.data/parquet --jobs 4
+```
+
+The converter prepares and verifies every replacement before changing any
+completed hour. It removes the hour's manifest while atomically replacing its
+files, then writes a manifest with updated byte sizes and SHA-256 hashes last.
+
 ## Type and identifier conventions
 
 All seven files begin with the same non-null columns, in this order:
