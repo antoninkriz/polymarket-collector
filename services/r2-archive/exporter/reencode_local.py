@@ -1,4 +1,4 @@
-"""Re-encode completed local Parquet exports with the current writer policy."""
+"""Sort and re-encode completed local Parquet exports with the writer policy."""
 
 from __future__ import annotations
 
@@ -129,6 +129,7 @@ def _prepare_file(task: ReencodeTask) -> PreparedFile:
         for column in exporter.PARQUET_DICTIONARY_COLUMNS[task.event_type]
         if column in source.schema_arrow.names
     ]
+    sort_columns = exporter.PARQUET_SORT_COLUMNS[task.event_type]
     column_encodings = {
         column: encoding
         for column, encoding in exporter.PARQUET_COLUMN_ENCODINGS[
@@ -138,6 +139,12 @@ def _prepare_file(task: ReencodeTask) -> PreparedFile:
     }
 
     try:
+        sorted_table = source.read()
+        if sorted_table.num_rows:
+            sorted_table = sorted_table.sort_by(
+                [(column, "ascending") for column in sort_columns]
+            )
+
         with pq.ParquetWriter(
             temporary,
             source.schema_arrow,
@@ -149,9 +156,12 @@ def _prepare_file(task: ReencodeTask) -> PreparedFile:
             dictionary_pagesize_limit=(exporter.PARQUET_DICTIONARY_PAGE_SIZE_LIMIT),
             store_decimal_as_integer=True,
         ) as writer:
+            offset = 0
             for row_group in range(source_metadata.num_row_groups):
-                table = source.read_row_group(row_group)
+                row_count = source_metadata.row_group(row_group).num_rows
+                table = sorted_table.slice(offset, row_count)
                 writer.write_table(table, row_group_size=max(1, table.num_rows))
+                offset += row_count
 
         os.chmod(temporary, task.path.stat().st_mode & 0o777)
         with temporary.open("rb") as output:
@@ -178,6 +188,14 @@ def _prepare_file(task: ReencodeTask) -> PreparedFile:
         )
         if replacement_groups != source_groups:
             raise ValueError(f"row groups changed while re-encoding {task.path}")
+
+        offset = 0
+        for row_group, row_count in enumerate(replacement_groups):
+            actual = replacement.read_row_group(row_group, columns=list(sort_columns))
+            expected = sorted_table.slice(offset, row_count).select(sort_columns)
+            if not actual.equals(expected):
+                raise ValueError(f"sort order changed while re-encoding {task.path}")
+            offset += row_count
 
         return PreparedFile(
             source=task.path,
@@ -249,6 +267,10 @@ def _commit_hour(plan: HourPlan, prepared: tuple[PreparedFile, ...]) -> None:
         for event_type, item in by_event.items():
             manifest["files"][event_type]["byte_size"] = item.new_size
             manifest["files"][event_type]["sha256"] = item.sha256
+            manifest["files"][event_type]["order_by"] = (
+                exporter.PARQUET_SORT_COLUMNS[event_type]
+            )
+        manifest.pop("order_by", None)
         manifest["created_at"] = datetime.now(timezone.utc).isoformat()
         _write_manifest(plan.manifest_path, manifest)
     except BaseException:
@@ -265,7 +287,7 @@ def _commit_hour(plan: HourPlan, prepared: tuple[PreparedFile, ...]) -> None:
 
 
 def reencode(root: Path, jobs: int) -> None:
-    """Re-encode every file referenced by a completed local manifest."""
+    """Sort and re-encode every file referenced by a completed manifest."""
     plans = _discover(root)
     tasks = tuple(task for plan in plans for task in plan.tasks)
     if not tasks:
@@ -316,7 +338,8 @@ def reencode(root: Path, jobs: int) -> None:
     old_bytes = sum(item.old_size for item in prepared)
     new_bytes = sum(item.new_size for item in prepared)
     log.info(
-        "Re-encoded %d files: %.2f GiB -> %.2f GiB, saved %.2f GiB (%.1f%%)",
+        "Sorted and re-encoded %d files: %.2f GiB -> %.2f GiB, "
+        "saved %.2f GiB (%.1f%%)",
         len(prepared),
         old_bytes / (1024**3),
         new_bytes / (1024**3),

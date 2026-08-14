@@ -60,6 +60,7 @@ class ReencodeLocalTest(unittest.TestCase):
                     }
                 },
                 "hour_utc": datetime(2026, 8, 14, 8, tzinfo=timezone.utc).isoformat(),
+                "order_by": ["sequence"],
                 "row_count": table.num_rows,
             }
             manifest_path = hour / "manifest.json"
@@ -73,8 +74,17 @@ class ReencodeLocalTest(unittest.TestCase):
             reencoder._commit_hour(plan, (prepared,))
 
             rewritten = pq.read_table(parquet_path)
-            self.assertTrue(rewritten.equals(table))
+            sort_columns = exporter.PARQUET_SORT_COLUMNS["price_change"]
+            expected = table.sort_by(
+                [(column, "ascending") for column in sort_columns]
+            )
+            self.assertTrue(rewritten.equals(expected))
             updated = json.loads(manifest_path.read_text())
+            self.assertNotIn("order_by", updated)
+            self.assertEqual(
+                updated["files"]["price_change"]["order_by"],
+                ["market", "asset_id", "sequence"],
+            )
             self.assertEqual(
                 updated["files"]["price_change"]["byte_size"],
                 parquet_path.stat().st_size,
@@ -109,8 +119,14 @@ class ReencodeLocalTest(unittest.TestCase):
                     [1_000, 1_001, 1_002, 1_003],
                     type=pa.timestamp("ms", tz="UTC"),
                 ),
-                "market": pa.array([b"m" * 32] * 4, type=pa.binary(32)),
-                "asset_id": pa.array([b"a" * 32] * 4, type=pa.binary(32)),
+                "market": pa.array(
+                    [b"b" * 32, b"a" * 32, b"b" * 32, b"a" * 32],
+                    type=pa.binary(32),
+                ),
+                "asset_id": pa.array(
+                    [b"2" * 32, b"2" * 32, b"1" * 32, b"1" * 32],
+                    type=pa.binary(32),
+                ),
                 "price": pa.array(
                     [Decimal("0.5000")] * 4,
                     type=pa.decimal32(9, 4),
