@@ -354,7 +354,10 @@ async fn stats_loop(
     redis_url: String,
     cache_count_key: String,
 ) {
-    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    const SAMPLES_PER_REPORT: u64 = 60;
+    const PRESSURE_THRESHOLD_PCT: f64 = 50.0;
+
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
 
@@ -362,8 +365,19 @@ async fn stats_loop(
     let mut redis_conn: Option<redis::aio::MultiplexedConnection> = None;
 
     let mut iteration = 0_u64;
+    let mut samples = 0_u64;
+    let mut queue_high_water = 0_usize;
     loop {
         tick.tick().await;
+
+        let queue_max = event_tx.max_capacity();
+        let queue_used = queue_max.saturating_sub(event_tx.capacity());
+        queue_high_water = queue_high_water.max(queue_used);
+        samples += 1;
+        if samples < SAMPLES_PER_REPORT {
+            continue;
+        }
+        samples = 0;
         iteration += 1;
 
         let stats = {
@@ -371,10 +385,13 @@ async fn stats_loop(
             p.pool_stats()
         };
 
-        let queue_max = event_tx.max_capacity();
-        let queue_used = queue_max.saturating_sub(event_tx.capacity());
         let queue_pct = if queue_max > 0 {
             (queue_used as f64 / queue_max as f64) * 100.0
+        } else {
+            0.0
+        };
+        let queue_high_water_pct = if queue_max > 0 {
+            (queue_high_water as f64 / queue_max as f64) * 100.0
         } else {
             0.0
         };
@@ -411,8 +428,10 @@ async fn stats_loop(
         info!(
             iter = iteration,
             queue_size = queue_used,
+            queue_high_water,
             queue_max,
             queue_pct = format!("{:.1}", queue_pct),
+            queue_high_water_pct = format!("{:.1}", queue_high_water_pct),
             subscribed_markets = stats.market_count,
             cache_active_markets,
             connections = stats.connection_count,
@@ -434,31 +453,38 @@ async fn stats_loop(
                 "connections": stats.connection_count,
                 "lifecycle_listeners": stats.lifecycle_listener_count,
                 "queue_size": queue_used,
+                "queue_high_water": queue_high_water,
                 "queue_max": queue_max,
                 "queue_pct": format!("{:.1}", queue_pct),
+                "queue_high_water_pct": format!("{:.1}", queue_high_water_pct),
                 "asset_down_events_total": stats.asset_down_events,
                 "conn_down_events_total": stats.conn_down_events,
             }),
             "pool_stats",
         );
 
-        if queue_pct > 50.0 {
+        if queue_high_water_pct >= PRESSURE_THRESHOLD_PCT {
             warn!(
                 queue_size = queue_used,
+                queue_high_water,
                 queue_max,
                 queue_pct = format!("{:.1}", queue_pct),
-                "[QUEUE-PRESSURE] queue above 50%",
+                queue_high_water_pct = format!("{:.1}", queue_high_water_pct),
+                "[QUEUE-PRESSURE] queue high-water at or above 50%",
             );
             warn!(
                 grafana = true,
                 event = "queue_pressure",
                 meta = %serde_json::json!({
                     "queue_size": queue_used,
+                    "queue_high_water": queue_high_water,
                     "queue_max": queue_max,
                     "queue_pct": format!("{:.1}", queue_pct),
+                    "queue_high_water_pct": format!("{:.1}", queue_high_water_pct),
                 }),
                 "queue_pressure",
             );
         }
+        queue_high_water = 0;
     }
 }

@@ -85,7 +85,7 @@ services:
       CLICKHOUSE_TABLE: polymarket_orderbook_v3
       # WS pool
       SKIP_ACTIVE_MARKETS_CACHE: "false"
-      QUEUE_SIZE: "5000000"
+      QUEUE_SIZE: "250000"
       MAX_ASSETS_PER_CONN: "250"
       # Redis Stream publisher batching
       MAX_BATCH: "200"
@@ -132,7 +132,8 @@ services:
       CLICKHOUSE_TABLE: polymarket_orderbook_v3
       FLUSH_BATCH_SIZE: "5000"
       FLUSH_INTERVAL_MS: "500"
-      QUEUE_SIZE: "5000000"
+      QUEUE_SIZE: "50000"
+      ACK_QUEUE_SIZE: "32"
       RUST_LOG: info,polymarket_orderbook_rust_from_pubsub=info,polymarket_orderbook_rust=info
 
   obdata-polymarket-r2-archive-exporter:

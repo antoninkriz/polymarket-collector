@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+pub const DEFAULT_QUEUE_SIZE: usize = 250_000;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     // -- Redis ---------------------------------------------------------------
@@ -55,6 +57,7 @@ impl Config {
             "PUBLISHER_GENERATION_PERSIST_TIMEOUT_MS",
             5_000_u64,
         )?);
+        let queue_size = env_parse("QUEUE_SIZE", DEFAULT_QUEUE_SIZE)?;
         anyhow::ensure!(
             !publisher_lease_ttl.is_zero(),
             "PUBLISHER_LEASE_TTL_MS must be positive",
@@ -69,6 +72,7 @@ impl Config {
                 && publisher_generation_persist_timeout < publisher_lease_ttl,
             "PUBLISHER_GENERATION_PERSIST_TIMEOUT_MS must be positive and less than PUBLISHER_LEASE_TTL_MS",
         );
+        anyhow::ensure!(queue_size > 0, "QUEUE_SIZE must be positive");
 
         Ok(Self {
             redis_url: require_env("REDIS_URL")?,
@@ -108,7 +112,7 @@ impl Config {
 
             skip_active_markets_cache: env_bool("SKIP_ACTIVE_MARKETS_CACHE"),
 
-            queue_size: env_parse("QUEUE_SIZE", 5_000_000)?,
+            queue_size,
             max_assets_per_conn: env_parse("MAX_ASSETS_PER_CONN", 200)?,
         })
     }
@@ -239,7 +243,7 @@ mod tests {
         assert_eq!(cfg.stream_consumer_name, "orderbook-rust-pubsub-1");
         assert_eq!(cfg.redis_event_stream, "polymarket:events:v3");
         assert!(!cfg.skip_active_markets_cache);
-        assert_eq!(cfg.queue_size, 5_000_000);
+        assert_eq!(cfg.queue_size, DEFAULT_QUEUE_SIZE);
         assert_eq!(cfg.max_assets_per_conn, 200);
         assert_eq!(cfg.publish_batch_max, 200);
         assert_eq!(cfg.publish_linger, Duration::from_millis(2));
@@ -269,6 +273,7 @@ mod tests {
         clear_env();
         std::env::set_var("REDIS_URL", "redis://r:6379");
         std::env::set_var("REDIS_EVENT_STREAM", "my:custom:stream");
+        std::env::set_var("QUEUE_SIZE", "1234");
         std::env::set_var("MAX_ASSETS_PER_CONN", "100");
         std::env::set_var("ORDERBOOK_CONSUMER_GROUP", "g1");
         std::env::set_var("ORDERBOOK_CONSUMER_NAME", "c1");
@@ -286,6 +291,7 @@ mod tests {
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.redis_url, "redis://r:6379");
         assert_eq!(cfg.redis_event_stream, "my:custom:stream");
+        assert_eq!(cfg.queue_size, 1234);
         assert_eq!(cfg.max_assets_per_conn, 100);
         assert_eq!(cfg.stream_consumer_group, "g1");
         assert_eq!(cfg.stream_consumer_name, "c1");
@@ -301,6 +307,20 @@ mod tests {
         assert_eq!(cfg.clickhouse_url, "http://clickhouse:8124");
         assert_eq!(cfg.clickhouse_database, "marketdata");
         assert_eq!(cfg.clickhouse_table, "events_v3");
+
+        restore_env(snap);
+    }
+
+    #[test]
+    fn from_env_rejects_zero_queue_size() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let snap = snapshot_env();
+        clear_env();
+        std::env::set_var("REDIS_URL", "redis://localhost:6379");
+        std::env::set_var("QUEUE_SIZE", "0");
+
+        let err = Config::from_env().unwrap_err().to_string();
+        assert!(err.contains("QUEUE_SIZE must be positive"), "{err}");
 
         restore_env(snap);
     }

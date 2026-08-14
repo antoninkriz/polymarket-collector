@@ -40,11 +40,13 @@ async fn main() -> Result<()> {
         delete_acked_stream_entries = cfg.delete_acked_stream_entries,
         ttl_minutes = cfg.ttl_minutes,
         queue_size = cfg.queue_size,
+        ack_queue_size = cfg.ack_queue_size,
         "starting polymarket-orderbook-rust-from-pubsub",
     );
 
     let (event_tx, event_rx) = mpsc::channel::<SinkItem>(cfg.queue_size);
-    let (ack_tx, ack_rx) = mpsc::channel::<Vec<String>>(1_000);
+    let (ack_tx, ack_rx) = mpsc::channel::<Vec<String>>(cfg.ack_queue_size);
+    let ack_monitor_tx = ack_tx.clone();
     let sink = Sink::connect(SinkConfig {
         url: cfg.clickhouse_url.clone(),
         user: cfg.clickhouse_user.clone(),
@@ -75,7 +77,11 @@ async fn main() -> Result<()> {
         Arc::clone(&stats),
     ));
 
-    let stats_handle = tokio::spawn(stats_loop(event_tx.clone(), Arc::clone(&stats)));
+    let stats_handle = tokio::spawn(stats_loop(
+        event_tx.clone(),
+        ack_monitor_tx,
+        Arc::clone(&stats),
+    ));
 
     wait_for_shutdown().await;
     info!("shutdown signal received");
@@ -99,40 +105,99 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn stats_loop(event_tx: mpsc::Sender<SinkItem>, stats: Arc<SubscriberStats>) {
+async fn stats_loop(
+    event_tx: mpsc::Sender<SinkItem>,
+    ack_tx: mpsc::Sender<Vec<String>>,
+    stats: Arc<SubscriberStats>,
+) {
     use std::sync::atomic::Ordering;
-    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    const SAMPLES_PER_REPORT: u64 = 60;
+    const PRESSURE_THRESHOLD_PCT: f64 = 75.0;
+
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
+    let mut samples = 0_u64;
+    let mut event_queue_high_water = 0_usize;
+    let mut ack_queue_high_water = 0_usize;
     loop {
         tick.tick().await;
-        let queue_max = event_tx.max_capacity();
-        let queue_used = queue_max.saturating_sub(event_tx.capacity());
-        let queue_pct = if queue_max > 0 {
-            (queue_used as f64 / queue_max as f64) * 100.0
+        let event_queue_max = event_tx.max_capacity();
+        let event_queue_used = event_queue_max.saturating_sub(event_tx.capacity());
+        let ack_queue_max = ack_tx.max_capacity();
+        let ack_queue_used = ack_queue_max.saturating_sub(ack_tx.capacity());
+        event_queue_high_water = event_queue_high_water.max(event_queue_used);
+        ack_queue_high_water = ack_queue_high_water.max(ack_queue_used);
+        samples += 1;
+        if samples < SAMPLES_PER_REPORT {
+            continue;
+        }
+        samples = 0;
+
+        let event_queue_pct = if event_queue_max > 0 {
+            (event_queue_used as f64 / event_queue_max as f64) * 100.0
         } else {
             0.0
         };
+        let event_queue_high_water_pct = if event_queue_max > 0 {
+            (event_queue_high_water as f64 / event_queue_max as f64) * 100.0
+        } else {
+            0.0
+        };
+        let ack_queue_pct = if ack_queue_max > 0 {
+            (ack_queue_used as f64 / ack_queue_max as f64) * 100.0
+        } else {
+            0.0
+        };
+        let ack_queue_high_water_pct = if ack_queue_max > 0 {
+            (ack_queue_high_water as f64 / ack_queue_max as f64) * 100.0
+        } else {
+            0.0
+        };
+        let events_forwarded = stats.events_forwarded.load(Ordering::Relaxed);
+        let events_acked = stats.events_acked.load(Ordering::Relaxed);
         info!(
-            queue_size = queue_used,
-            queue_max,
-            queue_pct = format!("{queue_pct:.1}"),
+            event_queue_size = event_queue_used,
+            event_queue_high_water,
+            event_queue_max,
+            event_queue_pct = format!("{event_queue_pct:.1}"),
+            event_queue_high_water_pct = format!("{event_queue_high_water_pct:.1}"),
+            ack_queue_batches = ack_queue_used,
+            ack_queue_high_water_batches = ack_queue_high_water,
+            ack_queue_max_batches = ack_queue_max,
+            ack_queue_pct = format!("{ack_queue_pct:.1}"),
+            ack_queue_high_water_pct = format!("{ack_queue_high_water_pct:.1}"),
             events_received = stats.events_received.load(Ordering::Relaxed),
-            events_forwarded = stats.events_forwarded.load(Ordering::Relaxed),
-            events_acked = stats.events_acked.load(Ordering::Relaxed),
+            events_forwarded,
+            events_acked,
+            forwarded_minus_acked = events_forwarded.saturating_sub(events_acked),
             events_deleted = stats.events_deleted.load(Ordering::Relaxed),
             parse_failures = stats.parse_failures.load(Ordering::Relaxed),
             reconnects = stats.reconnects.load(Ordering::Relaxed),
             "[POLYMARKET-FROM-PUBSUB-STATS]",
         );
-        if queue_pct > 50.0 {
+        if event_queue_high_water_pct >= PRESSURE_THRESHOLD_PCT {
             warn!(
-                queue_size = queue_used,
-                queue_max,
-                queue_pct = format!("{queue_pct:.1}"),
-                "polymarket from-pubsub queue above 50%",
+                event_queue_size = event_queue_used,
+                event_queue_high_water,
+                event_queue_max,
+                event_queue_pct = format!("{event_queue_pct:.1}"),
+                event_queue_high_water_pct = format!("{event_queue_high_water_pct:.1}"),
+                "polymarket from-pubsub event queue high-water at or above 75%",
             );
         }
+        if ack_queue_high_water_pct >= PRESSURE_THRESHOLD_PCT {
+            warn!(
+                ack_queue_batches = ack_queue_used,
+                ack_queue_high_water_batches = ack_queue_high_water,
+                ack_queue_max_batches = ack_queue_max,
+                ack_queue_pct = format!("{ack_queue_pct:.1}"),
+                ack_queue_high_water_pct = format!("{ack_queue_high_water_pct:.1}"),
+                "polymarket acknowledgement queue high-water at or above 75%",
+            );
+        }
+        event_queue_high_water = 0;
+        ack_queue_high_water = 0;
     }
 }
 
