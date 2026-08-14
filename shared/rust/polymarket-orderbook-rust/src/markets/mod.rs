@@ -1,18 +1,12 @@
 //! Market discovery and lifecycle.
 //!
-//! Two phases:
-//!
-//! - **Pre-load** at startup: read the active-markets cache from Redis (or
-//!   fall back to the Gamma API), produce an initial list of [`Market`]s to
-//!   subscribe to. Skipped under `--new-only`.
-//! - **Runtime**: consume the `polymarket:market_events` Redis stream as a
-//!   consumer-group member. Dispatch `new_market` events to the pool's
-//!   `subscribe_markets`, and `market_resolved` events to `unsubscribe_markets`.
+//! The publisher loads an optional Redis restart cache, then reconciles active,
+//! newly created, and resolved markets directly from Gamma while WebSocket
+//! lifecycle events remain the primary low-latency source.
 
 pub mod gamma;
 pub mod lifecycle;
 pub mod redis_cache;
-pub mod stream;
 
 use crate::events::Market;
 

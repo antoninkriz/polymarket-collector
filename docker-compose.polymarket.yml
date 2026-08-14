@@ -2,14 +2,9 @@ name: obdata-polymarket
 
 # Polymarket orderbook stack — obdata-side, full pipeline.
 #
-#   obdata-polymarket-active-markets
-#     Polls the Polymarket Gamma REST API, maintains the Redis active_markets
-#     cache and lifecycle event stream that the pubsub publisher consumes.
-#
 #   obdata-polymarket-orderbook-rust-pubsub
-#     Subscribes to the Polymarket WS and publishes all standard and custom
-#     market event variants as v3 records on durable Redis Stream
-#     `polymarket:events:v3`. Only service holding a Polymarket WS connection.
+#     Owns Gamma market discovery and the restart cache, subscribes to the
+#     Polymarket WS, and publishes v3 records to `polymarket:events:v3`.
 #
 #   obdata-polymarket-orderbook-rust-from-pubsub
 #     Consumes `polymarket:events:v3` and acknowledges records only after
@@ -24,38 +19,17 @@ name: obdata-polymarket
 
 services:
 
-  obdata-polymarket-active-markets:
-    build:
-      context: .
-      dockerfile: services/polymarket/polymarket-active-markets/Dockerfile
-    container_name: obdata-polymarket-active-markets
-    command: ["python", "run.py"]
-    env_file:
-      - path: .env
-        required: false
-    restart: unless-stopped
-    network_mode: host
-    environment:
-      REDIS_URL: redis://localhost:6380
-      REDIS_STREAM_MARKET_EVENTS: polymarket:market_events
-      REDIS_KEY_ACTIVE_MARKETS: polymarket:active_markets
-      REDIS_KEY_ACTIVE_MARKETS_COUNT: polymarket:active_markets:count
-
   obdata-polymarket-orderbook-rust-pubsub:
     build:
       context: .
       dockerfile: services/polymarket/polymarket-orderbook-rust-pubsub/Dockerfile
     container_name: obdata-polymarket-orderbook-rust-pubsub
-    # Optional flags: --new-only (skip pre-loading active markets),
-    #                 --skip-backlog (skip unprocessed Redis stream messages)
     command: ["/app/polymarket-orderbook-rust-pubsub"]
     env_file:
       - path: .env
         required: false
     restart: unless-stopped
     network_mode: host
-    depends_on:
-      - obdata-polymarket-active-markets
     ulimits:
       nofile:
         soft: ${CONTAINER_NOFILE_LIMIT:-65536}
@@ -63,9 +37,7 @@ services:
     environment:
       # Redis (host-local)
       REDIS_URL: redis://localhost:6380
-      REDIS_STREAM_MARKET_EVENTS: polymarket:market_events
       REDIS_KEY_ACTIVE_MARKETS: polymarket:active_markets
-      REDIS_KEY_ACTIVE_MARKETS_COUNT: polymarket:active_markets:count
       # Durable event log consumed and acknowledged by the ClickHouse writer.
       REDIS_EVENT_STREAM: polymarket:events:v3
       # Exactly one authoritative publisher may hold this renewable lease.
@@ -91,9 +63,6 @@ services:
       # Redis Stream publisher batching
       MAX_BATCH: "200"
       LINGER_MS: "2"
-      # Independent consumer group from the from-pubsub side
-      ORDERBOOK_CONSUMER_GROUP: polymarket-orderbook-pubsub
-      ORDERBOOK_CONSUMER_NAME: polymarket-orderbook-pubsub-1
       RUST_LOG: info,polymarket_orderbook_rust_pubsub=info,polymarket_orderbook_rust=info
 
   obdata-polymarket-orderbook-rust-from-pubsub:

@@ -243,7 +243,6 @@ impl LifecycleState {
         markets.sort_unstable_by(|left, right| left.hash.cmp(&right.hash));
         ActiveMarketSnapshot {
             revision: self.revision,
-            active_count: self.active.len(),
             markets,
         }
     }
@@ -702,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_ws_and_stream_inputs_keep_first_source() {
+    fn duplicate_ws_and_gamma_inputs_keep_first_source() {
         let mut state = LifecycleState::default();
         let observation = new_market("m", ["a", "b"]);
         let first = state.plan_observation(&observation).unwrap();
@@ -711,7 +710,7 @@ mod tests {
 
         let duplicate = state.plan_observation(&observation).unwrap();
         assert!(matches!(duplicate, PlannedObservation::Duplicate));
-        state.commit_observation(&duplicate, LifecycleSource::RedisStream);
+        state.commit_observation(&duplicate, LifecycleSource::Gamma);
         assert_eq!(
             state.first_source.get(&LifecycleKey::NewMarket("m".into())),
             Some(&LifecycleSource::WebSocket)
@@ -719,16 +718,16 @@ mod tests {
     }
 
     #[test]
-    fn stream_can_win_source_precedence() {
+    fn gamma_can_win_source_precedence() {
         let mut state = LifecycleState::default();
         let observation = new_market("m", ["a", "b"]);
         let first = state.plan_observation(&observation).unwrap();
-        state.commit_observation(&first, LifecycleSource::RedisStream);
+        state.commit_observation(&first, LifecycleSource::Gamma);
         let duplicate = state.plan_observation(&observation).unwrap();
         state.commit_observation(&duplicate, LifecycleSource::WebSocket);
         assert_eq!(
             state.first_source.get(&LifecycleKey::NewMarket("m".into())),
-            Some(&LifecycleSource::RedisStream)
+            Some(&LifecycleSource::Gamma)
         );
     }
 
@@ -769,7 +768,7 @@ mod tests {
 
         let dropped = state.plan_observation(&incomplete).unwrap();
         assert!(matches!(dropped, PlannedObservation::Drop));
-        state.commit_observation(&dropped, LifecycleSource::RedisStream);
+        state.commit_observation(&dropped, LifecycleSource::Gamma);
         assert!(state.first_source.is_empty());
 
         assert!(matches!(
@@ -795,7 +794,7 @@ mod tests {
 
         let duplicate = state.plan_observation(&observation).unwrap();
         assert!(matches!(duplicate, PlannedObservation::Duplicate));
-        state.commit_observation(&duplicate, LifecycleSource::RedisStream);
+        state.commit_observation(&duplicate, LifecycleSource::Gamma);
         assert_eq!(
             state
                 .first_source
@@ -817,13 +816,13 @@ mod tests {
             suppressed,
             PlannedObservation::SuppressTerminal { .. }
         ));
-        state.commit_observation(&suppressed, LifecycleSource::RedisStream);
+        state.commit_observation(&suppressed, LifecycleSource::Gamma);
 
         assert!(state.active.is_empty());
         assert!(state.asset_owner.is_empty());
         assert_eq!(
             state.first_source.get(&LifecycleKey::NewMarket("m".into())),
-            Some(&LifecycleSource::RedisStream)
+            Some(&LifecycleSource::Gamma)
         );
 
         assert!(state
@@ -855,7 +854,6 @@ mod tests {
             .unwrap();
         let snapshot = completed.await.unwrap();
 
-        assert_eq!(snapshot.active_count, 2);
         assert_eq!(
             snapshot
                 .markets
@@ -872,7 +870,6 @@ mod tests {
             .state
             .commit_observation(&plan, LifecycleSource::WebSocket);
         assert_eq!(coordinator.state.active.len(), 1);
-        assert_eq!(snapshot.active_count, 2);
         assert_eq!(snapshot.markets.len(), 2);
     }
 

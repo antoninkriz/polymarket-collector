@@ -5,10 +5,9 @@
 //! instead of inserting into ClickHouse.
 //!
 //! ```text
-//!   Redis cache / Gamma API ──> initial market set ──┐
-//!   Redis lifecycle stream ──> reconciliation ───────┤
+//!   Redis restart cache + Gamma reconciliation ──────┐
 //!   WS lifecycle routes ──> deduplicated updates ────┤
-//!                                                   v
+//!                                                    v
 //!   Polymarket WS pool ── (mpsc) ──> Redis XADD (durable event stream)
 //! ```
 
@@ -17,7 +16,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use clap::Parser;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -25,7 +23,6 @@ use tracing::{info, warn};
 use polymarket_orderbook_rust::events::{Market, MarketLifecycleObservation};
 use polymarket_orderbook_rust::markets;
 use polymarket_orderbook_rust::markets::lifecycle::LifecycleRequest;
-use polymarket_orderbook_rust::markets::stream::StreamConfig;
 use polymarket_orderbook_rust::record::EventRecord;
 use polymarket_orderbook_rust::ws::pool::Pool;
 
@@ -36,24 +33,10 @@ use polymarket_orderbook_rust_pubsub::market_lifecycle::LifecycleCoordinator;
 use polymarket_orderbook_rust_pubsub::pubsub_sink::{PubSubSink, PubSubSinkConfig};
 use polymarket_orderbook_rust_pubsub::sequence_watermark::clickhouse_generation_floor;
 
-#[derive(Debug, Parser)]
-#[command(name = "polymarket-orderbook-rust-pubsub")]
-#[command(about = "Polymarket orderbook → durable Redis Stream publisher")]
-struct Cli {
-    /// Only listen for new markets, skip pre-loading active markets.
-    #[arg(long)]
-    new_only: bool,
-
-    /// Skip unprocessed Redis stream messages, only process new ones.
-    #[arg(long)]
-    skip_backlog: bool,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     init_tracing();
-    let cli = Cli::parse();
     let cfg = Config::from_env().context("load config from env")?;
     let clickhouse_generation_floor = clickhouse_generation_floor(&cfg)
         .await
@@ -72,8 +55,6 @@ async fn main() -> Result<()> {
     .context("acquire authoritative publisher lease")?;
     let publisher_fence = publisher_lease.generation();
     info!(
-        new_only = cli.new_only,
-        skip_backlog = cli.skip_backlog,
         redis_url = %cfg.redis_url,
         event_stream = %cfg.redis_event_stream,
         max_assets_per_conn = cfg.max_assets_per_conn,
@@ -126,12 +107,7 @@ async fn main() -> Result<()> {
         LifecycleCoordinator::new(Arc::clone(&pool), websocket_lifecycle_rx, reconciliation_rx);
     let mut coordinator_handle = tokio::spawn(coordinator.run());
 
-    let (cached_markets, cache_fetched_at) = if cli.new_only {
-        info!("--new-only set, skipping active market restart cache");
-        (Vec::new(), None)
-    } else {
-        load_restart_cache(&cfg).await
-    };
+    let (cached_markets, cache_fetched_at) = load_restart_cache(&cfg).await;
     let cold_start = cached_markets.is_empty();
     if !cached_markets.is_empty() {
         let market_count = cached_markets.len();
@@ -144,17 +120,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    let stream_cfg = StreamConfig {
-        redis_url: cfg.redis_url.clone(),
-        stream_key: cfg.redis_stream_market_events.clone(),
-        group: cfg.stream_consumer_group.clone(),
-        consumer: cfg.stream_consumer_name.clone(),
-        skip_backlog: cli.skip_backlog,
-    };
-    let stream_lifecycle_tx = reconciliation_tx.clone();
-    let mut stream_handle: JoinHandle<Result<()>> =
-        tokio::spawn(async move { markets::stream::run(stream_cfg, stream_lifecycle_tx).await });
-
     let gamma_http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -163,15 +128,7 @@ async fn main() -> Result<()> {
     let reconciliation_stats = Arc::new(ReconciliationStats::default());
     let (cache_trigger_tx, cache_trigger_rx) = mpsc::channel(1);
     let (gamma_shutdown_tx, gamma_shutdown_rx) = watch::channel(false);
-    let mut full_scan_handle: JoinHandle<Result<()>> = if cli.new_only {
-        tokio::spawn(async move {
-            let mut shutdown = gamma_shutdown_rx;
-            shutdown
-                .changed()
-                .await
-                .context("Gamma shutdown sender dropped")
-        })
-    } else {
+    let mut full_scan_handle: JoinHandle<Result<()>> =
         tokio::spawn(gamma_reconcile::run_full_scans(
             gamma_client.clone(),
             reconciliation_tx.clone(),
@@ -179,8 +136,7 @@ async fn main() -> Result<()> {
             cache_trigger_tx,
             Arc::clone(&reconciliation_stats),
             gamma_shutdown_rx,
-        ))
-    };
+        ));
     let startup_poll_time = Utc::now();
     let mut new_poll_handle = tokio::spawn(gamma_reconcile::run_new_market_polls(
         gamma_client.clone(),
@@ -204,8 +160,6 @@ async fn main() -> Result<()> {
 
     let stats_pool = Arc::clone(&pool);
     let stats_event_tx = event_tx.clone();
-    let stats_redis_url = cfg.redis_url.clone();
-    let stats_cache_count_key = cfg.redis_key_active_markets_count.clone();
     let stats_websocket_lifecycle_tx = websocket_lifecycle_tx.clone();
     let stats_reconciliation_tx = reconciliation_tx.clone();
     let stats_reconciliation = Arc::clone(&reconciliation_stats);
@@ -216,14 +170,11 @@ async fn main() -> Result<()> {
             stats_websocket_lifecycle_tx,
             stats_reconciliation_tx,
             stats_reconciliation,
-            stats_redis_url,
-            stats_cache_count_key,
         )
         .await;
     });
 
     let mut sink_outcome = None;
-    let mut stream_stopped = false;
     let mut coordinator_stopped = false;
     let mut full_scan_stopped = false;
     let mut new_poll_stopped = false;
@@ -237,10 +188,6 @@ async fn main() -> Result<()> {
         outcome = &mut sink_handle => {
             warn!(?outcome, "Redis event sink stopped; stopping collector");
             sink_outcome = Some(outcome);
-        }
-        outcome = &mut stream_handle => {
-            warn!(?outcome, "Redis lifecycle stream stopped; stopping collector");
-            stream_stopped = true;
         }
         outcome = &mut coordinator_handle => {
             warn!(?outcome, "market lifecycle coordinator stopped; stopping collector");
@@ -280,12 +227,6 @@ async fn main() -> Result<()> {
         cache_saver_handle.abort();
         let _ = cache_saver_handle.await;
     }
-
-    if !stream_stopped {
-        stream_handle.abort();
-        let _ = stream_handle.await;
-    }
-    info!("stream listener stopped");
 
     if !coordinator_stopped {
         if let Err(error) = gamma_reconcile::persist_final_snapshot(
@@ -424,8 +365,6 @@ async fn stats_loop(
     websocket_lifecycle_tx: mpsc::Sender<MarketLifecycleObservation>,
     reconciliation_tx: mpsc::Sender<LifecycleRequest>,
     reconciliation_stats: Arc<ReconciliationStats>,
-    redis_url: String,
-    cache_count_key: String,
 ) {
     const SAMPLES_PER_REPORT: u64 = 60;
     const PRESSURE_THRESHOLD_PCT: f64 = 50.0;
@@ -433,9 +372,6 @@ async fn stats_loop(
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
-
-    let redis_client = redis::Client::open(redis_url.as_str()).ok();
-    let mut redis_conn: Option<redis::aio::MultiplexedConnection> = None;
 
     let mut iteration = 0_u64;
     let mut samples = 0_u64;
@@ -490,35 +426,6 @@ async fn stats_loop(
             0.0
         };
 
-        let cache_active_markets: u64 = 'redis: {
-            if redis_conn.is_none() {
-                if let Some(client) = &redis_client {
-                    match client.get_multiplexed_async_connection().await {
-                        Ok(conn) => redis_conn = Some(conn),
-                        Err(e) => {
-                            warn!(error = %e, "stats_loop: Redis connect failed");
-                            break 'redis 0;
-                        }
-                    }
-                } else {
-                    break 'redis 0;
-                }
-            }
-            let conn = redis_conn.as_mut().unwrap();
-            let r: redis::RedisResult<Option<String>> = redis::cmd("GET")
-                .arg(&cache_count_key)
-                .query_async(conn)
-                .await;
-            match r {
-                Ok(v) => v.and_then(|s| s.parse().ok()).unwrap_or(0),
-                Err(e) => {
-                    warn!(error = %e, "stats_loop: Redis GET failed, will reconnect");
-                    redis_conn = None;
-                    0
-                }
-            }
-        };
-
         info!(
             iter = iteration,
             queue_size = queue_used,
@@ -536,7 +443,6 @@ async fn stats_loop(
             reconciliation_queue_max = reconciliation_max,
             reconciliation_queue_high_water_pct = format!("{:.1}", reconciliation_high_water_pct),
             subscribed_markets = stats.market_count,
-            cache_active_markets,
             connections = stats.connection_count,
             lifecycle_listeners = stats.lifecycle_listener_count,
             gamma_full_scan_age_s = ?reconciliation_ages.full_scan_seconds,
@@ -556,7 +462,6 @@ async fn stats_loop(
             meta = %serde_json::json!({
                 "iter": iteration,
                 "subscribed_markets": stats.market_count,
-                "cache_active_markets": cache_active_markets,
                 "connections": stats.connection_count,
                 "lifecycle_listeners": stats.lifecycle_listener_count,
                 "queue_size": queue_used,

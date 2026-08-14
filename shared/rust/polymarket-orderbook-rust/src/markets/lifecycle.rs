@@ -7,7 +7,6 @@ use crate::events::{Market, MarketLifecycleObservation};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleSource {
     WebSocket,
-    RedisStream,
     Gamma,
 }
 
@@ -16,7 +15,6 @@ pub type LifecycleCompletion = oneshot::Sender<Result<(), String>>;
 #[derive(Debug, Clone)]
 pub struct ActiveMarketSnapshot {
     pub revision: u64,
-    pub active_count: usize,
     pub markets: Vec<Market>,
 }
 

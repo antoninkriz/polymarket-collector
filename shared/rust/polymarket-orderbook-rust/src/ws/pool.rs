@@ -61,7 +61,7 @@ pub struct Pool {
     asset_to_conn: HashMap<String, usize>,
     next_conn_id: usize,
     /// Stable ID of the lifecycle anchor. It remains alive with no data
-    /// assets so `--new-only` still has one lifecycle listener.
+    /// assets so lifecycle discovery remains available during cold start.
     lifecycle_conn_id: Option<usize>,
     lifecycle_tx: Option<mpsc::Sender<MarketLifecycleObservation>>,
     health_counters: Arc<HealthCounters>,
@@ -139,7 +139,7 @@ impl Pool {
     }
 
     /// Ensure the lifecycle anchor exists. This is required even with no
-    /// preloaded assets so `--new-only` can receive `new_market` events.
+    /// preloaded assets so cold start can receive `new_market` events.
     pub async fn start(&mut self) {
         if self.lifecycle_conn_id.is_none() {
             self.spawn_connection().await;

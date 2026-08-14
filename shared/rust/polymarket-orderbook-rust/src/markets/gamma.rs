@@ -17,7 +17,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::warn;
 
 use crate::events::Market;
 use crate::record::now_ns;
@@ -321,63 +321,6 @@ impl GammaClient {
 struct Received<T> {
     value: T,
     received_at_ns: i64,
-}
-
-/// Fetch all active binary markets from Gamma with keyset pagination.
-///
-/// This compatibility entry point is used by the current publisher startup
-/// path. Runtime topology remains unchanged; future callers can share a
-/// [`GammaClient`] directly across discovery and lifecycle tasks.
-pub async fn fetch_active_markets(http: &reqwest::Client) -> Result<Vec<Market>> {
-    let gamma = GammaClient::new(http.clone());
-    let records = fetch_active_market_records(&gamma).await?;
-    Ok(records
-        .into_iter()
-        .filter_map(|market| market.active_subscription())
-        .collect())
-}
-
-/// Fetch all active/open Gamma records that describe a valid binary market.
-pub async fn fetch_active_market_records(client: &GammaClient) -> Result<Vec<GammaMarket>> {
-    let mut scan = client.full_active_scan();
-    let mut seen_markets = HashSet::new();
-    let mut markets = Vec::new();
-    let mut page_number = 0_usize;
-
-    loop {
-        let Some(page) = client.next_keyset_page(&mut scan).await? else {
-            break;
-        };
-        page_number += 1;
-        let page_size = page.len();
-
-        for market in page {
-            if seen_markets.insert(market.condition_id.clone()) {
-                markets.push(market);
-            }
-        }
-
-        debug!(
-            page_number,
-            fetched = page_size,
-            total_binary_markets = markets.len(),
-            "Gamma keyset page fetched"
-        );
-        if page_number.is_multiple_of(100) {
-            info!(
-                page_number,
-                total_binary_markets = markets.len(),
-                "Gamma active-market fetch progress"
-            );
-        }
-    }
-
-    info!(
-        pages = page_number,
-        total_binary_markets = markets.len(),
-        "Gamma active-market fetch complete"
-    );
-    Ok(markets)
 }
 
 fn scan_params(kind: KeysetScanKind, cursor: Option<&str>) -> Vec<(&'static str, String)> {

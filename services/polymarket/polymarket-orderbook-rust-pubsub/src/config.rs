@@ -14,11 +14,7 @@ pub const DEFAULT_LIFECYCLE_QUEUE_SIZE: usize = 8_192;
 pub struct Config {
     // -- Redis ---------------------------------------------------------------
     pub redis_url: String,
-    pub redis_stream_market_events: String,
     pub redis_key_active_markets: String,
-    pub redis_key_active_markets_count: String,
-    pub stream_consumer_group: String,
-    pub stream_consumer_name: String,
 
     // -- Pub/sub publish -----------------------------------------------------
     pub redis_event_stream: String,
@@ -83,20 +79,10 @@ impl Config {
 
         Ok(Self {
             redis_url: require_env("REDIS_URL")?,
-            redis_stream_market_events: env_or(
-                "REDIS_STREAM_MARKET_EVENTS",
-                "polymarket:market_events",
-            ),
             redis_key_active_markets: env_or(
                 "REDIS_KEY_ACTIVE_MARKETS",
-                "polymarket:active_markets:pubsub",
+                "polymarket:active_markets",
             ),
-            redis_key_active_markets_count: env_or(
-                "REDIS_KEY_ACTIVE_MARKETS_COUNT",
-                "polymarket:active_markets:pubsub:count",
-            ),
-            stream_consumer_group: env_or("ORDERBOOK_CONSUMER_GROUP", "orderbook-rust-pubsub"),
-            stream_consumer_name: env_or("ORDERBOOK_CONSUMER_NAME", "orderbook-rust-pubsub-1"),
 
             redis_event_stream: env_or("REDIS_EVENT_STREAM", "polymarket:events:v3"),
             publish_batch_max: env_parse("MAX_BATCH", 200_usize)?,
@@ -167,11 +153,7 @@ mod tests {
 
     const ALL_ENV_KEYS: &[&str] = &[
         "REDIS_URL",
-        "REDIS_STREAM_MARKET_EVENTS",
         "REDIS_KEY_ACTIVE_MARKETS",
-        "REDIS_KEY_ACTIVE_MARKETS_COUNT",
-        "ORDERBOOK_CONSUMER_GROUP",
-        "ORDERBOOK_CONSUMER_NAME",
         "REDIS_EVENT_STREAM",
         "SKIP_ACTIVE_MARKETS_CACHE",
         "QUEUE_SIZE",
@@ -239,17 +221,7 @@ mod tests {
 
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.redis_url, "redis://localhost:6379");
-        assert_eq!(cfg.redis_stream_market_events, "polymarket:market_events");
-        assert_eq!(
-            cfg.redis_key_active_markets,
-            "polymarket:active_markets:pubsub"
-        );
-        assert_eq!(
-            cfg.redis_key_active_markets_count,
-            "polymarket:active_markets:pubsub:count",
-        );
-        assert_eq!(cfg.stream_consumer_group, "orderbook-rust-pubsub");
-        assert_eq!(cfg.stream_consumer_name, "orderbook-rust-pubsub-1");
+        assert_eq!(cfg.redis_key_active_markets, "polymarket:active_markets");
         assert_eq!(cfg.redis_event_stream, "polymarket:events:v3");
         assert!(!cfg.skip_active_markets_cache);
         assert_eq!(cfg.queue_size, DEFAULT_QUEUE_SIZE);
@@ -286,8 +258,7 @@ mod tests {
         std::env::set_var("QUEUE_SIZE", "1234");
         std::env::set_var("LIFECYCLE_QUEUE_SIZE", "4321");
         std::env::set_var("MAX_ASSETS_PER_CONN", "100");
-        std::env::set_var("ORDERBOOK_CONSUMER_GROUP", "g1");
-        std::env::set_var("ORDERBOOK_CONSUMER_NAME", "c1");
+        std::env::set_var("REDIS_KEY_ACTIVE_MARKETS", "custom:markets");
         std::env::set_var("PUBLISHER_LEASE_KEY", "custom:lease");
         std::env::set_var("PUBLISHER_LEASE_GENERATION_KEY", "custom:generation");
         std::env::set_var("PUBLISHER_LEASE_TTL_MS", "9000");
@@ -305,8 +276,7 @@ mod tests {
         assert_eq!(cfg.queue_size, 1234);
         assert_eq!(cfg.lifecycle_queue_size, 4321);
         assert_eq!(cfg.max_assets_per_conn, 100);
-        assert_eq!(cfg.stream_consumer_group, "g1");
-        assert_eq!(cfg.stream_consumer_name, "c1");
+        assert_eq!(cfg.redis_key_active_markets, "custom:markets");
         assert_eq!(cfg.publisher_lease_key, "custom:lease");
         assert_eq!(cfg.publisher_lease_generation_key, "custom:generation");
         assert_eq!(cfg.publisher_lease_ttl, Duration::from_secs(9));

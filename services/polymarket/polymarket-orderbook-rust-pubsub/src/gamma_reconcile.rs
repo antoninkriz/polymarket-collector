@@ -127,8 +127,10 @@ async fn run_full_scan(
     .await?;
     let mut scan = client.full_active_scan();
     let mut pages = 0_usize;
+    let mut total_markets = 0_usize;
     while let Some(markets) = client.next_keyset_page(&mut scan).await? {
         pages += 1;
+        total_markets += markets.len();
         let markets = markets.into_iter().filter_map(scanned_active).collect();
         send_confirmed(lifecycle_tx, |completion| LifecycleRequest::ScanPage {
             scan_id,
@@ -136,13 +138,19 @@ async fn run_full_scan(
             completion,
         })
         .await?;
+        if pages.is_multiple_of(100) {
+            info!(scan_id, pages, total_markets, "full Gamma scan progress");
+        }
     }
     send_confirmed(lifecycle_tx, |completion| LifecycleRequest::ScanFinish {
         scan_id,
         completion,
     })
     .await?;
-    info!(scan_id, pages, cold_start, "full Gamma scan completed");
+    info!(
+        scan_id,
+        pages, total_markets, cold_start, "full Gamma scan completed"
+    );
     Ok(())
 }
 
@@ -248,8 +256,8 @@ pub async fn run_cache_saver(
                 match trigger {
                     Some(CacheSaveTrigger::Force) => force = true,
                     None => {
-                        // Periodic persistence remains useful when the optional
-                        // full-scan producer is disabled by --new-only.
+                        // Periodic persistence remains useful if the force
+                        // trigger sender stops during shutdown.
                         interval.tick().await;
                     }
                 }

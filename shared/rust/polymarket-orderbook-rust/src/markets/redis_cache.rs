@@ -1,6 +1,6 @@
 //! Typed Redis restart cache for active market subscriptions.
 //!
-//! The JSON representation remains compatible with the Python producer:
+//! The JSON representation is:
 //! ```json
 //! {
 //!   "fetched_at": "2026-08-14T12:34:56Z",
@@ -132,21 +132,6 @@ pub async fn load_document(redis_url: &str, key: &str) -> Result<Option<CacheDoc
     Ok(Some(document))
 }
 
-/// Backward-compatible loader used by the current Python-owned startup path.
-pub async fn load(redis_url: &str, key: &str) -> Result<Option<Vec<Market>>> {
-    Ok(load_document(redis_url, key)
-        .await?
-        .map(CacheDocument::into_markets))
-}
-
-/// Atomically replace the cache key with one complete JSON snapshot.
-pub async fn save(redis_url: &str, key: &str, document: &CacheDocument) -> Result<()> {
-    // Serialize and validate before opening Redis so a bad snapshot cannot
-    // replace the last known-good restart cache.
-    let raw = document.to_json()?;
-    save_json(redis_url, key, raw).await
-}
-
 /// Atomically store JSON previously produced by [`CacheDocument::to_json`].
 /// This split lets callers move serialization to `spawn_blocking`.
 pub async fn save_json(redis_url: &str, key: &str, raw: String) -> Result<()> {
@@ -156,22 +141,6 @@ pub async fn save_json(redis_url: &str, key: &str, raw: String) -> Result<()> {
         .await
         .context("connect redis")?;
     conn.set::<_, _, ()>(key, raw).await.context("redis SET")
-}
-
-/// Return the Unix timestamp of the latest Python-owned cache update.
-///
-/// Kept during the transition so the current startup freshness gate is
-/// unchanged. Rust-owned cache consumers use [`CacheDocument::age`] instead.
-pub async fn last_updated(redis_url: &str, key: &str) -> Result<Option<u64>> {
-    let client = redis::Client::open(redis_url).context("open redis client")?;
-    let mut conn = client
-        .get_multiplexed_async_connection()
-        .await
-        .context("connect redis")?;
-
-    let raw: Option<String> = conn.get(key).await.context("redis GET")?;
-    raw.map(|value| value.parse().context("parse cache update timestamp"))
-        .transpose()
 }
 
 fn validate_markets(markets: &[Market]) -> Result<()> {

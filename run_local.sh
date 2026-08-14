@@ -14,7 +14,6 @@ COMPOSE_COMMAND=()
 INFRA_COMPOSE=()
 LOCAL_COMPOSE=()
 APPLICATION_SERVICES=(
-    obdata-polymarket-active-markets
     obdata-polymarket-orderbook-rust-pubsub
     obdata-polymarket-orderbook-rust-from-pubsub
     obdata-polymarket-r2-archive-exporter
