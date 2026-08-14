@@ -12,8 +12,9 @@
 //! received after a PING proves the transport is alive; this matters when a
 //! busy market-data stream delays the textual PONG behind data frames. If no
 //! frame arrives before the heartbeat deadline, the socket is closed and the
-//! run loop reconnects immediately (no backoff). Other failures use
-//! exponential backoff (1 → 60 s).
+//! run loop reconnects after a short per-connection jitter (no base backoff).
+//! Other failures use exponential backoff (1 → 60 s) plus the same jitter so
+//! an upstream batch close does not become a synchronized reconnect storm.
 //!
 //! ## Subscription state
 //!
@@ -73,6 +74,17 @@ pub enum ConnStatus {
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 const PONG_TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
+const RECONNECT_JITTER_MAX_MS: u64 = 750;
+
+/// Deterministic jitter spreads a batch of reconnects without adding a random
+/// dependency or making tests non-reproducible. The reconnect round changes
+/// the offset so the same connection does not always occupy the same slot.
+fn reconnect_jitter(index: usize, reconnect_round: u64) -> Duration {
+    let mixed = (index as u64)
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(reconnect_round.wrapping_mul(1_442_695_040_888_963_407));
+    Duration::from_millis(mixed % (RECONNECT_JITTER_MAX_MS + 1))
+}
 
 /// Commands sent from the pool into a connection task. Shutdown is signalled
 /// by closing the command channel (dropping every sender), which makes
@@ -136,21 +148,31 @@ impl Connection {
         let mut last_message_time: Option<Instant> = None;
         let mut heartbeat_timed_out = false;
         let mut first_attempt = true;
+        let mut reconnect_round = 0_u64;
         loop {
-            // Reconnect delay (skip on first attempt and on PONG timeout).
+            // Skip delay on the first attempt. Every reconnect gets a small
+            // deterministic jitter so a source-side batch close does not make
+            // hundreds of sockets reconnect in the same millisecond.
             if first_attempt {
                 first_attempt = false;
-            } else if heartbeat_timed_out {
-                heartbeat_timed_out = false;
-                info!(conn = index, "heartbeat timeout — reconnecting immediately");
             } else {
+                let jitter = reconnect_jitter(index, reconnect_round);
+                reconnect_round = reconnect_round.wrapping_add(1);
+                let (delay, reason) = if heartbeat_timed_out {
+                    heartbeat_timed_out = false;
+                    (jitter, "heartbeat timeout")
+                } else {
+                    let delay = backoff.saturating_add(jitter);
+                    backoff = (backoff * 2).min(RECONNECT_DELAY_MAX);
+                    (delay, "session ended")
+                };
                 info!(
                     conn = index,
-                    delay_ms = backoff.as_millis() as u64,
+                    delay_ms = delay.as_millis() as u64,
+                    reason,
                     "reconnecting"
                 );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(RECONNECT_DELAY_MAX);
+                tokio::time::sleep(delay).await;
             }
 
             // Allow shutdown to short-circuit during the reconnect delay.
@@ -909,5 +931,14 @@ mod tests {
             !should_exit,
             "must not exit while buffered work remains, even with senders dropped",
         );
+    }
+
+    #[test]
+    fn reconnect_jitter_is_bounded_stable_and_distributed() {
+        let first = reconnect_jitter(42, 3);
+        assert_eq!(first, reconnect_jitter(42, 3));
+        assert!(first <= Duration::from_millis(RECONNECT_JITTER_MAX_MS));
+        assert_ne!(first, reconnect_jitter(43, 3));
+        assert_ne!(first, reconnect_jitter(42, 4));
     }
 }
