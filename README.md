@@ -170,6 +170,7 @@ Production uses an existing R2 bucket. Prepare the environment:
 2. Set a strong `CLICKHOUSE_PASSWORD`.
 3. Set `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY`, and `R2_SECRET_KEY`.
 4. Restrict access to `.env`.
+5. Confirm the host can provide a high open-file limit.
 
 ```sh
 cp .env.example .env
@@ -192,6 +193,10 @@ Production notes:
 
 - Redis, ClickHouse, and all Rust services share the private `obdata` bridge.
   Redis and ClickHouse publish no host ports.
+- Keep `RLIMIT_NOFILE` high. The supplied configuration requests 262,144 open
+  files through `CONTAINER_NOFILE_LIMIT`; 65,536 is a practical minimum for the
+  full market universe. Rootless Podman cannot request more than `ulimit -Hn`,
+  so lower the setting to that host limit when necessary.
 - Use a host firewall with default-deny inbound rules and allow only required
   management traffic—normally SSH or a VPN. Docker manages its own
   iptables/nftables rules, so verify the effective exposure after deployment
@@ -238,6 +243,7 @@ the recorded SHA-256 digests before trusting the hour.
 |---|---:|---:|
 | CPU | 4 modern vCPUs | 8 modern vCPUs |
 | RAM | 16 GiB | 32 GiB |
+| Open files (`RLIMIT_NOFILE`) | 65,536 | 262,144 |
 | Local disk with R2 | 50 GiB SSD | 100 GiB NVMe |
 | Network | 100 Mbit/s symmetric | 200 Mbit/s symmetric; 1 Gbit/s for comfortable recovery |
 | Local archive | Add 22 GB/day retained | Add 0.65 TB per 30 days plus headroom |
@@ -250,6 +256,7 @@ the recorded SHA-256 digests before trusting the hour.
 |---|---|---|
 | CPU | Roughly one aggregate core in steady state. | ClickHouse merges, cold subscription, and hourly export are bursty; 4 vCPUs is tight and 8 leaves useful headroom. |
 | RAM | About 6–7 GiB total; the publisher used roughly 3–4 GiB. | 16 GiB supports a healthy full-universe pipeline; 32 GiB provides safer burst and backlog capacity. |
+| Open files | The publisher maintains roughly 1,280 WebSocket connections, while Redis and ClickHouse also hold sockets and data files. | A high limit avoids failures during reconnect waves, merges, and export. The runtime cannot exceed the host user's hard limit. |
 | ClickHouse disk | About 3.4–3.8 GiB per raw hour; the rolling window normally uses 15–20 GiB. | SSD latency matters during simultaneous writes, merges, and export. Container images and temporary files also need room. |
 | Parquet archive | About 0.8–0.9 GB/hour, or 20–22 GB/day. | Local retention needs roughly 0.65 TB per 30 days before filesystem headroom; R2 avoids that persistent local cost. |
 | Incoming network | Roughly 60–75 Mbit/s sustained, with snapshot and reconnect bursts. | 100 Mbit/s is a tight minimum. More bandwidth shortens full-universe and reconnect recovery. |
