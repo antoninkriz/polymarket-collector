@@ -180,7 +180,7 @@ $EDITOR .env
 Start infrastructure and applications with Docker Compose:
 
 ```sh
-docker compose -f docker-compose.infra.yml up -d
+docker compose -f docker-compose.infra.yml up -d --remove-orphans
 docker compose -f docker-compose.polymarket.yml \
   up -d --build --remove-orphans
 ```
@@ -192,7 +192,6 @@ Production notes:
 
 - Redis, ClickHouse, and all Rust services share the private `obdata` bridge.
   Redis and ClickHouse publish no host ports.
-- Only Dozzle is published, and only on `127.0.0.1:8080`.
 - Use a host firewall with default-deny inbound rules and allow only required
   management traffic—normally SSH or a VPN. Docker manages its own
   iptables/nftables rules, so verify the effective exposure after deployment
@@ -210,14 +209,6 @@ Start with container health and structured logs:
 docker compose -f docker-compose.infra.yml ps
 docker compose -f docker-compose.polymarket.yml ps
 docker compose -f docker-compose.polymarket.yml logs -f --tail=200
-```
-
-The infrastructure Compose file also provides Dozzle on
-`http://127.0.0.1:8080` for Docker deployments. Keep it on loopback; an SSH
-tunnel is convenient for remote viewing:
-
-```sh
-ssh -L 8080:127.0.0.1:8080 collector-host
 ```
 
 The most useful signals are:
