@@ -52,11 +52,12 @@ new generation has reached its append-only file. The supplied Redis service
 therefore runs with AOF enabled. An ordinary process restart, or loss of only
 the Redis generation key, cannot reuse an exported sequence.
 
-If both Redis and ClickHouse are lost while R2 survives, find the greatest
-`max_sequence` across the retained hourly manifests, shift it right by 48 bits,
-and set `PUBLISHER_GENERATION_FLOOR` to at least that generation before starting
-the publisher. This is an explicit disaster-recovery override; starting with a
-lower floor could reuse sequence values already present in Parquet.
+If both Redis and ClickHouse are lost while the Parquet archive survives, find
+the greatest `max_sequence` across the retained hourly manifests, shift it
+right by 48 bits, and set `PUBLISHER_GENERATION_FLOOR` to at least that
+generation before starting the publisher. This is an explicit disaster-
+recovery override; starting with a lower floor could reuse sequence values
+already present in Parquet.
 
 ## Collection rules
 
@@ -76,8 +77,8 @@ before assigning a sequence or storing a row. The three listeners remain
 connected with an empty token set if their markets are removed, including
 `--new-only` operation and reconnects.
 
-WebSocket lifecycle events add and remove subscriptions immediately. The
-Gamma pollers remain an idempotent reconciliation path for startup state,
+WebSocket lifecycle events add and remove subscriptions immediately. Gamma
+market discovery provides an idempotent reconciliation path for startup state,
 missed notifications, and upstream lifecycle-feed outages.
 
 The client sends Polymarket's text `PING` every ten seconds and arms a separate
@@ -178,7 +179,7 @@ out-of-range decimal token ID. A missing optional price remains null rather
 than being changed to zero.
 
 Each event file is ordered by `sequence`. The exporter writes all seven files,
-including correctly typed zero-row files, before uploading `manifest.json`.
+including correctly typed zero-row files, before writing `manifest.json`.
 The manifest lists every file's columns, row count, byte size, digest, and
 minimum/maximum sequence, plus the hour-wide row count and sequence range. Its
 presence is the sole completion marker; data objects left by an interrupted
@@ -199,7 +200,7 @@ For one market:
 
 `best_bid_ask` is an independently observed top-of-book notification, not a
 depth delta, and is not applied during orderbook reconstruction. Lifecycle rows
-are market-scoped and therefore have null `asset_id`.
+are market-scoped and therefore do not have an `asset_id` column.
 
 No connection epoch is required in the file because reconnect deltas are
 withheld until a new snapshot makes the stream self-initializing again.
@@ -209,12 +210,9 @@ withheld until a new snapshot makes the stream self-initializing again.
 V3 reproduces what the collector accepted; it is not an exchange audit log.
 Polymarket provides no replay cursor or source sequence, so a disconnect or
 collector outage can contain an unknowable gap. The Gamma reconciliation path
-can restore the active subscription set, but cannot recreate a missed source
-lifecycle row. Unsupported parent event types are logged and omitted. The
-userspace receive timestamp includes network-stack, TLS, and scheduling
-latency. Consumers must not infer upstream completeness or exchange order that
-the public feed does not expose.
-
-The compact layout is incompatible with earlier experimental v3 tables. Deploy
-it to an empty table, or archive and recreate the old table explicitly;
-`CREATE TABLE IF NOT EXISTS` cannot migrate an existing layout.
+can restore the active subscription set, but it cannot reproduce a missed
+WebSocket observation, its receive timestamp, or its place in the observed
+stream. Unsupported parent event types are logged and omitted. The userspace
+receive timestamp includes network-stack, TLS, and scheduling latency.
+Consumers must not infer upstream completeness or exchange order that the
+public feed does not expose.

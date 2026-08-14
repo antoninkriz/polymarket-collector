@@ -49,12 +49,11 @@ The exporter writes Parquet data pages v2 with an explicit per-event policy:
 | All other scalar and nested leaf values | their owning event file | `PLAIN` |
 
 Every column is compressed with ZSTD level 9. Dictionary-encoded columns use
-an 8 MiB dictionary-page limit. The larger-than-default limit keeps the
-high-cardinality `market` and `asset_id` dictionaries from falling back to
-plain values while rows remain ordered by the global sequence. Decimal values
-use `store_decimal_as_integer`, which is why precision-nine decimals have
-physical type `INT32` and precision-18 decimals have physical type `INT64`
-instead of `FIXED_LEN_BYTE_ARRAY`.
+an 8 MiB dictionary-page limit so the high-cardinality `market` and `asset_id`
+dictionaries can cover a sequence-ordered row group without premature fallback
+to plain values. Decimal values use `store_decimal_as_integer`, which is why
+precision-nine decimals have physical type `INT32` and precision-18 decimals
+have physical type `INT64` instead of `FIXED_LEN_BYTE_ARRAY`.
 
 Dictionary encoding is a writer preference, not part of the logical file
 contract. PyArrow may fall back to `PLAIN` within a row group when a dictionary
@@ -68,10 +67,10 @@ the physical encodings.
 
 The policy is based on measurements from every physical column in all seven
 event formats, including nested snapshot and lifecycle leaves. See
-[`PARQUET_ENCODING_BENCHMARK.md`](PARQUET_ENCODING_BENCHMARK.md) for the data,
-alternatives, and rationale. In particular, Parquet does not combine
-dictionary and `DELTA_BINARY_PACKED` for the same column: dictionary indexes
-already use RLE/bit packing, while delta encodes the values directly.
+[`PARQUET_ENCODING_BENCHMARK.md`](PARQUET_ENCODING_BENCHMARK.md) for the active
+choices, benchmark procedure, and rationale. In particular, Parquet does not
+combine dictionary and `DELTA_BINARY_PACKED` for the same column: dictionary
+indexes already use RLE/bit packing, while delta encodes the values directly.
 
 ## Archive destinations
 
@@ -136,7 +135,7 @@ List elements are non-null; a non-null list itself may still be empty.
 ## `book.parquet`
 
 A row is a complete aggregated depth snapshot for one outcome asset. It
-replaces the previously reconstructed book for that asset.
+replaces the reconstructed book state for that asset.
 
 Columns after the common prefix:
 
@@ -246,10 +245,9 @@ Columns after the common prefix:
 | `question` | `string` | yes | Human-readable market question, when supplied. |
 | `slug` | `string` | yes | Human-readable market URL slug, when supplied. |
 
-`assets_ids[i]` corresponds to `outcomes[i]`. V3 intentionally keeps only the
-identity and outcome-routing fields needed by the collector; descriptive
-payload fields such as `description`, `tags`, and `event_message` are not in
-this export.
+`assets_ids[i]` corresponds to `outcomes[i]`. The event contains the identity
+and outcome-routing fields used by the collector; descriptive payload fields
+such as `description`, `tags`, and `event_message` are not exported.
 
 ## `market_resolved.parquet`
 
@@ -271,7 +269,7 @@ exported.
 
 ## `manifest.json`
 
-The manifest is uploaded only after all seven Parquet objects. Its presence is
+The manifest is written only after all seven Parquet files. Its presence is
 the sole completion marker for the hour. It contains:
 
 | Field | Meaning |
@@ -281,7 +279,7 @@ the sole completion marker for the hour. It contains:
 | `min_sequence`, `max_sequence` | Hour-wide sequence bounds, or null for an entirely empty hour. |
 | `files` | Object keyed by event type with file path, columns, row count, byte size, SHA-256 digest, and per-file sequence bounds. |
 | `source_table` | ClickHouse table used for the export. |
-| `order_by` | Columns defining row order; currently `["sequence"]`. |
+| `order_by` | Columns defining row order: `["sequence"]`. |
 | `created_at` | UTC time when the manifest was produced. |
 
 Consumers should verify the listed byte size and SHA-256 when downloading an
@@ -289,7 +287,6 @@ archive. Objects from an interrupted export may exist without a manifest; do
 not treat those objects as a completed hour.
 
 The upstream event definitions are documented by Polymarket's
-[Market Channel reference](https://docs.polymarket.com/api-reference/wss/market).
+[real-time market data reference](https://docs.polymarket.com/market-data/realtime-data).
 The archive contract above describes the normalized representation actually
-written by this repository, which is deliberately smaller than the upstream
-wire payload.
+written by this repository.

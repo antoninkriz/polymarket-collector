@@ -1,18 +1,19 @@
 # polymarket-orderbook-collector
 
-A collector for Polymarket's public orderbook feed: market discovery,
+A collector for Polymarket's public market-data feed: market discovery,
 WebSocket ingestion, replayable ClickHouse storage, and hourly Parquet archival
-to S3-compatible object storage. The upstream feed has no exchange sequence or
-replay cursor; v3 preserves the collector's actual observations and makes
-disconnect boundaries explicit rather than claiming an exchange audit log.
+to R2-compatible or local storage. The upstream feed has no exchange sequence
+or replay cursor; v3 preserves the collector's actual observations and restores
+reconstructible book state after reconnects without claiming an exchange audit
+log.
 
 ## Pipeline
 
 ```
-Polymarket Gamma REST ──▶ polymarket-active-markets ──▶ Redis (active_markets cache + market_events stream)
-Polymarket WS ──▶ polymarket-orderbook-rust-pubsub ──▶ Redis Stream `polymarket:events:v3`
-                  polymarket-orderbook-rust-from-pubsub ──▶ ClickHouse `polymarket_orderbook_v3`
-                  r2-archive exporter ──▶ R2 hourly Parquet
+Polymarket Gamma REST ─▶ active-markets ─▶ Redis cache/lifecycle stream ─┐
+Polymarket WS ──────────────────────────────────────────────────────────┴─▶ WS publisher
+WS publisher ─▶ Redis Stream `polymarket:events:v3` ─▶ ClickHouse writer
+ClickHouse writer ─▶ ClickHouse `polymarket_orderbook_v3` ─▶ Parquet exporter ─▶ R2/local
 ```
 
 - `services/polymarket/polymarket-active-markets` — Python; polls the Gamma API,
@@ -25,8 +26,9 @@ Polymarket WS ──▶ polymarket-orderbook-rust-pubsub ──▶ Redis Stream 
 - `services/polymarket/polymarket-orderbook-rust-from-pubsub` — Rust; consumes the
   stream and acknowledges rows only after the compact raw v3 ClickHouse insert.
   Logical ad-hoc reads use `FINAL` to collapse same-sequence transport retries.
-- `services/r2-archive/exporter` — projects one typed Parquet per event/hour
-  named by `R2_BUCKET`.
+- `services/r2-archive/exporter` — projects each completed receive-time hour
+  into seven typed event files plus a manifest, then writes them to R2 or the
+  local filesystem.
 - `shared/rust/polymarket-orderbook-rust` — shared library crate (WS pool, REST
   client, ClickHouse sink, event types) used by both Rust binaries.
 - `shared/py` — shared Python helpers used by the Python services' Dockerfiles.
@@ -93,7 +95,7 @@ docker compose -f docker-compose.polymarket.yml up -d --build \
   obdata-polymarket-orderbook-rust-pubsub
 ```
 
-Then inspect the durable firehose (~10k+ events/sec across all markets):
+Then inspect the durable event stream:
 
 ```sh
 docker exec obdata-redis redis-cli XRANGE polymarket:events:v3 - + COUNT 1
