@@ -60,7 +60,6 @@ async fn sink_collapses_only_same_sequence_retry() -> Result<()> {
         table: CH_TABLE.into(),
         batch_size: 3,
         flush_interval: Duration::from_millis(200),
-        ttl_minutes: 0,
     })
     .await?;
     let trade = Event::LastTradePrice {

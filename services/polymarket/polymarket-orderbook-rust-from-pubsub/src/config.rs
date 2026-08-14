@@ -27,7 +27,6 @@ pub struct Config {
     pub clickhouse_table: String,
     pub flush_batch_size: usize,
     pub flush_interval: Duration,
-    pub ttl_minutes: u64,
     pub queue_size: usize,
     pub ack_queue_size: usize,
 }
@@ -60,7 +59,6 @@ impl Config {
                 "FLUSH_INTERVAL_MS",
                 DEFAULT_FLUSH_INTERVAL_MS,
             )?),
-            ttl_minutes: env_u64_or("TTL_MINUTES", 0)?,
             queue_size,
             ack_queue_size,
         })

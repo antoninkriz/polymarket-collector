@@ -38,7 +38,6 @@ async fn main() -> Result<()> {
         flush_batch_size = cfg.flush_batch_size,
         flush_interval_ms = cfg.flush_interval.as_millis() as u64,
         delete_acked_stream_entries = cfg.delete_acked_stream_entries,
-        ttl_minutes = cfg.ttl_minutes,
         queue_size = cfg.queue_size,
         ack_queue_size = cfg.ack_queue_size,
         "starting polymarket-orderbook-rust-from-pubsub",
@@ -55,7 +54,6 @@ async fn main() -> Result<()> {
         table: cfg.clickhouse_table.clone(),
         batch_size: cfg.flush_batch_size,
         flush_interval: cfg.flush_interval,
-        ttl_minutes: cfg.ttl_minutes,
     })
     .await
     .context("connect Polymarket ClickHouse sink")?;

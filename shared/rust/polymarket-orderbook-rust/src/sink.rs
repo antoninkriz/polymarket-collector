@@ -29,8 +29,6 @@ pub struct SinkConfig {
     pub table: String,
     pub batch_size: usize,
     pub flush_interval: Duration,
-    /// Row-level TTL in minutes on `timestamp_received`. Zero disables it.
-    pub ttl_minutes: u64,
 }
 
 pub struct Sink {
@@ -207,14 +205,6 @@ impl Sink {
     }
 
     async fn ensure_table(&self) -> Result<()> {
-        let ttl_clause = if self.cfg.ttl_minutes > 0 {
-            format!(
-                "\nTTL timestamp_received + INTERVAL {} MINUTE",
-                self.cfg.ttl_minutes,
-            )
-        } else {
-            String::new()
-        };
         let sql = format!(
             "CREATE TABLE IF NOT EXISTS {} (
                 timestamp_received DateTime64(9, 'UTC') CODEC(Delta, ZSTD(1)),
@@ -223,15 +213,11 @@ impl Sink {
             )
             ENGINE = ReplacingMergeTree()
             PARTITION BY toStartOfHour(timestamp_received)
-            ORDER BY sequence{ttl_clause}",
+            ORDER BY sequence",
             self.cfg.table,
         );
         self.exec(&sql).await.context("ensure table")?;
-        info!(
-            table = %self.cfg.table,
-            ttl_minutes = self.cfg.ttl_minutes,
-            "ensured table exists",
-        );
+        info!(table = %self.cfg.table, "ensured table exists");
         Ok(())
     }
 
@@ -297,7 +283,6 @@ mod tests {
                 table: "test_table".into(),
                 batch_size: 10,
                 flush_interval: Duration::from_millis(500),
-                ttl_minutes: 0,
             },
             http: Client::new(),
             buffer: Vec::new(),
