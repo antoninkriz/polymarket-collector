@@ -485,10 +485,13 @@ async fn run_health_monitor(
 #[derive(Default)]
 struct HealthState {
     asset_conns: HashMap<String, usize>,
+    conn_assets: HashMap<usize, Vec<String>>,
     conn_status: HashMap<usize, ConnStatus>,
     conn_generation: HashMap<usize, u64>,
     asset_ready_generation: HashMap<String, u64>,
     down_since: HashMap<String, Instant>,
+    assets_down_count: usize,
+    conns_down_count: usize,
 }
 
 impl HealthState {
@@ -504,28 +507,43 @@ impl HealthState {
                     return;
                 }
 
+                let assigned_assets = self.conn_assets.get(&conn_id).cloned().unwrap_or_default();
+                let was_down =
+                    !assigned_assets.is_empty() && old_status == ConnStatus::Disconnected;
+                let ready_before: Vec<String> = assigned_assets
+                    .iter()
+                    .filter(|asset| self.asset_is_ready(asset, conn_id))
+                    .cloned()
+                    .collect();
+
                 if status == ConnStatus::Disconnected {
                     counters.conn_down_events.fetch_add(1, Ordering::Relaxed);
                     let now = Instant::now();
-                    for (asset, assigned_conn) in &self.asset_conns {
-                        if *assigned_conn == conn_id && self.asset_is_ready(asset, conn_id) {
-                            counters.asset_down_events.fetch_add(1, Ordering::Relaxed);
-                            self.down_since.insert(asset.clone(), now);
-                            warn!(
-                                asset,
-                                conn = conn_id,
-                                "[ASSET-DATA-GAP] authoritative connection down"
-                            );
-                        }
+                    for asset in &ready_before {
+                        counters.asset_down_events.fetch_add(1, Ordering::Relaxed);
+                        self.down_since.insert(asset.clone(), now);
+                        warn!(
+                            asset,
+                            conn = conn_id,
+                            "[ASSET-DATA-GAP] authoritative connection down"
+                        );
                     }
                 } else {
                     let generation = self.conn_generation.entry(conn_id).or_default();
                     *generation = generation.wrapping_add(1);
                 }
                 self.conn_status.insert(conn_id, status);
-                // Connection transitions are rare. Recompute here because one
-                // transition changes readiness for every asset on the route.
-                self.update_gauges(counters);
+
+                let ready_after = assigned_assets
+                    .iter()
+                    .filter(|asset| self.asset_is_ready(asset, conn_id))
+                    .count();
+                self.assets_down_count =
+                    adjust_down_count(self.assets_down_count, ready_before.len(), ready_after);
+                let is_down = !assigned_assets.is_empty() && status == ConnStatus::Disconnected;
+                self.conns_down_count =
+                    adjust_boolean_count(self.conns_down_count, was_down, is_down);
+                self.publish_gauges(counters);
             }
             HealthEvent::BookSnapshot { conn_id, asset_id } => {
                 if let Some(assigned_conn) = self.asset_conns.get(&asset_id) {
@@ -550,10 +568,8 @@ impl HealthState {
                     && !was_ready
                     && self.asset_is_ready(&asset_id, conn_id)
                 {
-                    let assets_down = counters.assets_down.load(Ordering::Relaxed);
-                    counters
-                        .assets_down
-                        .store(assets_down.saturating_sub(1), Ordering::Relaxed);
+                    self.assets_down_count = self.assets_down_count.saturating_sub(1);
+                    self.publish_gauges(counters);
                 }
                 if let Some(started) = self.down_since.remove(&asset_id) {
                     info!(
@@ -569,11 +585,28 @@ impl HealthState {
 
     fn update_mappings(&mut self, asset_conns: HashMap<String, usize>, counters: &HealthCounters) {
         self.asset_conns = asset_conns;
+        self.conn_assets.clear();
+        for (asset, conn_id) in &self.asset_conns {
+            self.conn_assets
+                .entry(*conn_id)
+                .or_default()
+                .push(asset.clone());
+        }
         self.asset_ready_generation
             .retain(|asset, _| self.asset_conns.contains_key(asset));
         self.down_since
             .retain(|asset, _| self.asset_conns.contains_key(asset));
-        self.update_gauges(counters);
+        self.assets_down_count = self
+            .asset_conns
+            .iter()
+            .filter(|(asset, conn_id)| !self.asset_is_ready(asset, **conn_id))
+            .count();
+        self.conns_down_count = self
+            .conn_assets
+            .keys()
+            .filter(|conn_id| !matches!(self.conn_status.get(conn_id), Some(ConnStatus::Connected)))
+            .count();
+        self.publish_gauges(counters);
     }
 
     fn asset_is_ready(&self, asset: &str, conn_id: usize) -> bool {
@@ -581,23 +614,29 @@ impl HealthState {
             && self.asset_ready_generation.get(asset) == self.conn_generation.get(&conn_id)
     }
 
-    fn update_gauges(&self, counters: &HealthCounters) {
-        let active_connections: HashSet<usize> = self.asset_conns.values().copied().collect();
-        let conns_down = active_connections
-            .iter()
-            .filter(|id| !matches!(self.conn_status.get(id), Some(ConnStatus::Connected)))
-            .count();
-        let assets_down = self
-            .asset_conns
-            .iter()
-            .filter(|(asset, conn_id)| !self.asset_is_ready(asset, **conn_id))
-            .count();
+    fn publish_gauges(&self, counters: &HealthCounters) {
         counters
             .conns_down
-            .store(conns_down as u64, Ordering::Relaxed);
+            .store(self.conns_down_count as u64, Ordering::Relaxed);
         counters
             .assets_down
-            .store(assets_down as u64, Ordering::Relaxed);
+            .store(self.assets_down_count as u64, Ordering::Relaxed);
+    }
+}
+
+fn adjust_down_count(current: usize, ready_before: usize, ready_after: usize) -> usize {
+    if ready_before >= ready_after {
+        current.saturating_add(ready_before - ready_after)
+    } else {
+        current.saturating_sub(ready_after - ready_before)
+    }
+}
+
+fn adjust_boolean_count(current: usize, before: bool, after: bool) -> usize {
+    match (before, after) {
+        (false, true) => current.saturating_add(1),
+        (true, false) => current.saturating_sub(1),
+        _ => current,
     }
 }
 
