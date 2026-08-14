@@ -27,8 +27,8 @@ ClickHouse writer ─▶ ClickHouse `polymarket_orderbook_v3` ─▶ Parquet exp
   stream and acknowledges rows only after the compact raw v3 ClickHouse insert.
   Logical ad-hoc reads use `FINAL` to collapse same-sequence transport retries.
 - `services/r2-archive/exporter` — projects each completed receive-time hour
-  into seven typed event files plus a manifest, then writes them to R2 or the
-  local filesystem.
+  into seven typed event files plus a manifest. Token events are clustered by
+  market and asset, then written to R2 or the local filesystem.
 - `shared/rust/polymarket-orderbook-rust` — shared library crate (WS pool, REST
   client, ClickHouse sink, event types) used by both Rust binaries.
 - `shared/py` — shared Python helpers used by the Python services' Dockerfiles.

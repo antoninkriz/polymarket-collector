@@ -178,20 +178,24 @@ The export aborts rather than padding malformed hexadecimal IDs or wrapping an
 out-of-range decimal token ID. A missing optional price remains null rather
 than being changed to zero.
 
-Each event file is ordered by `sequence`. The exporter writes all seven files,
-including correctly typed zero-row files, before writing `manifest.json`.
-The manifest lists every file's columns, row count, byte size, digest, and
-minimum/maximum sequence, plus the hour-wide row count and sequence range. Its
-presence is the sole completion marker; data objects left by an interrupted
-attempt are overwritten on retry and are not considered a completed hour.
+Token-scoped files are ordered by `(market, asset_id, sequence)`. Lifecycle
+files have no asset column and are ordered by `(market, sequence)`. The
+exporter writes all seven files, including correctly typed zero-row files,
+before writing `manifest.json`. The manifest lists every file's columns, row
+order, row count, byte size, digest, and minimum/maximum sequence, plus the
+hour-wide row count and sequence range. Its presence is the sole completion
+marker; data objects left by an interrupted attempt are overwritten on retry
+and are not considered a completed hour.
 
 ## Replay
 
-To replay the complete observed stream, open the seven files for an hour and
-k-way merge their rows by `sequence`; a sequence belongs to exactly one file.
+Physical Parquet order is optimized for market and asset access, not global
+replay. To replay the complete observed stream, combine the seven files for an
+hour and order all rows by `sequence`; a sequence belongs to exactly one file.
 For one market:
 
-1. Filter or merge the event files for that market in ascending `sequence`.
+1. Filter the event files by `market`, then merge or order the selected rows by
+   `sequence`. The two asset runs are individually ordered but not interleaved.
 2. For each asset, begin at its first `book`; the snapshot replaces all depth.
 3. Apply each `price_change` by assigning `size` at `(side, price)`; zero size
    removes the level.

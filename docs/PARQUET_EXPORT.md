@@ -26,9 +26,17 @@ filename is the event type, so Parquet files do not contain an `event_type`
 column. Every file is present even when it has zero rows. Treat the hour as
 complete only when `manifest.json` exists.
 
-Parquet files use ZSTD level 9 and are sorted by `sequence` ascending. To
-recreate the complete observed stream, k-way merge the seven files on
-`sequence`.
+Parquet files use ZSTD level 9. Their physical row order is:
+
+| Files | Row order |
+|---|---|
+| `book`, `price_change`, `last_trade_price`, `tick_size_change`, `best_bid_ask` | `market`, `asset_id`, `sequence` ascending |
+| `new_market`, `market_resolved` | `market`, `sequence` ascending |
+
+This clustering keeps one market and outcome asset together for selective
+reads and compression. `sequence` remains the authoritative observation order.
+To replay across assets, markets, or event files, combine the relevant rows and
+order them by `sequence`; physical file order is not global replay order.
 
 ## Parquet storage encodings
 
@@ -36,24 +44,22 @@ The exporter writes Parquet data pages v2 with an explicit per-event policy:
 
 | Columns or leaf values | Event files | Value encoding |
 |---|---|---|
-| `sequence` | all | `DELTA_BINARY_PACKED` |
-| `timestamp_received` | `book`, `last_trade_price`, `tick_size_change`, `best_bid_ask`, `new_market` | `DELTA_BINARY_PACKED` |
-| `timestamp_received` | `price_change`, `market_resolved` | `PLAIN` |
-| `timestamp` | all | `PLAIN` |
-| `market` | all | `RLE_DICTIONARY` requested; `PLAIN` fallback allowed |
-| `asset_id` | `book`, `price_change`, `last_trade_price`, `best_bid_ask` | `RLE_DICTIONARY` requested; `PLAIN` fallback allowed |
-| `asset_id` | `tick_size_change` | `PLAIN` |
+| `timestamp_received`, `sequence`, `timestamp` | all | `BYTE_STREAM_SPLIT` |
 | `side` | `price_change`, `last_trade_price` | `RLE_DICTIONARY` requested; `PLAIN` fallback allowed |
 | `fee_rate_bps`, `price` | `last_trade_price` | `RLE_DICTIONARY` requested; `PLAIN` fallback allowed |
-| `best_bid`, `best_ask` | `price_change`, `best_bid_ask` | `RLE_DICTIONARY` requested; `PLAIN` fallback allowed |
 | All other scalar and nested leaf values | their owning event file | `PLAIN` |
 
 Every column is compressed with ZSTD level 9. Dictionary-encoded columns use
-an 8 MiB dictionary-page limit so the high-cardinality `market` and `asset_id`
-dictionaries can cover a sequence-ordered row group without premature fallback
-to plain values. Decimal values use `store_decimal_as_integer`, which is why
-precision-nine decimals have physical type `INT32` and precision-18 decimals
-have physical type `INT64` instead of `FIXED_LEN_BYTE_ARRAY`.
+an 8 MiB dictionary-page limit. The active dictionary columns are bounded
+categories or repeated trade prices and normally remain well below that cap.
+Decimal values use `store_decimal_as_integer`, which is why precision-nine
+decimals have physical type `INT32` and precision-18 decimals have physical
+type `INT64` instead of `FIXED_LEN_BYTE_ARRAY`.
+
+Byte-stream split transposes the bytes of each fixed-width integer before ZSTD
+compression. It fits the three 64-bit sequence/time columns because their
+high-order bytes repeat even though market clustering introduces backward jumps
+between asset runs. It does not alter their Arrow logical types or values.
 
 Dictionary encoding is a writer preference, not part of the logical file
 contract. PyArrow may fall back to `PLAIN` within a row group when a dictionary
@@ -63,14 +69,16 @@ uses `PLAIN` and because value pages may fall back to it. `RLE` is also used for
 Parquet definition and repetition levels, including the structure of optional
 and nested values; it does not change the logical Arrow types described below.
 Readers should rely on those logical types and let their Parquet library decode
-the physical encodings.
+the physical encodings. A zero-row file has no value pages, so its metadata may
+list only the `RLE` encoding used for definition and repetition levels.
 
 The policy is based on measurements from every physical column in all seven
 event formats, including nested snapshot and lifecycle leaves. See
 [`PARQUET_ENCODING_BENCHMARK.md`](PARQUET_ENCODING_BENCHMARK.md) for the active
 choices, benchmark procedure, and rationale. In particular, Parquet does not
-combine dictionary and `DELTA_BINARY_PACKED` for the same column: dictionary
-indexes already use RLE/bit packing, while delta encodes the values directly.
+combine dictionary and another explicit value encoding for the same column:
+dictionary indexes already use RLE/bit packing, while byte-stream split and
+delta encodings operate directly on the values.
 
 ## Archive destinations
 
@@ -87,17 +95,18 @@ container's `/exports` directory to `.data/parquet` on the host. Set
 currently eligible missing hour and exit instead of entering the continuous
 export loop.
 
-After changing only physical Parquet writer settings, completed local files can
-be rewritten in parallel with:
+Completed local files can be sorted and re-encoded in parallel with:
 
 ```bash
 cd services/r2-archive/exporter
 python reencode_local.py ../../../.data/parquet --jobs 4
 ```
 
-The converter prepares and verifies every replacement before changing any
-completed hour. It removes the hour's manifest while atomically replacing its
-files, then writes a manifest with updated byte sizes and SHA-256 hashes last.
+The converter reads and sorts each complete file in memory, so choose the job
+count for the available RAM. It prepares and verifies every replacement before
+changing any completed hour. It removes the hour's manifest while atomically
+replacing its files, then writes a manifest with updated byte sizes, SHA-256
+hashes, and row-order metadata last.
 
 ## Type and identifier conventions
 
@@ -161,8 +170,9 @@ because it is neither a unique event ID nor needed for reconstruction.
 
 A row assigns the new aggregate size at one `(asset_id, side, price)` level.
 Set that level to `size`; remove it when `size == 0`. One upstream message can
-contain multiple changes. The collector emits them as separate consecutive
-rows in their original array order.
+contain multiple changes. The collector assigns them consecutive sequence
+values in their original array order. Physical clustering can place changes
+for different assets in separate runs.
 
 Columns after the common prefix:
 
@@ -182,8 +192,9 @@ optional best prices are accompanying observations, not additional deltas.
 ## `last_trade_price.parquet`
 
 A row is one trade-execution notification observed on the public market
-channel. Preserve every row in `sequence` order, including rows with identical
-payload values or the same transaction hash.
+channel. Rows within one `(market, asset_id)` group are already in `sequence`
+order. Preserve every row, including rows with identical payload values or the
+same transaction hash.
 
 Columns after the common prefix:
 
@@ -277,10 +288,13 @@ the sole completion marker for the hour. It contains:
 | `hour_utc` | Exported UTC hour. |
 | `row_count` | Total rows across all seven files. |
 | `min_sequence`, `max_sequence` | Hour-wide sequence bounds, or null for an entirely empty hour. |
-| `files` | Object keyed by event type with file path, columns, row count, byte size, SHA-256 digest, and per-file sequence bounds. |
+| `files` | Object keyed by event type with file path, columns, row order, row count, byte size, SHA-256 digest, and per-file sequence bounds. |
 | `source_table` | ClickHouse table used for the export. |
-| `order_by` | Columns defining row order: `["sequence"]`. |
 | `created_at` | UTC time when the manifest was produced. |
+
+Each entry in `files` has an `order_by` list matching the two physical orders
+documented above. There is no hour-wide `order_by` because lifecycle files do
+not have an `asset_id` column.
 
 Consumers should verify the listed byte size and SHA-256 when downloading an
 archive. Objects from an interrupted export may exist without a manifest; do
