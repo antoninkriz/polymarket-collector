@@ -1,8 +1,8 @@
-# Polymarket v3 Parquet export format
+# Parquet archive format
 
-This document is the file-level contract for the event-specific v3 archive.
-For collection guarantees, deduplication, restart ordering, and replay rules,
-see [`POLYMARKET_V3.md`](POLYMARKET_V3.md).
+This document is the file-level contract for the event-specific archive. For
+collection guarantees, deduplication, restart ordering, and replay rules, see
+[`DATA_MODEL.md`](DATA_MODEL.md).
 
 ## Directory layout
 
