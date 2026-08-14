@@ -32,16 +32,21 @@ recreate the complete observed stream, k-way merge the seven files on
 
 ## Parquet storage encodings
 
-The exporter writes Parquet data pages v2 with the following storage settings:
+The exporter writes Parquet data pages v2 with an explicit per-event policy:
 
-| Columns or leaf values | Parquet physical type | Current value encoding |
+| Columns or leaf values | Event files | Value encoding |
 |---|---|---|
-| `timestamp_received`, `sequence`, `timestamp` | `INT64` | `DELTA_BINARY_PACKED` |
-| `fee_rate_bps` | `INT32` | `DELTA_BINARY_PACKED` |
-| Other top-level scalar columns | As specified by the file schema below | `RLE_DICTIONARY` requested; `PLAIN` fallback allowed |
-| `bids.list.element.price`, `asks.list.element.price` | `INT32` | `PLAIN` |
-| `bids.list.element.size`, `asks.list.element.size` | `INT64` | `PLAIN` |
-| Other nested list leaves, such as `assets_ids.list.element` and `outcomes.list.element` | As specified by the file schema below | `PLAIN` |
+| `sequence` | all | `DELTA_BINARY_PACKED` |
+| `timestamp_received` | `book`, `last_trade_price`, `tick_size_change`, `best_bid_ask`, `new_market` | `DELTA_BINARY_PACKED` |
+| `timestamp_received` | `price_change`, `market_resolved` | `PLAIN` |
+| `timestamp` | all | `PLAIN` |
+| `market` | all | `RLE_DICTIONARY` requested; `PLAIN` fallback allowed |
+| `asset_id` | `book`, `price_change`, `last_trade_price`, `best_bid_ask` | `RLE_DICTIONARY` requested; `PLAIN` fallback allowed |
+| `asset_id` | `tick_size_change` | `PLAIN` |
+| `side` | `price_change`, `last_trade_price` | `RLE_DICTIONARY` requested; `PLAIN` fallback allowed |
+| `fee_rate_bps`, `price` | `last_trade_price` | `RLE_DICTIONARY` requested; `PLAIN` fallback allowed |
+| `best_bid`, `best_ask` | `price_change`, `best_bid_ask` | `RLE_DICTIONARY` requested; `PLAIN` fallback allowed |
+| All other scalar and nested leaf values | their owning event file | `PLAIN` |
 
 Every column is compressed with ZSTD level 9. Decimal values use
 `store_decimal_as_integer`, which is why precision-nine decimals have physical
@@ -57,6 +62,13 @@ Parquet definition and repetition levels, including the structure of optional
 and nested values; it does not change the logical Arrow types described below.
 Readers should rely on those logical types and let their Parquet library decode
 the physical encodings.
+
+The policy is based on measurements from every physical column in all seven
+event formats, including nested snapshot and lifecycle leaves. See
+[`PARQUET_ENCODING_BENCHMARK.md`](PARQUET_ENCODING_BENCHMARK.md) for the data,
+alternatives, and rationale. In particular, Parquet does not combine
+dictionary and `DELTA_BINARY_PACKED` for the same column: dictionary indexes
+already use RLE/bit packing, while delta encodes the values directly.
 
 ## Archive destinations
 

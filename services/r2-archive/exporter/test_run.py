@@ -137,7 +137,7 @@ class ParquetSchemaTest(unittest.TestCase):
         )
         source = pa.Table.from_arrays(arrays, schema=source_schema)
 
-        data = exporter.table_to_parquet(source)
+        data = exporter.table_to_parquet(source, "book")
         parquet_file = pq.ParquetFile(BytesIO(data))
         arrow_schema = parquet_file.schema_arrow
         for name in decimal32_columns:
@@ -180,6 +180,160 @@ class ParquetSchemaTest(unittest.TestCase):
             ],
         )
         self.assertEqual(round_trip.column("asks")[0].as_py(), [])
+
+
+class ParquetEncodingTest(unittest.TestCase):
+    @staticmethod
+    def _encodings(data: bytes) -> dict[str, tuple[str, ...]]:
+        parquet_file = pq.ParquetFile(BytesIO(data))
+        metadata = parquet_file.metadata
+        encodings: dict[str, tuple[str, ...]] = {}
+        for index in range(metadata.num_columns):
+            column = metadata.row_group(0).column(index)
+            encodings[column.path_in_schema] = column.encodings
+        return encodings
+
+    def test_event_policies_cover_every_export(self) -> None:
+        self.assertEqual(
+            set(exporter.PARQUET_DICTIONARY_COLUMNS),
+            set(exporter.EVENT_PROJECTIONS),
+        )
+        self.assertEqual(
+            set(exporter.PARQUET_DELTA_COLUMNS),
+            set(exporter.EVENT_PROJECTIONS),
+        )
+        for event_type in exporter.EVENT_PROJECTIONS:
+            dictionary = set(exporter.PARQUET_DICTIONARY_COLUMNS[event_type])
+            delta = set(exporter.PARQUET_DELTA_COLUMNS[event_type])
+            self.assertFalse(dictionary & delta)
+            self.assertIn("market", dictionary)
+            self.assertIn("sequence", delta)
+            self.assertNotIn("timestamp", dictionary | delta)
+
+        with self.assertRaisesRegex(ValueError, "unsupported event type"):
+            exporter.table_to_parquet(pa.table({}), "unknown")
+
+    def test_price_change_uses_measured_mixed_policy(self) -> None:
+        row_count = 100
+        source = pa.table(
+            {
+                "timestamp_received": pa.array(
+                    [1_000_000_000 + index // 2 for index in range(row_count)],
+                    type=pa.timestamp("ns", tz="UTC"),
+                ),
+                "sequence": pa.array(range(row_count), type=pa.uint64()),
+                "timestamp": pa.array(
+                    [1_000 + index // 4 for index in range(row_count)],
+                    type=pa.timestamp("ms", tz="UTC"),
+                ),
+                "market": pa.array([b"m" * 32] * row_count, type=pa.binary(32)),
+                "asset_id": pa.array(
+                    [b"a" * 32] * row_count,
+                    type=pa.binary(32),
+                ),
+                "price": pa.array(
+                    [Decimal("0.5000")] * row_count,
+                    type=pa.decimal32(9, 4),
+                ),
+                "size": pa.array(
+                    [Decimal("2.000000")] * row_count,
+                    type=pa.decimal64(18, 6),
+                ),
+                "side": pa.array(["BUY", "SELL"] * (row_count // 2)),
+                "best_bid": pa.array(
+                    [Decimal("0.4900")] * row_count,
+                    type=pa.decimal32(9, 4),
+                ),
+                "best_ask": pa.array(
+                    [Decimal("0.5100")] * row_count,
+                    type=pa.decimal32(9, 4),
+                ),
+            }
+        )
+
+        encodings = self._encodings(exporter.table_to_parquet(source, "price_change"))
+
+        for column in ("timestamp_received", "timestamp", "price", "size"):
+            self.assertIn("PLAIN", encodings[column])
+            self.assertNotIn("RLE_DICTIONARY", encodings[column])
+        self.assertIn("DELTA_BINARY_PACKED", encodings["sequence"])
+        for column in ("market", "asset_id", "side", "best_bid", "best_ask"):
+            self.assertIn("RLE_DICTIONARY", encodings[column])
+
+    def test_trade_tick_and_resolution_exceptions(self) -> None:
+        common = {
+            "timestamp_received": pa.array(
+                [1_000_000_000, 1_000_000_001],
+                type=pa.timestamp("ns", tz="UTC"),
+            ),
+            "sequence": pa.array([1, 2], type=pa.uint64()),
+            "timestamp": pa.array(
+                [1_000, 1_001],
+                type=pa.timestamp("ms", tz="UTC"),
+            ),
+            "market": pa.array([b"m" * 32] * 2, type=pa.binary(32)),
+        }
+        trade = pa.table(
+            {
+                **common,
+                "asset_id": pa.array([b"a" * 32] * 2, type=pa.binary(32)),
+                "price": pa.array(
+                    [Decimal("0.5000")] * 2,
+                    type=pa.decimal32(9, 4),
+                ),
+                "size": pa.array(
+                    [Decimal("2.000000")] * 2,
+                    type=pa.decimal64(18, 6),
+                ),
+                "side": pa.array(["BUY", "SELL"]),
+                "fee_rate_bps": pa.array([0, 0], type=pa.uint16()),
+                "transaction_hash": pa.array(
+                    [b"x" * 32, b"y" * 32],
+                    type=pa.binary(32),
+                ),
+            }
+        )
+        trade_encodings = self._encodings(
+            exporter.table_to_parquet(trade, "last_trade_price")
+        )
+        self.assertIn("DELTA_BINARY_PACKED", trade_encodings["timestamp_received"])
+        for column in ("price", "fee_rate_bps", "side"):
+            self.assertIn("RLE_DICTIONARY", trade_encodings[column])
+        for column in ("size", "transaction_hash", "timestamp"):
+            self.assertNotIn("RLE_DICTIONARY", trade_encodings[column])
+
+        tick = pa.table(
+            {
+                **common,
+                "asset_id": pa.array(
+                    [b"a" * 32, b"b" * 32],
+                    type=pa.binary(32),
+                ),
+                "old_tick_size": pa.array(
+                    [Decimal("0.0100")] * 2,
+                    type=pa.decimal32(9, 4),
+                ),
+                "new_tick_size": pa.array(
+                    [Decimal("0.0010")] * 2,
+                    type=pa.decimal32(9, 4),
+                ),
+            }
+        )
+        tick_encodings = self._encodings(
+            exporter.table_to_parquet(tick, "tick_size_change")
+        )
+        self.assertIn("DELTA_BINARY_PACKED", tick_encodings["timestamp_received"])
+        for column in ("asset_id", "old_tick_size", "new_tick_size"):
+            self.assertNotIn("RLE_DICTIONARY", tick_encodings[column])
+
+        resolved_encodings = self._encodings(
+            exporter.table_to_parquet(pa.table(common), "market_resolved")
+        )
+        self.assertIn("PLAIN", resolved_encodings["timestamp_received"])
+        self.assertNotIn(
+            "DELTA_BINARY_PACKED",
+            resolved_encodings["timestamp_received"],
+        )
 
 
 class LocalArchiveTest(unittest.TestCase):

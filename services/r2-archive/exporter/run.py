@@ -2,7 +2,8 @@
 
 Each query applies ``FINAL`` to collapse collector-owned retries, projects one
 event type into its own schema, and orders rows by the shared collector
-sequence. PyArrow writes ZSTD level 9 with delta encoding on integer columns.
+sequence. PyArrow writes ZSTD level 9 with encodings selected for each event's
+observed column distributions.
 """
 
 from __future__ import annotations
@@ -53,12 +54,30 @@ EXPORT_ONCE = os.environ.get("EXPORT_ONCE", "false").strip().lower() in {
 # Export format
 PARQUET_COMPRESSION = "zstd"
 PARQUET_COMPRESSION_LEVEL = 9
-DELTA_ENCODED_COLUMNS = (
-    "timestamp",
-    "timestamp_received",
-    "sequence",
-    "fee_rate_bps",
-)
+PARQUET_DICTIONARY_COLUMNS: dict[str, tuple[str, ...]] = {
+    "book": ("market", "asset_id"),
+    "price_change": ("market", "asset_id", "side", "best_bid", "best_ask"),
+    "last_trade_price": (
+        "market",
+        "asset_id",
+        "price",
+        "side",
+        "fee_rate_bps",
+    ),
+    "tick_size_change": ("market",),
+    "best_bid_ask": ("market", "asset_id", "best_bid", "best_ask"),
+    "new_market": ("market",),
+    "market_resolved": ("market",),
+}
+PARQUET_DELTA_COLUMNS: dict[str, tuple[str, ...]] = {
+    "book": ("timestamp_received", "sequence"),
+    "price_change": ("sequence",),
+    "last_trade_price": ("timestamp_received", "sequence"),
+    "tick_size_change": ("timestamp_received", "sequence"),
+    "best_bid_ask": ("timestamp_received", "sequence"),
+    "new_market": ("timestamp_received", "sequence"),
+    "market_resolved": ("sequence",),
+}
 ORDER_LEVEL_TYPE = pa.struct(
     [
         pa.field("price", pa.decimal32(9, 4), nullable=False),
@@ -350,8 +369,11 @@ def fetch_event_table(hour: datetime, event_type: str) -> pa.Table:
         return reader.read_all()
 
 
-def table_to_parquet(table: pa.Table) -> bytes:
-    """Encode a typed event table as ZSTD level 9 Parquet."""
+def table_to_parquet(table: pa.Table, event_type: str) -> bytes:
+    """Encode a typed event table using its measured Parquet policy."""
+    if event_type not in EVENT_PROJECTIONS:
+        raise ValueError(f"unsupported event type: {event_type}")
+
     fields = [
         pa.field(
             field.name,
@@ -369,8 +391,16 @@ def table_to_parquet(table: pa.Table) -> bytes:
         # Parquet can use physical INT32/INT64.
         table = table.cast(target_schema, safe=True)
 
-    delta_cols = [c for c in DELTA_ENCODED_COLUMNS if c in table.column_names]
-    dict_cols = [c for c in table.column_names if c not in delta_cols]
+    delta_cols = [
+        column
+        for column in PARQUET_DELTA_COLUMNS[event_type]
+        if column in table.column_names
+    ]
+    dict_cols = [
+        column
+        for column in PARQUET_DICTIONARY_COLUMNS[event_type]
+        if column in table.column_names
+    ]
 
     out = BytesIO()
     pq.write_table(
@@ -561,7 +591,7 @@ def export_hour(client: ArchiveWriter, hour: datetime) -> None:
 
     for event_type in EVENT_PROJECTIONS:
         table = fetch_event_table(hour, event_type)
-        data = table_to_parquet(table)
+        data = table_to_parquet(table, event_type)
         key = event_to_key(hour, event_type)
         row_count = table.num_rows
         min_sequence = int(table.column("sequence")[0].as_py()) if row_count else None
