@@ -12,6 +12,14 @@ pub enum LifecycleSource {
 
 pub type LifecycleCompletion = oneshot::Sender<Result<(), String>>;
 
+#[derive(Debug, Clone)]
+pub struct ActiveMarketSnapshot {
+    pub active_count: usize,
+    pub markets: Vec<Market>,
+}
+
+pub type LifecycleSnapshotCompletion = oneshot::Sender<ActiveMarketSnapshot>;
+
 /// Lower-priority lifecycle work. WebSocket observations use their own
 /// bounded, high-priority channel so reconciliation cannot delay an immediate
 /// `new_market` subscription.
@@ -24,5 +32,8 @@ pub enum LifecycleRequest {
         source: LifecycleSource,
         observation: MarketLifecycleObservation,
         completion: LifecycleCompletion,
+    },
+    Snapshot {
+        completion: LifecycleSnapshotCompletion,
     },
 }

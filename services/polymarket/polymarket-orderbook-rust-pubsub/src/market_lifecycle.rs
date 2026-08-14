@@ -9,7 +9,9 @@ use tracing::{info, warn};
 
 use polymarket_orderbook_rust::events::{Market, MarketLifecycle, MarketLifecycleObservation};
 use polymarket_orderbook_rust::markets;
-use polymarket_orderbook_rust::markets::lifecycle::{LifecycleRequest, LifecycleSource};
+use polymarket_orderbook_rust::markets::lifecycle::{
+    ActiveMarketSnapshot, LifecycleRequest, LifecycleSource,
+};
 use polymarket_orderbook_rust::ws::pool::Pool;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -30,7 +32,7 @@ enum PlannedObservation {
 
 #[derive(Default)]
 struct LifecycleState {
-    active: HashMap<String, [String; 2]>,
+    active: HashMap<String, Market>,
     asset_owner: HashMap<String, String>,
     first_source: HashMap<LifecycleKey, LifecycleSource>,
 }
@@ -44,11 +46,12 @@ impl LifecycleState {
             validate_market(&market)?;
             let assets = canonical_assets(&market.assets);
             if let Some(existing) = self.active.get(&market.hash) {
+                let existing_assets = canonical_assets(&existing.assets);
                 ensure!(
-                    existing == &assets,
+                    existing_assets == assets,
                     "market {} changed assets from {:?} to {:?}",
                     market.hash,
-                    existing,
+                    existing_assets,
                     assets
                 );
                 continue;
@@ -87,7 +90,7 @@ impl LifecycleState {
             for asset in &assets {
                 self.asset_owner.insert(asset.clone(), market.hash.clone());
             }
-            self.active.insert(market.hash.clone(), assets);
+            self.active.insert(market.hash.clone(), market.clone());
         }
     }
 
@@ -126,10 +129,11 @@ impl LifecycleState {
                 validate_market(&subscription)?;
                 let assets = canonical_assets(&subscription.assets);
                 if let Some(existing) = self.active.get(&market) {
+                    let existing_assets = canonical_assets(&existing.assets);
                     ensure!(
-                        existing == &assets,
+                        existing_assets == assets,
                         "market {market} changed assets from {:?} to {:?}",
-                        existing,
+                        existing_assets,
                         assets
                     );
                     return Ok(PlannedObservation::AdmitExisting { key });
@@ -175,17 +179,26 @@ impl LifecycleState {
                 for asset in &assets {
                     self.asset_owner.insert(asset.clone(), market.hash.clone());
                 }
-                self.active.insert(market.hash.clone(), assets);
+                self.active.insert(market.hash.clone(), market.clone());
                 self.first_source.insert(key.clone(), source);
             }
             PlannedObservation::Resolve { key, market } => {
-                if let Some(assets) = self.active.remove(market) {
-                    for asset in assets {
+                if let Some(active_market) = self.active.remove(market) {
+                    for asset in active_market.assets {
                         self.asset_owner.remove(&asset);
                     }
                 }
                 self.first_source.insert(key.clone(), source);
             }
+        }
+    }
+
+    fn snapshot(&self) -> ActiveMarketSnapshot {
+        let mut markets: Vec<_> = self.active.values().cloned().collect();
+        markets.sort_unstable_by(|left, right| left.hash.cmp(&right.hash));
+        ActiveMarketSnapshot {
+            active_count: self.active.len(),
+            markets,
         }
     }
 }
@@ -252,6 +265,12 @@ impl LifecycleCoordinator {
             } => {
                 let result = self.apply_observation(source, observation).await;
                 complete_or_fail(completion, result)
+            }
+            LifecycleRequest::Snapshot { completion } => {
+                if completion.send(self.state.snapshot()).is_err() {
+                    warn!("lifecycle snapshot requester stopped before receiving snapshot");
+                }
+                Ok(())
             }
         }
     }
@@ -556,5 +575,49 @@ mod tests {
             state.first_source.get(&LifecycleKey::NewMarket("m".into())),
             Some(&LifecycleSource::RedisStream)
         );
+    }
+
+    #[tokio::test]
+    async fn coordinator_snapshot_request_is_sorted_and_cloned() {
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let pool = Arc::new(Mutex::new(Pool::new(2, event_tx)));
+        let (_websocket_tx, websocket_rx) = mpsc::channel(8);
+        let (_reconciliation_tx, reconciliation_rx) = mpsc::channel(8);
+        let mut coordinator = LifecycleCoordinator::new(pool, websocket_rx, reconciliation_rx);
+        let planned = coordinator
+            .state
+            .plan_bootstrap(vec![
+                market("z", "z-yes", "z-no"),
+                market("a", "a-yes", "a-no"),
+            ])
+            .unwrap();
+        coordinator.state.commit_bootstrap(&planned);
+
+        let (completion, completed) = tokio::sync::oneshot::channel();
+        coordinator
+            .apply_request(LifecycleRequest::Snapshot { completion })
+            .await
+            .unwrap();
+        let snapshot = completed.await.unwrap();
+
+        assert_eq!(snapshot.active_count, 2);
+        assert_eq!(
+            snapshot
+                .markets
+                .iter()
+                .map(|market| market.hash.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "z"]
+        );
+        assert_eq!(snapshot.markets[1].assets, ["z-yes", "z-no"]);
+
+        let resolution = resolved("a");
+        let plan = coordinator.state.plan_observation(&resolution).unwrap();
+        coordinator
+            .state
+            .commit_observation(&plan, LifecycleSource::WebSocket);
+        assert_eq!(coordinator.state.active.len(), 1);
+        assert_eq!(snapshot.active_count, 2);
+        assert_eq!(snapshot.markets.len(), 2);
     }
 }
