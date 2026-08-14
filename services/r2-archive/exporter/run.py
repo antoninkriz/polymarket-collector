@@ -54,6 +54,7 @@ EXPORT_ONCE = os.environ.get("EXPORT_ONCE", "false").strip().lower() in {
 # Export format
 PARQUET_COMPRESSION = "zstd"
 PARQUET_COMPRESSION_LEVEL = 9
+PARQUET_DICTIONARY_PAGE_SIZE_LIMIT = 8 * 1024 * 1024
 PARQUET_DICTIONARY_COLUMNS: dict[str, tuple[str, ...]] = {
     "book": ("market", "asset_id"),
     "price_change": ("market", "asset_id", "side", "best_bid", "best_ask"),
@@ -411,6 +412,7 @@ def table_to_parquet(table: pa.Table, event_type: str) -> bytes:
         use_dictionary=dict_cols,  # pyright: ignore[reportArgumentType]
         column_encoding={c: "DELTA_BINARY_PACKED" for c in delta_cols},
         data_page_version="2.0",
+        dictionary_pagesize_limit=PARQUET_DICTIONARY_PAGE_SIZE_LIMIT,
         store_decimal_as_integer=True,
     )
     return out.getvalue()

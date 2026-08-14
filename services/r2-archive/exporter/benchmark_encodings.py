@@ -20,6 +20,7 @@ import pyarrow.parquet as pq
 
 COMPRESSION = "zstd"
 COMPRESSION_LEVEL = 9
+DICTIONARY_PAGE_SIZE_LIMIT = 8 * 1024 * 1024
 DICTIONARY = "RLE_DICTIONARY"
 
 
@@ -111,6 +112,7 @@ def _compressed_size(
         compression=COMPRESSION,
         compression_level=COMPRESSION_LEVEL,
         data_page_version="2.0",
+        dictionary_pagesize_limit=DICTIONARY_PAGE_SIZE_LIMIT,
         store_decimal_as_integer=True,
         **options,  # pyright: ignore[reportArgumentType]
     )

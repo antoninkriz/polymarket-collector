@@ -251,7 +251,18 @@ class ParquetEncodingTest(unittest.TestCase):
             }
         )
 
-        encodings = self._encodings(exporter.table_to_parquet(source, "price_change"))
+        with patch.object(
+            exporter.pq,
+            "write_table",
+            wraps=pq.write_table,
+        ) as write_table:
+            encoded = exporter.table_to_parquet(source, "price_change")
+
+        self.assertEqual(
+            write_table.call_args.kwargs["dictionary_pagesize_limit"],
+            8 * 1024 * 1024,
+        )
+        encodings = self._encodings(encoded)
 
         for column in ("timestamp_received", "timestamp", "price", "size"):
             self.assertIn("PLAIN", encodings[column])

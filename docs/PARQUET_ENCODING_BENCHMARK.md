@@ -31,6 +31,15 @@ python benchmark_encodings.py \
 divided by the number of non-null values. This is more relevant than
 file-global cardinality because Parquet builds dictionaries per row group.
 
+The original encoding comparison used PyArrow's default 1 MiB dictionary-page
+limit. A follow-up measurement on all 80 row groups of the sequence-ordered
+`2026-08-14/08/price_change.parquet` found as many as 57,105 distinct markets
+and 114,210 distinct assets in one row group. Raising the limit from 1 MiB to
+4 MiB reduced the two identifier chunks by 47% in a representative row group;
+4, 8, and 16 MiB produced identical output even for the highest-cardinality
+row group. Production and the benchmark utility therefore use 8 MiB, retaining
+headroom without allowing unbounded dictionaries.
+
 Parquet and PyArrow do not provide a "delta with dictionary" combination for a
 column. `DELTA_BINARY_PACKED` directly encodes integer values. A dictionary
 page instead stores values separately and data pages encode dictionary indexes

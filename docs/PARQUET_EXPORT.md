@@ -48,10 +48,13 @@ The exporter writes Parquet data pages v2 with an explicit per-event policy:
 | `best_bid`, `best_ask` | `price_change`, `best_bid_ask` | `RLE_DICTIONARY` requested; `PLAIN` fallback allowed |
 | All other scalar and nested leaf values | their owning event file | `PLAIN` |
 
-Every column is compressed with ZSTD level 9. Decimal values use
-`store_decimal_as_integer`, which is why precision-nine decimals have physical
-type `INT32` and precision-18 decimals have physical type `INT64` instead of
-`FIXED_LEN_BYTE_ARRAY`.
+Every column is compressed with ZSTD level 9. Dictionary-encoded columns use
+an 8 MiB dictionary-page limit. The larger-than-default limit keeps the
+high-cardinality `market` and `asset_id` dictionaries from falling back to
+plain values while rows remain ordered by the global sequence. Decimal values
+use `store_decimal_as_integer`, which is why precision-nine decimals have
+physical type `INT32` and precision-18 decimals have physical type `INT64`
+instead of `FIXED_LEN_BYTE_ARRAY`.
 
 Dictionary encoding is a writer preference, not part of the logical file
 contract. PyArrow may fall back to `PLAIN` within a row group when a dictionary
