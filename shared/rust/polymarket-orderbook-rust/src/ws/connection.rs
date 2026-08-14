@@ -146,7 +146,7 @@ impl Connection {
         let mut sub = SubState::default();
         let mut backoff = Duration::from_secs(1);
         let mut last_message_time: Option<Instant> = None;
-        let mut heartbeat_timed_out = false;
+        let mut fast_reconnect_reason: Option<&'static str> = None;
         let mut first_attempt = true;
         let mut reconnect_round = 0_u64;
         loop {
@@ -158,13 +158,12 @@ impl Connection {
             } else {
                 let jitter = reconnect_jitter(index, reconnect_round);
                 reconnect_round = reconnect_round.wrapping_add(1);
-                let (delay, reason) = if heartbeat_timed_out {
-                    heartbeat_timed_out = false;
-                    (jitter, "heartbeat timeout")
+                let (delay, reason) = if let Some(reason) = fast_reconnect_reason.take() {
+                    (jitter, reason)
                 } else {
                     let delay = backoff.saturating_add(jitter);
                     backoff = (backoff * 2).min(RECONNECT_DELAY_MAX);
-                    (delay, "session ended")
+                    (delay, "connection error")
                 };
                 info!(
                     conn = index,
@@ -191,6 +190,7 @@ impl Connection {
             let ws_stream = match tokio_tungstenite::connect_async(WS_MARKET_URL).await {
                 Ok((stream, _resp)) => {
                     info!(conn = index, "ws connected");
+                    backoff = Duration::from_secs(1);
                     stream
                 }
                 Err(e) => {
@@ -243,11 +243,10 @@ impl Connection {
 
             match outcome {
                 SessionOutcome::HeartbeatTimeout => {
-                    heartbeat_timed_out = true;
-                    backoff = Duration::from_secs(1);
+                    fast_reconnect_reason = Some("heartbeat timeout");
                 }
                 SessionOutcome::Closed => {
-                    backoff = Duration::from_secs(1);
+                    fast_reconnect_reason = Some("session ended");
                 }
                 SessionOutcome::ChannelClosed => {
                     info!(conn = index, "event sink closed, shutting down connection");
@@ -291,7 +290,7 @@ impl SubState {
 enum SessionOutcome {
     /// Session ended because no frame followed a heartbeat. Reconnect immediately.
     HeartbeatTimeout,
-    /// Session ended due to a remote close or read EOF. Reconnect with backoff.
+    /// Session ended due to a remote close or read EOF. Reconnect immediately.
     Closed,
     /// Event channel closed (sink died). Connection should shut down.
     ChannelClosed,
@@ -343,6 +342,8 @@ async fn run_session(
 
     let mut last_inbound = Instant::now();
     let mut last_ping_sent: Option<Instant> = None;
+    let heartbeat_deadline = tokio::time::sleep(PONG_TIMEOUT);
+    tokio::pin!(heartbeat_deadline);
 
     let mut events_buf: Vec<EventRecord> = Vec::new();
 
@@ -433,27 +434,33 @@ async fn run_session(
                 }
             },
 
+            // -- Heartbeat deadline ------------------------------------
+            _ = &mut heartbeat_deadline, if last_ping_sent.is_some() => {
+                let sent_at = last_ping_sent
+                    .take()
+                    .expect("heartbeat deadline is armed only after a ping");
+                if heartbeat_expired(last_inbound, sent_at, Instant::now()) {
+                    warn!(
+                        conn = index,
+                        since_inbound_secs = last_inbound.elapsed().as_secs_f64(),
+                        "heartbeat timeout, closing dead connection",
+                    );
+                    let _ = write.send(Message::Close(None)).await;
+                    return SessionOutcome::HeartbeatTimeout;
+                }
+            }
+
             // -- PING ticker --------------------------------------------
             _ = ping_interval.tick() => {
-                // A PONG is the normal response, but any later inbound frame
-                // proves this socket is alive. Requiring the textual PONG
-                // alone creates false reconnects on busy market streams.
-                if let Some(sent_at) = last_ping_sent {
-                    if heartbeat_expired(last_inbound, sent_at, Instant::now()) {
-                        warn!(
-                            conn = index,
-                            since_inbound_secs = last_inbound.elapsed().as_secs_f64(),
-                            "heartbeat timeout, closing dead connection",
-                        );
-                        let _ = write.send(Message::Close(None)).await;
-                        return SessionOutcome::HeartbeatTimeout;
-                    }
-                }
                 if let Err(e) = write.send(Message::Text("PING".into())).await {
                     warn!(conn = index, error = %e, "send PING failed");
                     return SessionOutcome::Closed;
                 }
-                last_ping_sent = Some(Instant::now());
+                let sent_at = Instant::now();
+                last_ping_sent = Some(sent_at);
+                heartbeat_deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + PONG_TIMEOUT);
             }
 
             // -- Pool commands ------------------------------------------

@@ -80,6 +80,12 @@ WebSocket lifecycle events add and remove subscriptions immediately. The
 Gamma pollers remain an idempotent reconciliation path for startup state,
 missed notifications, and upstream lifecycle-feed outages.
 
+The client sends Polymarket's text `PING` every ten seconds and arms a separate
+five-second response deadline. Any frame received after the ping proves the
+socket is alive. A heartbeat timeout, peer close, read error, or stream EOF
+reconnects after only a deterministic 0--750 ms jitter; exponential backoff is
+reserved for failed connection attempts and other local session errors.
+
 `timestamp_received` is sampled immediately after tungstenite yields a text
 frame, before JSON parsing, fan-out, Redis, or ClickHouse work. All children of
 one frame share that nanosecond UTC wall-clock value. It is an honest userspace
