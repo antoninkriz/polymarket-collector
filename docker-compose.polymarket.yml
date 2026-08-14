@@ -14,8 +14,9 @@ name: obdata-polymarket
 #     Reads obdata-clickhouse `polymarket_orderbook_v3` and exports one
 #     market-clustered Parquet file per event type and UTC hour.
 #
-# All services use `network_mode: host` so they reach the host-local
-# Redis (localhost:6380) and ClickHouse (localhost:8124).
+# All services join the private `obdata` bridge created by the infrastructure
+# Compose project. Redis and ClickHouse are addressed by service name and do
+# not publish ports to the host.
 
 services:
 
@@ -29,14 +30,14 @@ services:
       - path: .env
         required: false
     restart: unless-stopped
-    network_mode: host
+    networks:
+      - obdata
     ulimits:
       nofile:
         soft: ${CONTAINER_NOFILE_LIMIT:-65536}
         hard: ${CONTAINER_NOFILE_LIMIT:-65536}
     environment:
-      # Redis (host-local)
-      REDIS_URL: redis://localhost:6380
+      REDIS_URL: redis://obdata-redis:6379
       REDIS_KEY_ACTIVE_MARKETS: polymarket:active_markets
       # Durable event log consumed and acknowledged by the ClickHouse writer.
       REDIS_EVENT_STREAM: polymarket:events:v3
@@ -49,8 +50,8 @@ services:
       PUBLISHER_GENERATION_PERSIST_TIMEOUT_MS: "5000"
       PUBLISHER_LEASE_TTL_MS: "15000"
       PUBLISHER_LEASE_RENEW_MS: "5000"
-      CLICKHOUSE_HOST: localhost
-      CLICKHOUSE_PORT: "8124"
+      CLICKHOUSE_HOST: obdata-clickhouse
+      CLICKHOUSE_PORT: "8123"
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       CLICKHOUSE_DATABASE: default
@@ -75,7 +76,8 @@ services:
       - path: .env
         required: false
     restart: unless-stopped
-    network_mode: host
+    networks:
+      - obdata
     depends_on:
       - obdata-polymarket-orderbook-rust-pubsub
     ulimits:
@@ -83,8 +85,8 @@ services:
         soft: ${CONTAINER_NOFILE_LIMIT:-65536}
         hard: ${CONTAINER_NOFILE_LIMIT:-65536}
     environment:
-      # Redis (host-local) — same durable stream as the publisher
-      REDIS_URL: redis://localhost:6380
+      # Same durable stream as the publisher.
+      REDIS_URL: redis://obdata-redis:6379
       REDIS_EVENT_STREAM: polymarket:events:v3
       EVENT_CONSUMER_GROUP: polymarket-clickhouse-v3
       # Keep this stable across restarts so this consumer drains its pending entries.
@@ -93,9 +95,8 @@ services:
       # The atomic cleanup refuses to delete if another group is ever added.
       DELETE_ACKED_STREAM_ENTRIES: "true"
       STREAM_RECONNECT_DELAY_MS: "2000"
-      # ClickHouse (host-local)
-      CLICKHOUSE_HOST: localhost
-      CLICKHOUSE_PORT: "8124"
+      CLICKHOUSE_HOST: obdata-clickhouse
+      CLICKHOUSE_PORT: "8123"
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       CLICKHOUSE_DATABASE: default
@@ -116,10 +117,11 @@ services:
       - path: .env
         required: false
     restart: unless-stopped
-    network_mode: host
+    networks:
+      - obdata
     environment:
-      CLICKHOUSE_HOST: localhost
-      CLICKHOUSE_PORT: "8124"
+      CLICKHOUSE_HOST: obdata-clickhouse
+      CLICKHOUSE_PORT: "8123"
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       CLICKHOUSE_DATABASE: default
@@ -133,3 +135,8 @@ services:
       R2_ACCESS_KEY: ${R2_ACCESS_KEY:-}
       R2_SECRET_KEY: ${R2_SECRET_KEY:-}
       RUST_LOG: ${RUST_LOG:-info}
+
+networks:
+  obdata:
+    external: true
+    name: obdata
