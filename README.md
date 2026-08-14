@@ -1,4 +1,4 @@
-# polymarket-orderbook-collector
+# Polymarket Collector
 
 A production-oriented Rust pipeline for capturing Polymarket's public CLOB
 market-data feed in collector order, isolating live WebSocket ingestion from
