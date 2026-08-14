@@ -336,6 +336,7 @@ WHERE timestamp_received >= toDateTime64('{target}', 9, 'UTC')
       'invalid Polymarket condition ID'
   ) = 0{validations}
 ORDER BY {order_by}
+SETTINGS do_not_merge_across_partitions_select_final = 1
 FORMAT ArrowStream
 """
 

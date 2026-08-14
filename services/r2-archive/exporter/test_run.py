@@ -57,6 +57,17 @@ class ExportPathsTest(unittest.TestCase):
         self.assertIn(f"JSONExtract(data, 'asks', '{level_type}') AS asks", query)
         self.assertNotIn("JSONExtractRaw(data, 'bids')", query)
 
+    def test_query_limits_final_to_the_hour_partition(self) -> None:
+        query = exporter.build_event_query(
+            datetime(2026, 8, 13, 4, tzinfo=timezone.utc),
+            "book",
+        )
+
+        self.assertIn(
+            "SETTINGS do_not_merge_across_partitions_select_final = 1",
+            query,
+        )
+
 
 class ParquetSchemaTest(unittest.TestCase):
     def test_decimals_are_narrow_and_integer_backed(self) -> None:
