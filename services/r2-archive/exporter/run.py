@@ -65,43 +65,6 @@ PARQUET_DICTIONARY_COLUMNS: dict[str, tuple[str, ...]] = {
     "new_market": (),
     "market_resolved": (),
 }
-PARQUET_COLUMN_ENCODINGS: dict[str, dict[str, str]] = {
-    "book": {
-        "timestamp_received": "BYTE_STREAM_SPLIT",
-        "sequence": "BYTE_STREAM_SPLIT",
-        "timestamp": "BYTE_STREAM_SPLIT",
-    },
-    "price_change": {
-        "timestamp_received": "BYTE_STREAM_SPLIT",
-        "sequence": "BYTE_STREAM_SPLIT",
-        "timestamp": "BYTE_STREAM_SPLIT",
-    },
-    "last_trade_price": {
-        "timestamp_received": "BYTE_STREAM_SPLIT",
-        "sequence": "BYTE_STREAM_SPLIT",
-        "timestamp": "BYTE_STREAM_SPLIT",
-    },
-    "tick_size_change": {
-        "timestamp_received": "BYTE_STREAM_SPLIT",
-        "sequence": "BYTE_STREAM_SPLIT",
-        "timestamp": "BYTE_STREAM_SPLIT",
-    },
-    "best_bid_ask": {
-        "timestamp_received": "BYTE_STREAM_SPLIT",
-        "sequence": "BYTE_STREAM_SPLIT",
-        "timestamp": "BYTE_STREAM_SPLIT",
-    },
-    "new_market": {
-        "timestamp_received": "BYTE_STREAM_SPLIT",
-        "sequence": "BYTE_STREAM_SPLIT",
-        "timestamp": "BYTE_STREAM_SPLIT",
-    },
-    "market_resolved": {
-        "timestamp_received": "BYTE_STREAM_SPLIT",
-        "sequence": "BYTE_STREAM_SPLIT",
-        "timestamp": "BYTE_STREAM_SPLIT",
-    },
-}
 ORDER_LEVEL_TYPE = pa.struct(
     [
         pa.field("price", pa.decimal32(9, 4), nullable=False),
@@ -423,11 +386,6 @@ def table_to_parquet(table: pa.Table, event_type: str) -> bytes:
         # Parquet can use physical INT32/INT64.
         table = table.cast(target_schema, safe=True)
 
-    column_encodings = {
-        column: encoding
-        for column, encoding in PARQUET_COLUMN_ENCODINGS[event_type].items()
-        if column in table.column_names
-    }
     dict_cols = [
         column
         for column in PARQUET_DICTIONARY_COLUMNS[event_type]
@@ -441,7 +399,6 @@ def table_to_parquet(table: pa.Table, event_type: str) -> bytes:
         compression=PARQUET_COMPRESSION,
         compression_level=PARQUET_COMPRESSION_LEVEL,
         use_dictionary=dict_cols,  # pyright: ignore[reportArgumentType]
-        column_encoding=column_encodings,
         data_page_version="2.0",
         dictionary_pagesize_limit=PARQUET_DICTIONARY_PAGE_SIZE_LIMIT,
         store_decimal_as_integer=True,

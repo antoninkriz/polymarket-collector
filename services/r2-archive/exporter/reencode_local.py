@@ -130,13 +130,6 @@ def _prepare_file(task: ReencodeTask) -> PreparedFile:
         if column in source.schema_arrow.names
     ]
     sort_columns = exporter.PARQUET_SORT_COLUMNS[task.event_type]
-    column_encodings = {
-        column: encoding
-        for column, encoding in exporter.PARQUET_COLUMN_ENCODINGS[
-            task.event_type
-        ].items()
-        if column in source.schema_arrow.names
-    }
 
     try:
         sorted_table = source.read()
@@ -151,7 +144,6 @@ def _prepare_file(task: ReencodeTask) -> PreparedFile:
             compression=exporter.PARQUET_COMPRESSION,
             compression_level=exporter.PARQUET_COMPRESSION_LEVEL,
             use_dictionary=dictionary_columns,  # pyright: ignore[reportArgumentType]
-            column_encoding=column_encodings,
             data_page_version="2.0",
             dictionary_pagesize_limit=(exporter.PARQUET_DICTIONARY_PAGE_SIZE_LIMIT),
             store_decimal_as_integer=True,
