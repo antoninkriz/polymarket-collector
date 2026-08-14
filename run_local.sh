@@ -145,7 +145,7 @@ start_stack() {
 
     # podman-compose does not consistently replace containers after rebuilding
     # their images, so make the deployment of freshly built code explicit.
-    "${LOCAL_COMPOSE[@]}" up -d --build --force-recreate \
+    "${LOCAL_COMPOSE[@]}" up -d --build --force-recreate --remove-orphans \
         "${APPLICATION_SERVICES[@]}"
 
     cat <<EOF
@@ -183,7 +183,7 @@ case "$action" in
     down)
         select_runtime
         ensure_environment
-        "${LOCAL_COMPOSE[@]}" down
+        "${LOCAL_COMPOSE[@]}" down --remove-orphans
         "${INFRA_COMPOSE[@]}" down
         echo "Stopped services; retained data under $REPOSITORY_DIR/.data"
         ;;

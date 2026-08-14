@@ -111,6 +111,7 @@ services:
       context: .
       dockerfile: services/r2-archive/exporter/Dockerfile
     container_name: obdata-polymarket-r2-archive-exporter
+    command: ["/app/polymarket-r2-archive-exporter"]
     env_file:
       - path: .env
         required: false
@@ -121,7 +122,9 @@ services:
       CLICKHOUSE_PORT: "8124"
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DATABASE: default
       CLICKHOUSE_TABLE: polymarket_orderbook_v3
+      CLICKHOUSE_RETENTION_HOURS: ${CLICKHOUSE_RETENTION_HOURS:-3}
       EXPORT_BACKEND: ${EXPORT_BACKEND:-r2}
       LOCAL_EXPORT_DIR: ${LOCAL_EXPORT_DIR:-/exports}
       EXPORT_ONCE: ${EXPORT_ONCE:-false}
@@ -129,3 +132,4 @@ services:
       R2_BUCKET: ${R2_BUCKET:-}
       R2_ACCESS_KEY: ${R2_ACCESS_KEY:-}
       R2_SECRET_KEY: ${R2_SECRET_KEY:-}
+      RUST_LOG: ${RUST_LOG:-info}
