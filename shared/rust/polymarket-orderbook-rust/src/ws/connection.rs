@@ -110,7 +110,7 @@ pub struct Connection {
     /// Whether this socket is one of the redundant listeners for global
     /// `new_market` notifications.
     pub lifecycle_listener: bool,
-    pub lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycleObservation>>,
+    pub lifecycle_tx: Option<mpsc::Sender<MarketLifecycleObservation>>,
 }
 
 impl Connection {
@@ -120,7 +120,7 @@ impl Connection {
         collector: Arc<CollectorContext>,
         status_tx: mpsc::UnboundedSender<HealthEvent>,
         lifecycle_listener: bool,
-        lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycleObservation>>,
+        lifecycle_tx: Option<mpsc::Sender<MarketLifecycleObservation>>,
     ) -> Self {
         Self {
             index,
@@ -327,7 +327,7 @@ struct SessionContext<'a> {
     collector: &'a CollectorContext,
     status_tx: &'a mpsc::UnboundedSender<HealthEvent>,
     lifecycle_listener: bool,
-    lifecycle_tx: Option<&'a mpsc::UnboundedSender<MarketLifecycleObservation>>,
+    lifecycle_tx: Option<&'a mpsc::Sender<MarketLifecycleObservation>>,
 }
 
 /// Run a single connected WebSocket session: send the initial subscription,
@@ -609,18 +609,27 @@ fn handle_text(
             }
 
             if let Some(lifecycle_tx) = context.lifecycle_tx {
-                if lifecycle_tx
-                    .send(MarketLifecycleObservation {
-                        event: ev,
-                        timestamp_received_ns,
-                    })
-                    .is_err()
-                {
-                    error!(
-                        conn = context.index,
-                        "market lifecycle controller stopped; exiting before losing data"
-                    );
-                    std::process::exit(1);
+                match lifecycle_tx.try_send(MarketLifecycleObservation {
+                    event: ev,
+                    timestamp_received_ns,
+                }) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        error!(
+                            conn = context.index,
+                            capacity = lifecycle_tx.capacity(),
+                            max_capacity = lifecycle_tx.max_capacity(),
+                            "[QUEUE-OVERFLOW] market lifecycle channel full, exiting"
+                        );
+                        std::process::exit(1);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        error!(
+                            conn = context.index,
+                            "market lifecycle controller stopped; exiting before losing data"
+                        );
+                        std::process::exit(1);
+                    }
                 }
             } else {
                 events_buf.push(context.collector.record(ev, timestamp_received_ns));
@@ -900,7 +909,7 @@ mod tests {
         let mut buf = Vec::new();
         let (event_tx, _event_rx) = mpsc::channel(1);
         let (status_tx, _status_rx) = mpsc::unbounded_channel();
-        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(8);
         let collector = CollectorContext::new();
         let context = SessionContext {
             index: 0,
@@ -933,7 +942,7 @@ mod tests {
         let mut buf = Vec::new();
         let (event_tx, _event_rx) = mpsc::channel(1);
         let (status_tx, _status_rx) = mpsc::unbounded_channel();
-        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(8);
         let collector = CollectorContext::new();
         let context = SessionContext {
             index: 17,
@@ -963,7 +972,7 @@ mod tests {
         let mut buf = Vec::new();
         let (event_tx, _event_rx) = mpsc::channel(1);
         let (status_tx, _status_rx) = mpsc::unbounded_channel();
-        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(8);
         let collector = CollectorContext::new();
         let context = SessionContext {
             index: 18,

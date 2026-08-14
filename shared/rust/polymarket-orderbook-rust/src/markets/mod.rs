@@ -10,6 +10,7 @@
 //!   `subscribe_markets`, and `market_resolved` events to `unsubscribe_markets`.
 
 pub mod gamma;
+pub mod lifecycle;
 pub mod redis_cache;
 pub mod stream;
 

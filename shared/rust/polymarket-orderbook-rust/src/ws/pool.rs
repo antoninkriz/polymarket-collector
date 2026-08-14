@@ -63,7 +63,7 @@ pub struct Pool {
     /// Stable ID of the lifecycle anchor. It remains alive with no data
     /// assets so `--new-only` still has one lifecycle listener.
     lifecycle_conn_id: Option<usize>,
-    lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycleObservation>>,
+    lifecycle_tx: Option<mpsc::Sender<MarketLifecycleObservation>>,
     health_counters: Arc<HealthCounters>,
     monitor_join: Option<JoinHandle<()>>,
     status_event_tx: mpsc::UnboundedSender<HealthEvent>,
@@ -87,7 +87,7 @@ impl Pool {
         max_assets_per_conn: usize,
         event_tx: mpsc::Sender<EventRecord>,
         publisher_generation: u64,
-        lifecycle_tx: mpsc::UnboundedSender<MarketLifecycleObservation>,
+        lifecycle_tx: mpsc::Sender<MarketLifecycleObservation>,
     ) -> Self {
         Self::build(
             max_assets_per_conn,
@@ -101,7 +101,7 @@ impl Pool {
         max_assets_per_conn: usize,
         event_tx: mpsc::Sender<EventRecord>,
         publisher_generation: u64,
-        lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycleObservation>>,
+        lifecycle_tx: Option<mpsc::Sender<MarketLifecycleObservation>>,
     ) -> Self {
         let collector = Arc::new(CollectorContext::with_publisher_generation(
             publisher_generation,
@@ -850,7 +850,7 @@ mod tests {
     #[tokio::test]
     async fn first_three_connections_listen_for_global_lifecycle_events() {
         let (event_tx, _event_rx) = mpsc::channel(8);
-        let (lifecycle_tx, _lifecycle_rx) = mpsc::unbounded_channel();
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
         let mut pool = Pool::new_with_lifecycle(2, event_tx, 0, lifecycle_tx);
 
         pool.subscribe_markets(vec![

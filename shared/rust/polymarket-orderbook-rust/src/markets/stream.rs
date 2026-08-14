@@ -4,9 +4,10 @@
 //! against the configured consumer group + name. Two event types are
 //! handled:
 //!
-//! - `new_market` — parse outcomes/asset IDs into a [`Market`] and call the
-//!   pool's `subscribe_markets`.
-//! - `market_resolved` — call the pool's `unsubscribe_markets`.
+//! - `new_market` — normalize the complete payload and send it to the
+//!   authoritative lifecycle coordinator.
+//! - `market_resolved` — normalize the complete payload and send it to the
+//!   same coordinator.
 //!
 //! Each successfully processed message is XACK'd. With `--skip-backlog`, the
 //! cursor starts at `$` (drop pending messages and only process new ones).
@@ -14,19 +15,19 @@
 //! The consumer drains its pending (unacknowledged) messages first, then
 //! switches to `">"` for new messages.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use redis::aio::MultiplexedConnection;
 use redis::streams::{StreamReadOptions, StreamReadReply};
 use redis::{AsyncCommands, AsyncConnectionConfig};
 use serde::Deserialize;
-use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tokio::sync::{mpsc, oneshot};
+use tracing::info;
 
-use crate::markets;
-use crate::ws::pool::Pool;
+use crate::events::{Event, MarketLifecycleObservation};
+use crate::markets::lifecycle::{LifecycleRequest, LifecycleSource};
+use crate::record::now_ns;
 
 const READ_COUNT: usize = 10;
 const READ_BLOCK_MS: usize = 1000;
@@ -40,9 +41,9 @@ pub struct StreamConfig {
     pub skip_backlog: bool,
 }
 
-/// Run the stream consumer until shutdown. Holds a shared lock on the
-/// pool to dispatch subscribe / unsubscribe calls.
-pub async fn run(cfg: StreamConfig, pool: Arc<Mutex<Pool>>) -> Result<()> {
+/// Run the stream consumer until shutdown. An entry is acknowledged only after
+/// the lifecycle coordinator confirms that its event was successfully applied.
+pub async fn run(cfg: StreamConfig, lifecycle_tx: mpsc::Sender<LifecycleRequest>) -> Result<()> {
     let client = redis::Client::open(cfg.redis_url.as_str()).context("open redis client")?;
     // redis-rs 1.5 defaults to a 500 ms response timeout, which is shorter
     // than this consumer's intentional one-second blocking stream read.
@@ -96,23 +97,23 @@ pub async fn run(cfg: StreamConfig, pool: Arc<Mutex<Pool>>) -> Result<()> {
                 got_any = true;
                 last_pending_id = entry.id.clone();
                 let data = stream_entry_to_map(&entry);
-                if let Err(e) = dispatch(&data, &pool).await {
-                    error!(
-                        message_id = %entry.id,
-                        error = %e,
-                        "stream message dispatch failed",
-                    );
-                }
-                if let Err(e) = conn
+                let timestamp_received_ns = now_ns();
+                dispatch(&data, timestamp_received_ns, &lifecycle_tx)
+                    .await
+                    .with_context(|| format!("dispatch stream message {}", entry.id))?;
+                let acknowledged = conn
                     .xack::<_, _, _, i64>(
                         cfg.stream_key.as_str(),
                         cfg.group.as_str(),
                         &[entry.id.as_str()],
                     )
                     .await
-                {
-                    warn!(message_id = %entry.id, error = %e, "xack failed");
-                }
+                    .with_context(|| format!("xack stream message {}", entry.id))?;
+                ensure!(
+                    acknowledged == 1,
+                    "xack stream message {} acknowledged {acknowledged} entries",
+                    entry.id
+                );
             }
         }
         // Phase transition: when the pending pass returns no entries we
@@ -175,76 +176,94 @@ fn stream_entry_to_map(
 
 async fn dispatch(
     data: &std::collections::HashMap<String, String>,
-    pool: &Arc<Mutex<Pool>>,
+    timestamp_received_ns: i64,
+    lifecycle_tx: &mpsc::Sender<LifecycleRequest>,
 ) -> Result<()> {
+    let Some(event) = normalize_event(data)? else {
+        return Ok(());
+    };
+    let observation = MarketLifecycleObservation {
+        event,
+        timestamp_received_ns,
+    };
+    let (completion, completed) = oneshot::channel();
+    lifecycle_tx
+        .send(LifecycleRequest::Observation {
+            source: LifecycleSource::RedisStream,
+            observation,
+            completion,
+        })
+        .await
+        .context("lifecycle coordinator channel closed")?;
+    completed
+        .await
+        .context("lifecycle coordinator stopped before confirming dispatch")?
+        .map_err(anyhow::Error::msg)
+}
+
+fn normalize_event(data: &std::collections::HashMap<String, String>) -> Result<Option<Event>> {
     let event_type = data.get("event_type").map(String::as_str).unwrap_or("");
     let payload_raw = data.get("payload").map(String::as_str).unwrap_or("{}");
-
     match event_type {
         "new_market" => {
             let payload: NewMarketPayload =
                 serde_json::from_str(payload_raw).context("parse new_market payload")?;
-            let Some(market) = markets::binary_market_from_outcomes(
-                payload.market.clone(),
-                &payload.outcomes,
-                &payload.assets_ids,
-            ) else {
-                return Ok(()); // skip non-binary
-            };
-            info!(
-                market = short(&payload.market),
-                question = short(&payload.question.unwrap_or_default()),
-                "[MARKET_EVENT] new_market",
-            );
-            pool.lock().await.subscribe_markets(vec![market]).await?;
+            Ok(Some(Event::NewMarket {
+                id: payload.id,
+                market: payload.market,
+                timestamp: payload.timestamp,
+                assets_ids: payload.assets_ids,
+                outcomes: payload.outcomes,
+                question: payload.question,
+                slug: payload.slug,
+            }))
         }
         "market_resolved" => {
             let payload: MarketResolvedPayload =
                 serde_json::from_str(payload_raw).context("parse market_resolved payload")?;
-            if payload.market.is_empty() {
-                return Ok(());
-            }
-            info!(
-                market = short(&payload.market),
-                winner = %payload.winning_outcome.unwrap_or_default(),
-                "[MARKET_EVENT] market_resolved",
-            );
-            pool.lock()
-                .await
-                .unsubscribe_markets(vec![payload.market])
-                .await?;
+            Ok(Some(Event::MarketResolved {
+                id: payload.id,
+                market: payload.market,
+                timestamp: payload.timestamp,
+                assets_ids: payload.assets_ids,
+                winning_asset_id: payload.winning_asset_id,
+                winning_outcome: payload.winning_outcome,
+            }))
         }
-        _ => {
-            // Unknown event type — ignore.
-        }
+        _ => Ok(None),
     }
-    Ok(())
-}
-
-fn short(s: &str) -> &str {
-    let mut end = s.len().min(16);
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 #[derive(Debug, Deserialize)]
 struct NewMarketPayload {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
     market: String,
+    #[serde(default)]
+    timestamp: String,
     #[serde(default)]
     assets_ids: Vec<String>,
     #[serde(default)]
     outcomes: Vec<String>,
     #[serde(default)]
     question: Option<String>,
+    #[serde(default)]
+    slug: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct MarketResolvedPayload {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
     market: String,
+    #[serde(default)]
+    timestamp: String,
+    #[serde(default)]
+    assets_ids: Vec<String>,
+    #[serde(default)]
+    winning_asset_id: Option<String>,
     #[serde(default)]
     winning_outcome: Option<String>,
 }
@@ -269,6 +288,42 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_complete_new_market_event() {
+        let data = std::collections::HashMap::from([
+            ("event_type".into(), "new_market".into()),
+            (
+                "payload".into(),
+                r#"{
+                    "id":"7", "market":"0xabc", "timestamp":"123",
+                    "assets_ids":["y","n"], "outcomes":["Yes","No"],
+                    "question":"Will it rain?", "slug":"rain"
+                }"#
+                .into(),
+            ),
+        ]);
+        let event = normalize_event(&data).unwrap().unwrap();
+        let Event::NewMarket {
+            id,
+            market,
+            timestamp,
+            assets_ids,
+            outcomes,
+            question,
+            slug,
+        } = event
+        else {
+            panic!("expected new_market")
+        };
+        assert_eq!(id, "7");
+        assert_eq!(market, "0xabc");
+        assert_eq!(timestamp, "123");
+        assert_eq!(assets_ids, ["y", "n"]);
+        assert_eq!(outcomes, ["Yes", "No"]);
+        assert_eq!(question.as_deref(), Some("Will it rain?"));
+        assert_eq!(slug.as_deref(), Some("rain"));
+    }
+
+    #[test]
     fn parse_market_resolved_payload() {
         let raw = r#"{
             "market": "0xabc",
@@ -278,6 +333,40 @@ mod tests {
         let p: MarketResolvedPayload = serde_json::from_str(raw).unwrap();
         assert_eq!(p.market, "0xabc");
         assert_eq!(p.winning_outcome.as_deref(), Some("Yes"));
+    }
+
+    #[test]
+    fn normalizes_complete_market_resolved_event() {
+        let data = std::collections::HashMap::from([
+            ("event_type".into(), "market_resolved".into()),
+            (
+                "payload".into(),
+                r#"{
+                    "id":"7", "market":"0xabc", "timestamp":"123",
+                    "assets_ids":["y","n"], "winning_asset_id":"y",
+                    "winning_outcome":"Yes"
+                }"#
+                .into(),
+            ),
+        ]);
+        let event = normalize_event(&data).unwrap().unwrap();
+        let Event::MarketResolved {
+            id,
+            market,
+            timestamp,
+            assets_ids,
+            winning_asset_id,
+            winning_outcome,
+        } = event
+        else {
+            panic!("expected market_resolved")
+        };
+        assert_eq!(id, "7");
+        assert_eq!(market, "0xabc");
+        assert_eq!(timestamp, "123");
+        assert_eq!(assets_ids, ["y", "n"]);
+        assert_eq!(winning_asset_id.as_deref(), Some("y"));
+        assert_eq!(winning_outcome.as_deref(), Some("Yes"));
     }
 
     #[test]
@@ -316,8 +405,8 @@ mod tests {
     }
 
     #[test]
-    fn short_does_not_split_a_utf8_character() {
-        let value = format!("{}é-tail", "a".repeat(15));
-        assert_eq!(short(&value), "a".repeat(15));
+    fn unknown_event_is_ignored() {
+        let data = std::collections::HashMap::from([("event_type".into(), "future".into())]);
+        assert!(normalize_event(&data).unwrap().is_none());
     }
 }

@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 pub const DEFAULT_QUEUE_SIZE: usize = 250_000;
+pub const DEFAULT_LIFECYCLE_QUEUE_SIZE: usize = 8_192;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -42,6 +43,7 @@ pub struct Config {
 
     // -- Pipeline ------------------------------------------------------------
     pub queue_size: usize,
+    pub lifecycle_queue_size: usize,
     pub max_assets_per_conn: usize,
 }
 
@@ -58,6 +60,7 @@ impl Config {
             5_000_u64,
         )?);
         let queue_size = env_parse("QUEUE_SIZE", DEFAULT_QUEUE_SIZE)?;
+        let lifecycle_queue_size = env_parse("LIFECYCLE_QUEUE_SIZE", DEFAULT_LIFECYCLE_QUEUE_SIZE)?;
         anyhow::ensure!(
             !publisher_lease_ttl.is_zero(),
             "PUBLISHER_LEASE_TTL_MS must be positive",
@@ -73,6 +76,10 @@ impl Config {
             "PUBLISHER_GENERATION_PERSIST_TIMEOUT_MS must be positive and less than PUBLISHER_LEASE_TTL_MS",
         );
         anyhow::ensure!(queue_size > 0, "QUEUE_SIZE must be positive");
+        anyhow::ensure!(
+            lifecycle_queue_size > 0,
+            "LIFECYCLE_QUEUE_SIZE must be positive"
+        );
 
         Ok(Self {
             redis_url: require_env("REDIS_URL")?,
@@ -113,6 +120,7 @@ impl Config {
             skip_active_markets_cache: env_bool("SKIP_ACTIVE_MARKETS_CACHE"),
 
             queue_size,
+            lifecycle_queue_size,
             max_assets_per_conn: env_parse("MAX_ASSETS_PER_CONN", 200)?,
         })
     }
@@ -167,6 +175,7 @@ mod tests {
         "REDIS_EVENT_STREAM",
         "SKIP_ACTIVE_MARKETS_CACHE",
         "QUEUE_SIZE",
+        "LIFECYCLE_QUEUE_SIZE",
         "MAX_ASSETS_PER_CONN",
         "MAX_BATCH",
         "LINGER_MS",
@@ -244,6 +253,7 @@ mod tests {
         assert_eq!(cfg.redis_event_stream, "polymarket:events:v3");
         assert!(!cfg.skip_active_markets_cache);
         assert_eq!(cfg.queue_size, DEFAULT_QUEUE_SIZE);
+        assert_eq!(cfg.lifecycle_queue_size, DEFAULT_LIFECYCLE_QUEUE_SIZE);
         assert_eq!(cfg.max_assets_per_conn, 200);
         assert_eq!(cfg.publish_batch_max, 200);
         assert_eq!(cfg.publish_linger, Duration::from_millis(2));
@@ -274,6 +284,7 @@ mod tests {
         std::env::set_var("REDIS_URL", "redis://r:6379");
         std::env::set_var("REDIS_EVENT_STREAM", "my:custom:stream");
         std::env::set_var("QUEUE_SIZE", "1234");
+        std::env::set_var("LIFECYCLE_QUEUE_SIZE", "4321");
         std::env::set_var("MAX_ASSETS_PER_CONN", "100");
         std::env::set_var("ORDERBOOK_CONSUMER_GROUP", "g1");
         std::env::set_var("ORDERBOOK_CONSUMER_NAME", "c1");
@@ -292,6 +303,7 @@ mod tests {
         assert_eq!(cfg.redis_url, "redis://r:6379");
         assert_eq!(cfg.redis_event_stream, "my:custom:stream");
         assert_eq!(cfg.queue_size, 1234);
+        assert_eq!(cfg.lifecycle_queue_size, 4321);
         assert_eq!(cfg.max_assets_per_conn, 100);
         assert_eq!(cfg.stream_consumer_group, "g1");
         assert_eq!(cfg.stream_consumer_name, "c1");
@@ -321,6 +333,23 @@ mod tests {
 
         let err = Config::from_env().unwrap_err().to_string();
         assert!(err.contains("QUEUE_SIZE must be positive"), "{err}");
+
+        restore_env(snap);
+    }
+
+    #[test]
+    fn from_env_rejects_zero_lifecycle_queue_size() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let snap = snapshot_env();
+        clear_env();
+        std::env::set_var("REDIS_URL", "redis://localhost:6379");
+        std::env::set_var("LIFECYCLE_QUEUE_SIZE", "0");
+
+        let err = Config::from_env().unwrap_err().to_string();
+        assert!(
+            err.contains("LIFECYCLE_QUEUE_SIZE must be positive"),
+            "{err}"
+        );
 
         restore_env(snap);
     }

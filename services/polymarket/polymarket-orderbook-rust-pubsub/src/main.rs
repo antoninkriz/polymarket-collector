@@ -12,24 +12,25 @@
 //!   Polymarket WS pool ── (mpsc) ──> Redis XADD (durable event stream)
 //! ```
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use polymarket_orderbook_rust::events::{Market, MarketLifecycle, MarketLifecycleObservation};
+use polymarket_orderbook_rust::events::{Market, MarketLifecycleObservation};
 use polymarket_orderbook_rust::markets;
+use polymarket_orderbook_rust::markets::lifecycle::LifecycleRequest;
 use polymarket_orderbook_rust::markets::stream::StreamConfig;
 use polymarket_orderbook_rust::record::EventRecord;
 use polymarket_orderbook_rust::ws::pool::Pool;
 
 use polymarket_orderbook_rust_pubsub::config::Config;
 use polymarket_orderbook_rust_pubsub::lease::{PublisherLease, PublisherLeaseConfig};
+use polymarket_orderbook_rust_pubsub::market_lifecycle::LifecycleCoordinator;
 use polymarket_orderbook_rust_pubsub::pubsub_sink::{PubSubSink, PubSubSinkConfig};
 use polymarket_orderbook_rust_pubsub::sequence_watermark::clickhouse_generation_floor;
 
@@ -75,6 +76,7 @@ async fn main() -> Result<()> {
         event_stream = %cfg.redis_event_stream,
         max_assets_per_conn = cfg.max_assets_per_conn,
         queue_size = cfg.queue_size,
+        lifecycle_queue_size = cfg.lifecycle_queue_size,
         publish_batch_max = cfg.publish_batch_max,
         publish_linger_ms = cfg.publish_linger.as_millis() as u64,
         publisher_fence,
@@ -108,24 +110,25 @@ async fn main() -> Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<EventRecord>(cfg.queue_size);
     let mut sink_handle: JoinHandle<Result<()>> = tokio::spawn(sink.run(event_rx));
 
-    let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+    let (websocket_lifecycle_tx, websocket_lifecycle_rx) = mpsc::channel(cfg.lifecycle_queue_size);
+    let (reconciliation_tx, reconciliation_rx) = mpsc::channel(cfg.lifecycle_queue_size);
     let pool = Arc::new(Mutex::new(Pool::new_with_lifecycle(
         cfg.max_assets_per_conn,
         event_tx.clone(),
         publisher_fence,
-        lifecycle_tx,
+        websocket_lifecycle_tx.clone(),
     )));
     pool.lock().await.start().await;
 
-    let lifecycle_pool = Arc::clone(&pool);
-    let lifecycle_handle = tokio::spawn(async move {
-        run_websocket_lifecycle(lifecycle_rx, lifecycle_pool).await;
-    });
+    let coordinator =
+        LifecycleCoordinator::new(Arc::clone(&pool), websocket_lifecycle_rx, reconciliation_rx);
+    let mut coordinator_handle = tokio::spawn(coordinator.run());
 
     if !cli.new_only {
         let markets = preload_markets(&cfg).await?;
-        if !markets.is_empty() {
-            pool.lock().await.subscribe_markets(markets).await?;
+        let market_count = markets.len();
+        apply_bootstrap(&reconciliation_tx, markets).await?;
+        if market_count > 0 {
             info!(
                 markets = pool.lock().await.subscribed_market_count(),
                 "pre-loaded markets",
@@ -142,18 +145,22 @@ async fn main() -> Result<()> {
         consumer: cfg.stream_consumer_name.clone(),
         skip_backlog: cli.skip_backlog,
     };
-    let stream_pool = Arc::clone(&pool);
-    let stream_handle: JoinHandle<Result<()>> =
-        tokio::spawn(async move { markets::stream::run(stream_cfg, stream_pool).await });
+    let stream_lifecycle_tx = reconciliation_tx.clone();
+    let mut stream_handle: JoinHandle<Result<()>> =
+        tokio::spawn(async move { markets::stream::run(stream_cfg, stream_lifecycle_tx).await });
 
     let stats_pool = Arc::clone(&pool);
     let stats_event_tx = event_tx.clone();
     let stats_redis_url = cfg.redis_url.clone();
     let stats_cache_count_key = cfg.redis_key_active_markets_count.clone();
+    let stats_websocket_lifecycle_tx = websocket_lifecycle_tx.clone();
+    let stats_reconciliation_tx = reconciliation_tx.clone();
     let stats_handle = tokio::spawn(async move {
         stats_loop(
             stats_pool,
             stats_event_tx,
+            stats_websocket_lifecycle_tx,
+            stats_reconciliation_tx,
             stats_redis_url,
             stats_cache_count_key,
         )
@@ -161,6 +168,8 @@ async fn main() -> Result<()> {
     });
 
     let mut sink_outcome = None;
+    let mut stream_stopped = false;
+    let mut coordinator_stopped = false;
     tokio::select! {
         _ = wait_for_shutdown() => info!("shutdown signal received"),
         lease_error = lease_failure_rx.recv() => {
@@ -170,15 +179,27 @@ async fn main() -> Result<()> {
             warn!(?outcome, "Redis event sink stopped; stopping collector");
             sink_outcome = Some(outcome);
         }
+        outcome = &mut stream_handle => {
+            warn!(?outcome, "Redis lifecycle stream stopped; stopping collector");
+            stream_stopped = true;
+        }
+        outcome = &mut coordinator_handle => {
+            warn!(?outcome, "market lifecycle coordinator stopped; stopping collector");
+            coordinator_stopped = true;
+        }
     }
 
-    stream_handle.abort();
-    let _ = stream_handle.await;
+    if !stream_stopped {
+        stream_handle.abort();
+        let _ = stream_handle.await;
+    }
     info!("stream listener stopped");
 
-    lifecycle_handle.abort();
-    let _ = lifecycle_handle.await;
-    info!("WebSocket lifecycle listener stopped");
+    if !coordinator_stopped {
+        coordinator_handle.abort();
+        let _ = coordinator_handle.await;
+    }
+    info!("market lifecycle coordinator stopped");
 
     stats_handle.abort();
     let _ = stats_handle.await;
@@ -226,6 +247,24 @@ async fn main() -> Result<()> {
 
     info!("shutdown complete");
     Ok(())
+}
+
+async fn apply_bootstrap(
+    lifecycle_tx: &mpsc::Sender<LifecycleRequest>,
+    markets: Vec<Market>,
+) -> Result<()> {
+    let (completion, completed) = oneshot::channel();
+    lifecycle_tx
+        .send(LifecycleRequest::Bootstrap {
+            markets,
+            completion,
+        })
+        .await
+        .context("lifecycle coordinator stopped before bootstrap")?;
+    completed
+        .await
+        .context("lifecycle coordinator dropped bootstrap completion")?
+        .map_err(anyhow::Error::msg)
 }
 
 fn init_tracing() {
@@ -300,57 +339,11 @@ async fn wait_for_shutdown() {
     }
 }
 
-async fn run_websocket_lifecycle(
-    mut lifecycle_rx: mpsc::UnboundedReceiver<MarketLifecycleObservation>,
-    pool: Arc<Mutex<Pool>>,
-) {
-    let mut seen = HashSet::<(&'static str, String)>::new();
-    while let Some(observation) = lifecycle_rx.recv().await {
-        let Some(update) = observation.event.market_lifecycle() else {
-            warn!("lifecycle controller received a token-scoped event");
-            continue;
-        };
-        let key = match &update {
-            MarketLifecycle::NewMarket { market, .. } => ("new_market", market.clone()),
-            MarketLifecycle::MarketResolved { market } => ("market_resolved", market.clone()),
-        };
-        if !seen.insert(key) {
-            continue;
-        }
-
-        let mut pool = pool.lock().await;
-        pool.admit_lifecycle(observation.event, observation.timestamp_received_ns);
-        let result = match update {
-            MarketLifecycle::NewMarket {
-                market,
-                assets_ids,
-                outcomes,
-            } => {
-                let Some(market) =
-                    markets::binary_market_from_outcomes(market, &outcomes, &assets_ids)
-                else {
-                    warn!(
-                        asset_count = assets_ids.len(),
-                        outcome_count = outcomes.len(),
-                        "ignoring non-binary WebSocket new_market"
-                    );
-                    continue;
-                };
-                pool.subscribe_markets(vec![market]).await
-            }
-            MarketLifecycle::MarketResolved { market } => {
-                pool.unsubscribe_markets(vec![market]).await
-            }
-        };
-        if let Err(error) = result {
-            warn!(%error, "failed to apply WebSocket market lifecycle update");
-        }
-    }
-}
-
 async fn stats_loop(
     pool: Arc<Mutex<Pool>>,
     event_tx: mpsc::Sender<EventRecord>,
+    websocket_lifecycle_tx: mpsc::Sender<MarketLifecycleObservation>,
+    reconciliation_tx: mpsc::Sender<LifecycleRequest>,
     redis_url: String,
     cache_count_key: String,
 ) {
@@ -367,12 +360,22 @@ async fn stats_loop(
     let mut iteration = 0_u64;
     let mut samples = 0_u64;
     let mut queue_high_water = 0_usize;
+    let mut websocket_lifecycle_high_water = 0_usize;
+    let mut reconciliation_high_water = 0_usize;
     loop {
         tick.tick().await;
 
         let queue_max = event_tx.max_capacity();
         let queue_used = queue_max.saturating_sub(event_tx.capacity());
+        let websocket_lifecycle_max = websocket_lifecycle_tx.max_capacity();
+        let websocket_lifecycle_used =
+            websocket_lifecycle_max.saturating_sub(websocket_lifecycle_tx.capacity());
+        let reconciliation_max = reconciliation_tx.max_capacity();
+        let reconciliation_used = reconciliation_max.saturating_sub(reconciliation_tx.capacity());
         queue_high_water = queue_high_water.max(queue_used);
+        websocket_lifecycle_high_water =
+            websocket_lifecycle_high_water.max(websocket_lifecycle_used);
+        reconciliation_high_water = reconciliation_high_water.max(reconciliation_used);
         samples += 1;
         if samples < SAMPLES_PER_REPORT {
             continue;
@@ -392,6 +395,16 @@ async fn stats_loop(
         };
         let queue_high_water_pct = if queue_max > 0 {
             (queue_high_water as f64 / queue_max as f64) * 100.0
+        } else {
+            0.0
+        };
+        let websocket_lifecycle_high_water_pct = if websocket_lifecycle_max > 0 {
+            (websocket_lifecycle_high_water as f64 / websocket_lifecycle_max as f64) * 100.0
+        } else {
+            0.0
+        };
+        let reconciliation_high_water_pct = if reconciliation_max > 0 {
+            (reconciliation_high_water as f64 / reconciliation_max as f64) * 100.0
         } else {
             0.0
         };
@@ -432,6 +445,15 @@ async fn stats_loop(
             queue_max,
             queue_pct = format!("{:.1}", queue_pct),
             queue_high_water_pct = format!("{:.1}", queue_high_water_pct),
+            websocket_lifecycle_queue_size = websocket_lifecycle_used,
+            websocket_lifecycle_queue_high_water = websocket_lifecycle_high_water,
+            websocket_lifecycle_queue_max = websocket_lifecycle_max,
+            websocket_lifecycle_queue_high_water_pct =
+                format!("{:.1}", websocket_lifecycle_high_water_pct),
+            reconciliation_queue_size = reconciliation_used,
+            reconciliation_queue_high_water = reconciliation_high_water,
+            reconciliation_queue_max = reconciliation_max,
+            reconciliation_queue_high_water_pct = format!("{:.1}", reconciliation_high_water_pct),
             subscribed_markets = stats.market_count,
             cache_active_markets,
             connections = stats.connection_count,
@@ -457,20 +479,39 @@ async fn stats_loop(
                 "queue_max": queue_max,
                 "queue_pct": format!("{:.1}", queue_pct),
                 "queue_high_water_pct": format!("{:.1}", queue_high_water_pct),
+                "websocket_lifecycle_queue_size": websocket_lifecycle_used,
+                "websocket_lifecycle_queue_high_water": websocket_lifecycle_high_water,
+                "websocket_lifecycle_queue_max": websocket_lifecycle_max,
+                "websocket_lifecycle_queue_high_water_pct": format!("{:.1}", websocket_lifecycle_high_water_pct),
+                "reconciliation_queue_size": reconciliation_used,
+                "reconciliation_queue_high_water": reconciliation_high_water,
+                "reconciliation_queue_max": reconciliation_max,
+                "reconciliation_queue_high_water_pct": format!("{:.1}", reconciliation_high_water_pct),
                 "asset_down_events_total": stats.asset_down_events,
                 "conn_down_events_total": stats.conn_down_events,
             }),
             "pool_stats",
         );
 
-        if queue_high_water_pct >= PRESSURE_THRESHOLD_PCT {
+        if queue_high_water_pct >= PRESSURE_THRESHOLD_PCT
+            || websocket_lifecycle_high_water_pct >= PRESSURE_THRESHOLD_PCT
+            || reconciliation_high_water_pct >= PRESSURE_THRESHOLD_PCT
+        {
             warn!(
                 queue_size = queue_used,
                 queue_high_water,
                 queue_max,
                 queue_pct = format!("{:.1}", queue_pct),
                 queue_high_water_pct = format!("{:.1}", queue_high_water_pct),
-                "[QUEUE-PRESSURE] queue high-water at or above 50%",
+                websocket_lifecycle_queue_high_water = websocket_lifecycle_high_water,
+                websocket_lifecycle_queue_max = websocket_lifecycle_max,
+                websocket_lifecycle_queue_high_water_pct =
+                    format!("{:.1}", websocket_lifecycle_high_water_pct),
+                reconciliation_queue_high_water = reconciliation_high_water,
+                reconciliation_queue_max = reconciliation_max,
+                reconciliation_queue_high_water_pct =
+                    format!("{:.1}", reconciliation_high_water_pct),
+                "[QUEUE-PRESSURE] pipeline queue high-water at or above 50%",
             );
             warn!(
                 grafana = true,
@@ -481,10 +522,18 @@ async fn stats_loop(
                     "queue_max": queue_max,
                     "queue_pct": format!("{:.1}", queue_pct),
                     "queue_high_water_pct": format!("{:.1}", queue_high_water_pct),
+                    "websocket_lifecycle_queue_high_water": websocket_lifecycle_high_water,
+                    "websocket_lifecycle_queue_max": websocket_lifecycle_max,
+                    "websocket_lifecycle_queue_high_water_pct": format!("{:.1}", websocket_lifecycle_high_water_pct),
+                    "reconciliation_queue_high_water": reconciliation_high_water,
+                    "reconciliation_queue_max": reconciliation_max,
+                    "reconciliation_queue_high_water_pct": format!("{:.1}", reconciliation_high_water_pct),
                 }),
                 "queue_pressure",
             );
         }
         queue_high_water = 0;
+        websocket_lifecycle_high_water = 0;
+        reconciliation_high_water = 0;
     }
 }
