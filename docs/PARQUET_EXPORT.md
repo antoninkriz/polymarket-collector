@@ -271,18 +271,6 @@ container's `/exports` directory to `.data/parquet` on the host. Set
 `EXPORT_ONCE=true` when invoking the exporter directly to backfill every
 currently eligible missing hour and exit.
 
-Completed local files can be sorted and re-encoded in parallel with:
-
-```bash
-cd services/r2-archive/exporter
-python reencode_local.py ../../../.data/parquet --jobs 4
-```
-
-The converter reads and sorts each complete file in memory, so choose the job
-count for the available RAM. It prepares and verifies every replacement before
-changing any completed hour. It removes the hour's manifest while atomically
-replacing its files, then writes the updated manifest last.
-
 The upstream event definitions are documented by Polymarket's
 [real-time market data reference](https://docs.polymarket.com/market-data/realtime-data).
 This document describes the normalized representation written by this
