@@ -1,9 +1,8 @@
 """Export compact Polymarket v3 rows to hourly, event-specific Parquet files.
 
 Each query applies ``FINAL`` to collapse collector-owned retries, projects one
-event type into its own schema, and orders rows by the shared collector
-sequence. PyArrow writes ZSTD level 9 with encodings selected for each event's
-observed column distributions.
+event type into its own schema, and clusters rows by market and asset. PyArrow
+writes ZSTD level 9 with plain value encoding and small, measured dictionaries.
 """
 
 from __future__ import annotations
@@ -217,23 +216,19 @@ EVENT_PROJECTIONS: dict[str, EventProjection] = {
             "JSONExtractString(data, 'id') AS id",
             ASSETS_IDS_COLUMN,
             """if(
-    JSONHas(data, 'winning_asset_id'),
+    winning_asset_id_text != '',
     toFixedString(
         unhex(leftPad(hex(toUInt256OrZero(winning_asset_id_text)), 64, '0')),
         32
     ),
     NULL
 ) AS winning_asset_id""",
-            """if(
-    JSONHas(data, 'winning_outcome'),
-    JSONExtractString(data, 'winning_outcome'),
-    NULL
-) AS winning_outcome""",
+            "nullIf(JSONExtractString(data, 'winning_outcome'), '') AS winning_outcome",
         ),
         validations=(
             ASSETS_IDS_VALIDATION,
             """throwIf(
-    JSONHas(data, 'winning_asset_id')
+    winning_asset_id_text != ''
         AND (
             NOT match(winning_asset_id_text, '^(0|[1-9][0-9]{0,77})$')
             OR toString(toUInt256OrZero(winning_asset_id_text))

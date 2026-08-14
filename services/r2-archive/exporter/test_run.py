@@ -77,6 +77,19 @@ class ExportPathsTest(unittest.TestCase):
         self.assertIn("ORDER BY market, asset_id, sequence", token_query)
         self.assertIn("ORDER BY market, sequence", lifecycle_query)
 
+    def test_resolution_query_preserves_null_winner_fields(self) -> None:
+        query = exporter.build_event_query(
+            datetime(2026, 8, 13, 4, tzinfo=timezone.utc),
+            "market_resolved",
+        )
+
+        self.assertIn("winning_asset_id_text != ''", query)
+        self.assertIn(
+            "nullIf(JSONExtractString(data, 'winning_outcome'), '')",
+            query,
+        )
+        self.assertNotIn("JSONHas(data, 'winning_asset_id')", query)
+
 
 class ParquetSchemaTest(unittest.TestCase):
     def test_decimals_are_narrow_and_integer_backed(self) -> None:
