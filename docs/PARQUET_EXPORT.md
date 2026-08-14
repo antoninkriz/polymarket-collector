@@ -44,7 +44,6 @@ The exporter writes Parquet data pages v2 with an explicit per-event policy:
 
 | Columns or leaf values | Event files | Value encoding |
 |---|---|---|
-| `timestamp_received`, `sequence`, `timestamp` | all | `BYTE_STREAM_SPLIT` |
 | `side` | `price_change`, `last_trade_price` | `RLE_DICTIONARY` requested; `PLAIN` fallback allowed |
 | `fee_rate_bps`, `price` | `last_trade_price` | `RLE_DICTIONARY` requested; `PLAIN` fallback allowed |
 | All other scalar and nested leaf values | their owning event file | `PLAIN` |
@@ -55,11 +54,6 @@ categories or repeated trade prices and normally remain well below that cap.
 Decimal values use `store_decimal_as_integer`, which is why precision-nine
 decimals have physical type `INT32` and precision-18 decimals have physical
 type `INT64` instead of `FIXED_LEN_BYTE_ARRAY`.
-
-Byte-stream split transposes the bytes of each fixed-width integer before ZSTD
-compression. It fits the three 64-bit sequence/time columns because their
-high-order bytes repeat even though market clustering introduces backward jumps
-between asset runs. It does not alter their Arrow logical types or values.
 
 Dictionary encoding is a writer preference, not part of the logical file
 contract. PyArrow may fall back to `PLAIN` within a row group when a dictionary
@@ -77,8 +71,8 @@ event formats, including nested snapshot and lifecycle leaves. See
 [`PARQUET_ENCODING_BENCHMARK.md`](PARQUET_ENCODING_BENCHMARK.md) for the active
 choices, benchmark procedure, and rationale. In particular, Parquet does not
 combine dictionary and another explicit value encoding for the same column:
-dictionary indexes already use RLE/bit packing, while byte-stream split and
-delta encodings operate directly on the values.
+dictionary indexes already use RLE/bit packing, while other value encodings
+operate directly on the values.
 
 ## Archive destinations
 

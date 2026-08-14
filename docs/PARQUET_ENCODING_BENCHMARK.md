@@ -18,22 +18,21 @@ All event files use the following settings:
 | Token-event row order | `market`, `asset_id`, `sequence` ascending |
 | Lifecycle-event row order | `market`, `sequence` ascending |
 
-The active policy is defined by `PARQUET_DICTIONARY_COLUMNS`,
-`PARQUET_COLUMN_ENCODINGS`, and `PARQUET_SORT_COLUMNS` in
-`services/r2-archive/exporter/run.py`. Columns absent from both encoding maps
-use `PLAIN` value encoding.
+The active policy is defined by `PARQUET_DICTIONARY_COLUMNS` and
+`PARQUET_SORT_COLUMNS` in `services/r2-archive/exporter/run.py`. Columns absent
+from the dictionary map use `PLAIN` value encoding.
 
 ## Active column policy
 
-| Event file | Byte-stream split | Dictionary |
-|---|---|---|
-| `book` | `timestamp_received`, `sequence`, `timestamp` | none |
-| `price_change` | `timestamp_received`, `sequence`, `timestamp` | `side` |
-| `last_trade_price` | `timestamp_received`, `sequence`, `timestamp` | `price`, `side`, `fee_rate_bps` |
-| `tick_size_change` | `timestamp_received`, `sequence`, `timestamp` | none |
-| `best_bid_ask` | `timestamp_received`, `sequence`, `timestamp` | none |
-| `new_market` | `timestamp_received`, `sequence`, `timestamp` | none |
-| `market_resolved` | `timestamp_received`, `sequence`, `timestamp` | none |
+| Event file | Dictionary |
+|---|---|
+| `book` | none |
+| `price_change` | `side` |
+| `last_trade_price` | `price`, `side`, `fee_rate_bps` |
+| `tick_size_change` | none |
+| `best_bid_ask` | none |
+| `new_market` | none |
+| `market_resolved` | none |
 
 Every other scalar or nested leaf is plain. PyArrow treats dictionary encoding
 as a writer preference and can fall back to plain values if a dictionary
@@ -42,12 +41,13 @@ therefore do not advertise a value encoding in Parquet metadata.
 
 ## Selection rationale
 
-Market clustering changes the shape of the three common 64-bit columns.
-`sequence` is increasing within an asset run but jumps between runs; source and
-receive timestamps have the same piecewise-ordered shape. Byte-stream split is
-robust to those jumps and exposes their shared high-order bytes to ZSTD. Delta
-binary packing assumes a smoother numeric series and performs poorly at the
-run boundaries.
+The three common 64-bit columns (`sequence`, `timestamp`, and
+`timestamp_received`) are plain. Plain keeps the policy uniform when individual
+event samples favor different encodings by small amounts. A complete rewrite
+of the local corpus was 1.6% larger with plain values than with byte-stream
+split; this modest storage cost is accepted in exchange for the simpler policy.
+Both encodings compressed substantially better than delta binary packing or
+dictionaries in the clustered benchmark.
 
 The fixed-width `market` and `asset_id` identifiers are plain. Sorting turns
 them into long identical runs, which ZSTD compresses directly. A dictionary
@@ -76,7 +76,7 @@ only small categories or trade prices and normally remain far below it.
 
 Parquet cannot apply dictionary and another explicit value encoding to the same
 column. Dictionary pages store values separately and RLE/bit-pack their indexes;
-byte-stream split and delta encodings operate directly on the values.
+other value encodings operate directly on the values.
 
 ## Reproducing the benchmark
 
