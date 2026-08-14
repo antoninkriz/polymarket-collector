@@ -1,4 +1,5 @@
 use std::env;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -10,14 +11,44 @@ pub const DEFAULT_LOOP_CHECK_INTERVAL_SECONDS: u64 = 60;
 pub const DEFAULT_QUERY_MAX_RETRIES: usize = 10;
 pub const DEFAULT_QUERY_RETRY_DELAY_SECONDS: u64 = 1;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Eq, PartialEq)]
+pub enum ExportBackend {
+    Local {
+        root: PathBuf,
+    },
+    R2 {
+        endpoint: String,
+        access_key: String,
+        secret_key: String,
+        bucket: String,
+    },
+}
+
+impl fmt::Debug for ExportBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local { root } => formatter.debug_struct("Local").field("root", root).finish(),
+            Self::R2 {
+                endpoint, bucket, ..
+            } => formatter
+                .debug_struct("R2")
+                .field("endpoint", endpoint)
+                .field("access_key", &"[REDACTED]")
+                .field("secret_key", &"[REDACTED]")
+                .field("bucket", bucket)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Config {
     pub clickhouse_url: String,
     pub clickhouse_user: String,
     pub clickhouse_password: String,
     pub clickhouse_database: String,
     pub clickhouse_table: String,
-    pub local_export_dir: PathBuf,
+    pub export_backend: ExportBackend,
     pub export_once: bool,
     pub export_delay_minutes: u32,
     pub export_lag_hours: i64,
@@ -42,10 +73,7 @@ impl Config {
         validate_identifier("CLICKHOUSE_DATABASE", &database)?;
         validate_identifier("CLICKHOUSE_TABLE", &table)?;
 
-        let backend = value_or(&mut lookup, "EXPORT_BACKEND", "local");
-        if !backend.eq_ignore_ascii_case("local") {
-            bail!("this exporter build currently supports only EXPORT_BACKEND=local");
-        }
+        let export_backend = parse_backend(&mut lookup)?;
 
         let export_delay_minutes = parse_or(
             &mut lookup,
@@ -62,11 +90,6 @@ impl Config {
             parse_or(&mut lookup, "QUERY_MAX_RETRIES", DEFAULT_QUERY_MAX_RETRIES)?;
         ensure!(query_max_retries > 0, "QUERY_MAX_RETRIES must be positive");
 
-        let local_export_dir = value_or(&mut lookup, "LOCAL_EXPORT_DIR", "/exports");
-        ensure!(
-            !local_export_dir.trim().is_empty(),
-            "LOCAL_EXPORT_DIR must not be empty"
-        );
         let loop_check_interval_seconds = parse_or(
             &mut lookup,
             "LOOP_CHECK_INTERVAL_SECONDS",
@@ -104,7 +127,7 @@ impl Config {
             clickhouse_password: value_or(&mut lookup, "CLICKHOUSE_PASSWORD", ""),
             clickhouse_database: database,
             clickhouse_table: table,
-            local_export_dir: PathBuf::from(local_export_dir),
+            export_backend,
             export_once: parse_bool(&mut lookup, "EXPORT_ONCE", false)?,
             export_delay_minutes,
             export_lag_hours,
@@ -115,6 +138,76 @@ impl Config {
             event_query_timeout: Duration::from_secs(event_query_timeout_seconds),
         })
     }
+}
+
+fn parse_backend(lookup: &mut impl FnMut(&str) -> Option<String>) -> Result<ExportBackend> {
+    match value_or(lookup, "EXPORT_BACKEND", "local")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "local" => {
+            let root = value_or(lookup, "LOCAL_EXPORT_DIR", "/exports");
+            ensure!(
+                !root.trim().is_empty(),
+                "LOCAL_EXPORT_DIR must not be empty"
+            );
+            Ok(ExportBackend::Local {
+                root: PathBuf::from(root),
+            })
+        }
+        "r2" => {
+            let endpoint = required_value(lookup, "R2_ENDPOINT")?;
+            validate_r2_endpoint(&endpoint)?;
+            let bucket = required_value(lookup, "R2_BUCKET")?;
+            ensure!(
+                !bucket.chars().any(|character| {
+                    character.is_ascii_whitespace()
+                        || character.is_ascii_control()
+                        || character == '/'
+                }),
+                "R2_BUCKET must be one bucket name"
+            );
+            Ok(ExportBackend::R2 {
+                endpoint,
+                access_key: required_value(lookup, "R2_ACCESS_KEY")?,
+                secret_key: required_value(lookup, "R2_SECRET_KEY")?,
+                bucket,
+            })
+        }
+        value => bail!("EXPORT_BACKEND must be either local or r2, got {value:?}"),
+    }
+}
+
+fn required_value(lookup: &mut impl FnMut(&str) -> Option<String>, name: &str) -> Result<String> {
+    let value = lookup(name).unwrap_or_default();
+    ensure!(!value.trim().is_empty(), "{name} must not be empty");
+    Ok(value)
+}
+
+fn validate_r2_endpoint(endpoint: &str) -> Result<()> {
+    let endpoint_url = reqwest::Url::parse(endpoint).context("parse R2_ENDPOINT as URL")?;
+    ensure!(
+        matches!(endpoint_url.scheme(), "http" | "https"),
+        "R2_ENDPOINT must use http or https"
+    );
+    ensure!(
+        endpoint_url.host().is_some(),
+        "R2_ENDPOINT must have a host"
+    );
+    ensure!(
+        endpoint_url.username().is_empty() && endpoint_url.password().is_none(),
+        "R2_ENDPOINT must not contain credentials"
+    );
+    ensure!(
+        endpoint_url.query().is_none() && endpoint_url.fragment().is_none(),
+        "R2_ENDPOINT must not contain a query or fragment"
+    );
+    ensure!(
+        endpoint_url.path().is_empty() || endpoint_url.path() == "/",
+        "R2_ENDPOINT must not contain a path"
+    );
+    Ok(())
 }
 
 fn value_or(lookup: &mut impl FnMut(&str) -> Option<String>, name: &str, default: &str) -> String {
@@ -183,7 +276,12 @@ mod tests {
         assert_eq!(defaults.clickhouse_url, "http://localhost:8123/");
         assert_eq!(defaults.clickhouse_database, "default");
         assert_eq!(defaults.clickhouse_table, "polymarket_orderbook_v3");
-        assert_eq!(defaults.local_export_dir, PathBuf::from("/exports"));
+        assert_eq!(
+            defaults.export_backend,
+            ExportBackend::Local {
+                root: PathBuf::from("/exports")
+            }
+        );
         assert!(!defaults.export_once);
         assert_eq!(defaults.export_delay_minutes, 5);
         assert_eq!(defaults.export_lag_hours, 1);
@@ -202,14 +300,72 @@ mod tests {
         assert_eq!(overridden.clickhouse_url, "http://clickhouse:9000/");
         assert_eq!(overridden.clickhouse_database, "archive");
         assert_eq!(overridden.clickhouse_table, "events_v3");
-        assert_eq!(overridden.local_export_dir, PathBuf::from("/tmp/archive"));
+        assert_eq!(
+            overridden.export_backend,
+            ExportBackend::Local {
+                root: PathBuf::from("/tmp/archive")
+            }
+        );
         assert!(overridden.export_once);
         assert_eq!(overridden.query_max_retries, 3);
     }
 
     #[test]
-    fn unsupported_backend_and_unsafe_identifiers_are_rejected() {
-        assert!(config(&[("EXPORT_BACKEND", "r2")]).is_err());
+    fn r2_requires_valid_complete_credentials_and_redacts_secrets() {
+        let values = [
+            ("EXPORT_BACKEND", "r2"),
+            ("R2_ENDPOINT", "https://account.r2.cloudflarestorage.com"),
+            ("R2_ACCESS_KEY", "access-secret"),
+            ("R2_SECRET_KEY", "very-secret"),
+            ("R2_BUCKET", "archive"),
+        ];
+        let cfg = config(&values).unwrap();
+        assert_eq!(
+            cfg.export_backend,
+            ExportBackend::R2 {
+                endpoint: "https://account.r2.cloudflarestorage.com".to_owned(),
+                access_key: "access-secret".to_owned(),
+                secret_key: "very-secret".to_owned(),
+                bucket: "archive".to_owned(),
+            }
+        );
+        let debug = format!("{:?}", cfg.export_backend);
+        assert!(!debug.contains("access-secret"));
+        assert!(!debug.contains("very-secret"));
+
+        for missing in ["R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY", "R2_BUCKET"] {
+            let incomplete = values
+                .iter()
+                .filter(|(name, _)| *name != missing)
+                .copied()
+                .collect::<Vec<_>>();
+            assert!(config(&incomplete).is_err(), "accepted missing {missing}");
+        }
+        assert!(
+            config(&[
+                ("EXPORT_BACKEND", "r2"),
+                ("R2_ENDPOINT", "ftp://example.com"),
+                ("R2_ACCESS_KEY", "access"),
+                ("R2_SECRET_KEY", "secret"),
+                ("R2_BUCKET", "archive"),
+            ])
+            .is_err()
+        );
+        assert!(
+            config(&[
+                ("EXPORT_BACKEND", "r2"),
+                ("R2_ENDPOINT", "https://user:pass@example.com/path?x=1"),
+                ("R2_ACCESS_KEY", "access"),
+                ("R2_SECRET_KEY", "secret"),
+                ("R2_BUCKET", "archive"),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unsafe_configuration_is_rejected() {
+        assert!(config(&[("EXPORT_BACKEND", "unknown")]).is_err());
         assert!(config(&[("CLICKHOUSE_TABLE", "events; DROP TABLE events")]).is_err());
         assert!(config(&[("CLICKHOUSE_TABLE", "default.events")]).is_err());
         assert!(config(&[("CLICKHOUSE_DATABASE", "9default")]).is_err());

@@ -184,10 +184,10 @@ fn read_limited(mut response: Take<Response>) -> std::io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::config::ExportBackend;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn source_can_be_constructed_and_dropped_on_async_worker() {
@@ -197,7 +197,9 @@ mod tests {
             clickhouse_password: String::new(),
             clickhouse_database: "default".to_owned(),
             clickhouse_table: "polymarket_orderbook_v3".to_owned(),
-            local_export_dir: PathBuf::from("/tmp/archive"),
+            export_backend: ExportBackend::Local {
+                root: "/tmp/archive".into(),
+            },
             export_once: true,
             export_delay_minutes: 5,
             export_lag_hours: 1,

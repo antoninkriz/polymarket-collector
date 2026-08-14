@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use tokio::task;
 use tracing::{error, info, warn};
 
-use crate::archive::{Archive, LocalArchive};
+use crate::archive::{Archive, build_archive};
 use crate::clickhouse::{ClickHouseSource, EventSource};
-use crate::config::Config;
+use crate::config::{Config, ExportBackend};
 use crate::event::{EventType, ensure_utc_hour};
 use crate::parquet_file::FileStats;
 
@@ -264,15 +264,25 @@ fn update_hour_stats(
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
-    let archive: Arc<dyn Archive> = Arc::new(LocalArchive::new(&cfg.local_export_dir)?);
+    let archive = build_archive(cfg.export_backend.clone()).await?;
     let source: Arc<dyn EventSource> = Arc::new(ClickHouseSource::new(cfg.clone())?);
     let exporter = Exporter::new(cfg.clone(), source, archive);
 
-    info!(
-        directory = %cfg.local_export_dir.display(),
-        source_table = %cfg.clickhouse_table,
-        "using local archive backend",
-    );
+    match &cfg.export_backend {
+        ExportBackend::Local { root } => info!(
+            directory = %root.display(),
+            source_table = %cfg.clickhouse_table,
+            "using local archive backend",
+        ),
+        ExportBackend::R2 {
+            endpoint, bucket, ..
+        } => info!(
+            %endpoint,
+            %bucket,
+            source_table = %cfg.clickhouse_table,
+            "using R2 archive backend",
+        ),
+    }
     let initial = exporter.clone();
     let initial_result = task::spawn_blocking(move || initial.backfill(Utc::now())).await;
     let mut next_hour = match initial_result {
@@ -345,7 +355,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::sync::Mutex;
 
-    use anyhow::bail;
+    use anyhow::{bail, ensure};
     use chrono::TimeZone;
     use sha2::{Digest, Sha256};
     use tempfile::{NamedTempFile, TempDir};
@@ -364,7 +374,9 @@ mod tests {
             clickhouse_password: String::new(),
             clickhouse_database: "default".to_owned(),
             clickhouse_table: "polymarket_orderbook_v3".to_owned(),
-            local_export_dir: root.to_path_buf(),
+            export_backend: ExportBackend::Local {
+                root: root.to_path_buf(),
+            },
             export_once: true,
             export_delay_minutes: 5,
             export_lag_hours: 1,
@@ -416,6 +428,15 @@ mod tests {
 
         fn exists(&self, key: &str) -> Result<bool> {
             Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+
+        fn get(&self, key: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+            let objects = self.objects.lock().unwrap();
+            let Some(data) = objects.get(key) else {
+                return Ok(None);
+            };
+            ensure!(data.len() <= max_bytes, "object exceeds read limit");
+            Ok(Some(data.clone()))
         }
     }
 
