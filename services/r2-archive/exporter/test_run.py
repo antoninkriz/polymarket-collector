@@ -68,6 +68,15 @@ class ExportPathsTest(unittest.TestCase):
             query,
         )
 
+    def test_queries_use_event_specific_cluster_order(self) -> None:
+        hour = datetime(2026, 8, 13, 4, tzinfo=timezone.utc)
+
+        token_query = exporter.build_event_query(hour, "price_change")
+        lifecycle_query = exporter.build_event_query(hour, "new_market")
+
+        self.assertIn("ORDER BY market, asset_id, sequence", token_query)
+        self.assertIn("ORDER BY market, sequence", lifecycle_query)
+
 
 class ParquetSchemaTest(unittest.TestCase):
     def test_decimals_are_narrow_and_integer_backed(self) -> None:
@@ -200,6 +209,10 @@ class ParquetEncodingTest(unittest.TestCase):
         )
         self.assertEqual(
             set(exporter.PARQUET_DELTA_COLUMNS),
+            set(exporter.EVENT_PROJECTIONS),
+        )
+        self.assertEqual(
+            set(exporter.PARQUET_SORT_COLUMNS),
             set(exporter.EVENT_PROJECTIONS),
         )
         for event_type in exporter.EVENT_PROJECTIONS:
@@ -378,7 +391,7 @@ class ExportHourTest(unittest.TestCase):
         client = MemoryR2()
 
         def fetch_event_table(_hour: datetime, event_type: str) -> pa.Table:
-            sequences = [10] if event_type == "book" else []
+            sequences = [12, 10] if event_type == "book" else []
             return pa.table({"sequence": pa.array(sequences, type=pa.uint64())})
 
         with patch.object(
@@ -393,11 +406,12 @@ class ExportHourTest(unittest.TestCase):
         self.assertEqual(len(client.uploads), len(exporter.EVENT_PROJECTIONS) + 1)
 
         manifest = json.loads(client.uploads[manifest_key])
-        self.assertEqual(manifest["row_count"], 1)
+        self.assertEqual(manifest["row_count"], 2)
         self.assertEqual(manifest["min_sequence"], 10)
-        self.assertEqual(manifest["max_sequence"], 10)
+        self.assertEqual(manifest["max_sequence"], 12)
         self.assertEqual(set(manifest["files"]), set(exporter.EVENT_PROJECTIONS))
-        self.assertEqual(manifest["files"]["book"]["row_count"], 1)
+        self.assertNotIn("order_by", manifest)
+        self.assertEqual(manifest["files"]["book"]["row_count"], 2)
         self.assertEqual(
             manifest["files"]["price_change"]["row_count"],
             0,
@@ -408,6 +422,10 @@ class ExportHourTest(unittest.TestCase):
                 f"2026-08-13/14/{event_type}.parquet",
             )
             self.assertIn(metadata["file"], client.uploads)
+            self.assertEqual(
+                metadata["order_by"],
+                list(exporter.PARQUET_SORT_COLUMNS[event_type]),
+            )
 
 
 class MainTest(unittest.TestCase):

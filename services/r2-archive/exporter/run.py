@@ -23,6 +23,7 @@ from typing import Protocol
 
 import boto3
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import requests
 from botocore.exceptions import ClientError
@@ -97,7 +98,15 @@ PARQUET_COLUMN_TYPES: dict[str, pa.DataType] = {
     "new_tick_size": pa.decimal32(9, 4),
     "size": pa.decimal64(18, 6),
 }
-SELECT_ORDER_BY = ("sequence",)
+PARQUET_SORT_COLUMNS: dict[str, tuple[str, ...]] = {
+    "book": ("market", "asset_id", "sequence"),
+    "price_change": ("market", "asset_id", "sequence"),
+    "last_trade_price": ("market", "asset_id", "sequence"),
+    "tick_size_change": ("market", "asset_id", "sequence"),
+    "best_bid_ask": ("market", "asset_id", "sequence"),
+    "new_market": ("market", "sequence"),
+    "market_resolved": ("market", "sequence"),
+}
 EXPORT_DELAY_MINUTES = int(os.environ.get("EXPORT_DELAY_MINUTES", "5"))
 EXPORT_LAG_HOURS = int(os.environ.get("EXPORT_LAG_HOURS", "1"))
 LOOP_CHECK_INTERVAL_SECONDS = int(os.environ.get("LOOP_CHECK_INTERVAL_SECONDS", "60"))
@@ -334,7 +343,7 @@ def build_event_query(hour: datetime, event_type: str) -> str:
     validations = "".join(
         f"\n  AND {validation}" for validation in projection.validations
     )
-    order_by = ", ".join(SELECT_ORDER_BY)
+    order_by = ", ".join(PARQUET_SORT_COLUMNS[event_type])
     return f"""
 WITH
     JSONExtractString(data, 'market') AS market_text{aliases}
@@ -596,10 +605,11 @@ def export_hour(client: ArchiveWriter, hour: datetime) -> None:
         data = table_to_parquet(table, event_type)
         key = event_to_key(hour, event_type)
         row_count = table.num_rows
-        min_sequence = int(table.column("sequence")[0].as_py()) if row_count else None
-        max_sequence = (
-            int(table.column("sequence")[row_count - 1].as_py()) if row_count else None
-        )
+        sequence_bounds = pc.min_max(  # pyright: ignore[reportAttributeAccessIssue]
+            table.column("sequence")
+        ).as_py()
+        min_sequence = int(sequence_bounds["min"]) if row_count else None
+        max_sequence = int(sequence_bounds["max"]) if row_count else None
         client.upload(key, data)
         files[event_type] = {
             "file": key,
@@ -609,6 +619,7 @@ def export_hour(client: ArchiveWriter, hour: datetime) -> None:
             "min_sequence": min_sequence,
             "max_sequence": max_sequence,
             "columns": table.column_names,
+            "order_by": PARQUET_SORT_COLUMNS[event_type],
         }
         total_rows += row_count
         if min_sequence is not None:
@@ -637,7 +648,6 @@ def export_hour(client: ArchiveWriter, hour: datetime) -> None:
         "max_sequence": hour_max_sequence,
         "files": files,
         "source_table": CLICKHOUSE_TABLE,
-        "order_by": SELECT_ORDER_BY,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     manifest_data = json.dumps(
@@ -742,10 +752,10 @@ def main() -> None:
         local_client.ensure_directory()
         client = local_client
         log.info(
-            "Using local archive directory %s, source_table=%s, order_by=%s",
+            "Using local archive directory %s, source_table=%s, sort_orders=%s",
             LOCAL_EXPORT_DIR,
             CLICKHOUSE_TABLE,
-            SELECT_ORDER_BY,
+            PARQUET_SORT_COLUMNS,
         )
     elif EXPORT_BACKEND == "r2":
         required = ("R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY", "R2_BUCKET")
@@ -758,11 +768,11 @@ def main() -> None:
         r2_client.ensure_bucket()
         client = r2_client
         log.info(
-            "Connected to R2 at %s, bucket=%s, source_table=%s, order_by=%s",
+            "Connected to R2 at %s, bucket=%s, source_table=%s, sort_orders=%s",
             R2_ENDPOINT,
             R2_BUCKET,
             CLICKHOUSE_TABLE,
-            SELECT_ORDER_BY,
+            PARQUET_SORT_COLUMNS,
         )
     else:
         log.error("Unsupported EXPORT_BACKEND: %s", EXPORT_BACKEND)
