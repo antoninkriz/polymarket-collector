@@ -18,6 +18,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+import run as exporter
+
 COMPRESSION = "zstd"
 COMPRESSION_LEVEL = 9
 DICTIONARY_PAGE_SIZE_LIMIT = 8 * 1024 * 1024
@@ -93,6 +95,36 @@ def _leaf_values(column: pa.ChunkedArray, physical_path: str) -> pa.Array:
     return values
 
 
+def _sampled_tables(
+    parquet_file: pq.ParquetFile,
+    row_group_limit: int,
+    sort_columns: tuple[str, ...],
+) -> tuple[pa.Table, ...]:
+    """Return sampled row groups, optionally after sorting the complete file."""
+    metadata = parquet_file.metadata
+    selected = _selected_row_groups(metadata.num_row_groups, row_group_limit)
+    if not sort_columns:
+        return tuple(parquet_file.read_row_group(index) for index in selected)
+
+    missing = set(sort_columns) - set(parquet_file.schema_arrow.names)
+    if missing:
+        raise ValueError(f"sort columns are absent from file: {sorted(missing)}")
+
+    table = parquet_file.read()
+    if table.num_rows:
+        table = table.sort_by([(column, "ascending") for column in sort_columns])
+
+    offsets: list[int] = []
+    offset = 0
+    for index in range(metadata.num_row_groups):
+        offsets.append(offset)
+        offset += metadata.row_group(index).num_rows
+    return tuple(
+        table.slice(offsets[index], metadata.row_group(index).num_rows)
+        for index in selected
+    )
+
+
 def _compressed_size(
     table: pa.Table,
     physical_path: str,
@@ -128,6 +160,7 @@ def _compressed_size(
 def benchmark_event(
     paths: Iterable[Path],
     row_group_limit: int,
+    sort_columns: tuple[str, ...] = (),
 ) -> dict[str, ColumnResult]:
     """Benchmark all physical columns in files for one event type."""
     results: dict[str, ColumnResult] = {}
@@ -143,10 +176,13 @@ def benchmark_event(
                 (column.path, column.physical_type)
             )
 
-        selected = _selected_row_groups(metadata.num_row_groups, row_group_limit)
-        for row_group in selected:
+        for sampled_table in _sampled_tables(
+            parquet_file,
+            row_group_limit,
+            sort_columns,
+        ):
             for top_level, leaves in leaves_by_top_level.items():
-                table = parquet_file.read_row_group(row_group, columns=[top_level])
+                table = sampled_table.select([top_level])
                 if table.num_rows == 0:
                     continue
                 for physical_path, physical_type in leaves:
@@ -255,6 +291,11 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="evenly spaced row groups to sample from each file; 0 means all",
     )
+    parser.add_argument(
+        "--sort-by-export-order",
+        action="store_true",
+        help="sort each complete file by its configured export order before sampling",
+    )
     args = parser.parse_args()
     if args.row_groups_per_file < 0:
         parser.error("--row-groups-per-file must be non-negative")
@@ -276,7 +317,15 @@ def main() -> None:
         "non-null values."
     )
     for event_type, paths in grouped.items():
-        results = benchmark_event(paths, args.row_groups_per_file)
+        sort_columns: tuple[str, ...] = ()
+        if args.sort_by_export_order:
+            try:
+                sort_columns = exporter.PARQUET_SORT_COLUMNS[event_type]
+            except KeyError as error:
+                raise SystemExit(
+                    f"no configured export order for event {event_type!r}"
+                ) from error
+        results = benchmark_event(paths, args.row_groups_per_file, sort_columns)
         _print_event(event_type, paths, results)
 
 

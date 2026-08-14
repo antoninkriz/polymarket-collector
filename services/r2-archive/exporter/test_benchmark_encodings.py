@@ -63,6 +63,29 @@ class EncodingBenchmarkTest(unittest.TestCase):
         self.assertEqual(results["bids.list.element.price"].value_count, 100)
         self.assertEqual(results["bids.list.element.size"].value_count, 100)
 
+    def test_samples_row_groups_after_complete_file_sort(self) -> None:
+        table = pa.table(
+            {
+                "market": pa.array([b"b", b"a", b"b", b"a"]),
+                "asset_id": pa.array([b"2", b"2", b"1", b"1"]),
+                "sequence": pa.array([1, 2, 3, 4], type=pa.uint64()),
+            }
+        )
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "price_change.parquet"
+            pq.write_table(table, path, row_group_size=2)
+            sampled = benchmark._sampled_tables(
+                pq.ParquetFile(path),
+                row_group_limit=0,
+                sort_columns=("market", "asset_id", "sequence"),
+            )
+
+        combined = pa.concat_tables(sampled)
+        self.assertEqual(combined.column("market").to_pylist(), [b"a", b"a", b"b", b"b"])
+        self.assertEqual(combined.column("asset_id").to_pylist(), [b"1", b"2", b"1", b"2"])
+        self.assertEqual(combined.column("sequence").to_pylist(), [4, 2, 3, 1])
+
 
 if __name__ == "__main__":
     unittest.main()
