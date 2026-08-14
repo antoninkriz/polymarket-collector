@@ -150,13 +150,17 @@ appear in `.data/parquet/YYYY-MM-DD/HH/`. An hour becomes exportable only after
 it is complete and the following receive-time hour has reached ClickHouse, so
 the first archive can take a little over one hour to appear.
 
-The supplied ports are loopback-only:
+Redis and ClickHouse are reachable only inside the private `obdata` container
+network:
 
-| Service | Address |
-|---|---|
-| Redis | `localhost:6380` |
-| ClickHouse HTTP | `localhost:8124` |
-| ClickHouse native | `localhost:9003` |
+| Service | Internal address | Host port |
+|---|---|---|
+| Redis | `obdata-redis:6379` | None |
+| ClickHouse HTTP | `obdata-clickhouse:8123` | None |
+| ClickHouse native | `obdata-clickhouse:9000` | None |
+
+Use `docker exec` or `podman exec` for local inspection rather than exposing a
+database port.
 
 ### Run in production
 
@@ -181,10 +185,18 @@ docker compose -f docker-compose.polymarket.yml \
   up -d --build --remove-orphans
 ```
 
+Start infrastructure first: it creates the private `obdata` bridge that the
+application Compose project joins.
+
 Production notes:
 
-- Application containers use host networking to reach loopback Redis and
-  ClickHouse. Keep those ports private.
+- Redis, ClickHouse, and all Rust services share the private `obdata` bridge.
+  Redis and ClickHouse publish no host ports.
+- Only Dozzle is published, and only on `127.0.0.1:8080`.
+- Use a host firewall with default-deny inbound rules and allow only required
+  management traffic—normally SSH or a VPN. Docker manages its own
+  iptables/nftables rules, so verify the effective exposure after deployment
+  instead of relying only on a firewall frontend.
 - Services use `restart: unless-stopped`.
 - `CLICKHOUSE_RETENTION_HOURS=0` retains every raw partition.
 - Do not use `run_local.sh` for R2: its local overlay switches the exporter to
