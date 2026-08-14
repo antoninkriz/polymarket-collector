@@ -95,7 +95,9 @@ After a connection or subscription starts, the collector discards
 `price_change` events for an asset until that asset's fresh `book` snapshot has
 arrived. Consequently an exported asset segment never applies post-reconnect
 deltas to a stale pre-reconnect book. Trades and tick-size events remain in
-their observed order because they do not mutate depth.
+their observed order because they do not mutate depth. Health gauges likewise
+keep the asset down after TCP reconnection and mark it recovered only when that
+fresh snapshot arrives; recovery logs include the measured snapshot latency.
 
 ## Duplication policy
 

@@ -4,12 +4,13 @@
 //! connection.  This matters because one `price_change` parent can contain
 //! updates for both assets: splitting those assets across redundant sockets
 //! creates two independently delivered copies whose relative order cannot be
-//! merged correctly.  V3 chooses correctness over seamless failover.  A
-//! after a reconnect, fresh `book` snapshots replace the full local state.
+//! merged correctly. V3 chooses correctness over seamless failover. After a
+//! reconnect, fresh `book` snapshots replace the full local state.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{ensure, Result};
 use tokio::sync::{mpsc, watch};
@@ -18,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::events::{Event, Market, MarketLifecycleObservation};
 use crate::record::{CollectorContext, EventRecord};
-use crate::ws::connection::{Command, ConnStatus, Connection};
+use crate::ws::connection::{Command, ConnStatus, Connection, HealthEvent};
 
 const COMMAND_CHANNEL_SIZE: usize = 64;
 const LIFECYCLE_LISTENER_CONNECTIONS: usize = 3;
@@ -65,7 +66,7 @@ pub struct Pool {
     lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycleObservation>>,
     health_counters: Arc<HealthCounters>,
     monitor_join: Option<JoinHandle<()>>,
-    status_event_tx: mpsc::UnboundedSender<(usize, ConnStatus)>,
+    status_event_tx: mpsc::UnboundedSender<HealthEvent>,
     asset_conns_tx: watch::Sender<HashMap<String, usize>>,
 }
 
@@ -459,83 +460,131 @@ impl Pool {
 }
 
 async fn run_health_monitor(
-    mut status_rx: mpsc::UnboundedReceiver<(usize, ConnStatus)>,
+    mut status_rx: mpsc::UnboundedReceiver<HealthEvent>,
     mut asset_conns_rx: watch::Receiver<HashMap<String, usize>>,
     counters: Arc<HealthCounters>,
 ) {
-    let mut asset_conns: HashMap<String, usize> = HashMap::new();
-    let mut conn_status: HashMap<usize, ConnStatus> = HashMap::new();
-    let mut down_assets: HashSet<String> = HashSet::new();
+    let mut state = HealthState::default();
 
     loop {
         tokio::select! {
             event = status_rx.recv() => {
-                let Some((conn_id, new_status)) = event else { break };
-                let old_status = conn_status
-                    .insert(conn_id, new_status)
-                    .unwrap_or(ConnStatus::Disconnected);
-                if old_status == new_status {
-                    continue;
-                }
-                match new_status {
-                    ConnStatus::Disconnected => {
-                        counters.conn_down_events.fetch_add(1, Ordering::Relaxed);
-                    }
-                    ConnStatus::Connected => {}
-                }
-
-                for (asset, assigned_conn) in &asset_conns {
-                    if *assigned_conn != conn_id {
-                        continue;
-                    }
-                    match new_status {
-                        ConnStatus::Disconnected => {
-                            if down_assets.insert(asset.clone()) {
-                                counters.asset_down_events.fetch_add(1, Ordering::Relaxed);
-                                warn!(asset, conn = conn_id, "[ASSET-DATA-GAP] authoritative connection down");
-                            }
-                        }
-                        ConnStatus::Connected => {
-                            if down_assets.remove(asset) {
-                                info!(asset, conn = conn_id, "asset connection restored; waiting for book snapshot");
-                            }
-                        }
-                    }
-                }
-                update_gauges(&counters, &asset_conns, &conn_status);
+                let Some(event) = event else { break };
+                state.apply_event(event, &counters);
             }
             changed = asset_conns_rx.changed() => {
                 if changed.is_err() {
                     break;
                 }
-                asset_conns = asset_conns_rx.borrow_and_update().clone();
-                down_assets.retain(|asset| asset_conns.contains_key(asset));
-                update_gauges(&counters, &asset_conns, &conn_status);
+                state.update_mappings(asset_conns_rx.borrow_and_update().clone(), &counters);
             }
         }
     }
 }
 
-fn update_gauges(
-    counters: &HealthCounters,
-    asset_conns: &HashMap<String, usize>,
-    conn_status: &HashMap<usize, ConnStatus>,
-) {
-    let active_connections: HashSet<usize> = asset_conns.values().copied().collect();
-    let conns_down = active_connections
-        .iter()
-        .filter(|id| !matches!(conn_status.get(id), Some(ConnStatus::Connected)))
-        .count();
-    let assets_down = asset_conns
-        .values()
-        .filter(|id| !matches!(conn_status.get(id), Some(ConnStatus::Connected)))
-        .count();
-    counters
-        .conns_down
-        .store(conns_down as u64, Ordering::Relaxed);
-    counters
-        .assets_down
-        .store(assets_down as u64, Ordering::Relaxed);
+#[derive(Default)]
+struct HealthState {
+    asset_conns: HashMap<String, usize>,
+    conn_status: HashMap<usize, ConnStatus>,
+    conn_generation: HashMap<usize, u64>,
+    asset_ready_generation: HashMap<String, u64>,
+    down_since: HashMap<String, Instant>,
+}
+
+impl HealthState {
+    fn apply_event(&mut self, event: HealthEvent, counters: &HealthCounters) {
+        match event {
+            HealthEvent::Connection { conn_id, status } => {
+                let old_status = self
+                    .conn_status
+                    .get(&conn_id)
+                    .copied()
+                    .unwrap_or(ConnStatus::Disconnected);
+                if old_status == status {
+                    return;
+                }
+
+                if status == ConnStatus::Disconnected {
+                    counters.conn_down_events.fetch_add(1, Ordering::Relaxed);
+                    let now = Instant::now();
+                    for (asset, assigned_conn) in &self.asset_conns {
+                        if *assigned_conn == conn_id && self.asset_is_ready(asset, conn_id) {
+                            counters.asset_down_events.fetch_add(1, Ordering::Relaxed);
+                            self.down_since.insert(asset.clone(), now);
+                            warn!(
+                                asset,
+                                conn = conn_id,
+                                "[ASSET-DATA-GAP] authoritative connection down"
+                            );
+                        }
+                    }
+                } else {
+                    let generation = self.conn_generation.entry(conn_id).or_default();
+                    *generation = generation.wrapping_add(1);
+                }
+                self.conn_status.insert(conn_id, status);
+            }
+            HealthEvent::BookSnapshot { conn_id, asset_id } => {
+                if let Some(assigned_conn) = self.asset_conns.get(&asset_id) {
+                    if *assigned_conn != conn_id {
+                        warn!(
+                            asset = asset_id,
+                            conn = conn_id,
+                            expected_conn = assigned_conn,
+                            "ignoring book readiness from non-authoritative connection"
+                        );
+                        self.update_gauges(counters);
+                        return;
+                    }
+                }
+                let generation = self.conn_generation.get(&conn_id).copied().unwrap_or(0);
+                self.asset_ready_generation
+                    .insert(asset_id.clone(), generation);
+                if let Some(started) = self.down_since.remove(&asset_id) {
+                    info!(
+                        asset = asset_id,
+                        conn = conn_id,
+                        recovery_ms = started.elapsed().as_secs_f64() * 1000.0,
+                        "[ASSET-DATA-RECOVERED] fresh book snapshot received"
+                    );
+                }
+            }
+        }
+        self.update_gauges(counters);
+    }
+
+    fn update_mappings(&mut self, asset_conns: HashMap<String, usize>, counters: &HealthCounters) {
+        self.asset_conns = asset_conns;
+        self.asset_ready_generation
+            .retain(|asset, _| self.asset_conns.contains_key(asset));
+        self.down_since
+            .retain(|asset, _| self.asset_conns.contains_key(asset));
+        self.update_gauges(counters);
+    }
+
+    fn asset_is_ready(&self, asset: &str, conn_id: usize) -> bool {
+        matches!(self.conn_status.get(&conn_id), Some(ConnStatus::Connected))
+            && self.asset_ready_generation.get(asset) == self.conn_generation.get(&conn_id)
+    }
+
+    fn update_gauges(&self, counters: &HealthCounters) {
+        let active_connections: HashSet<usize> = self.asset_conns.values().copied().collect();
+        let conns_down = active_connections
+            .iter()
+            .filter(|id| !matches!(self.conn_status.get(id), Some(ConnStatus::Connected)))
+            .count();
+        let assets_down = self
+            .asset_conns
+            .iter()
+            .filter(|(asset, conn_id)| !self.asset_is_ready(asset, **conn_id))
+            .count();
+        counters
+            .conns_down
+            .store(conns_down as u64, Ordering::Relaxed);
+        counters
+            .assets_down
+            .store(assets_down as u64, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -549,6 +598,65 @@ mod tests {
     fn pool(max_assets: usize) -> Pool {
         let (tx, _rx) = mpsc::channel::<EventRecord>(1024);
         Pool::new(max_assets, tx)
+    }
+
+    #[test]
+    fn asset_recovers_only_after_a_fresh_book_snapshot() {
+        let counters = HealthCounters::default();
+        let mut state = HealthState::default();
+        state.update_mappings(HashMap::from([("asset".into(), 7)]), &counters);
+
+        state.apply_event(
+            HealthEvent::Connection {
+                conn_id: 7,
+                status: ConnStatus::Connected,
+            },
+            &counters,
+        );
+        assert_eq!(counters.conns_down.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.assets_down.load(Ordering::Relaxed), 1);
+
+        state.apply_event(
+            HealthEvent::BookSnapshot {
+                conn_id: 7,
+                asset_id: "asset".into(),
+            },
+            &counters,
+        );
+        assert_eq!(counters.assets_down.load(Ordering::Relaxed), 0);
+
+        state.apply_event(
+            HealthEvent::Connection {
+                conn_id: 7,
+                status: ConnStatus::Disconnected,
+            },
+            &counters,
+        );
+        assert_eq!(counters.asset_down_events.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.assets_down.load(Ordering::Relaxed), 1);
+
+        state.apply_event(
+            HealthEvent::Connection {
+                conn_id: 7,
+                status: ConnStatus::Connected,
+            },
+            &counters,
+        );
+        assert_eq!(
+            counters.assets_down.load(Ordering::Relaxed),
+            1,
+            "a new TCP session is not data recovery"
+        );
+
+        state.apply_event(
+            HealthEvent::BookSnapshot {
+                conn_id: 7,
+                asset_id: "asset".into(),
+            },
+            &counters,
+        );
+        assert_eq!(counters.assets_down.load(Ordering::Relaxed), 0);
+        assert!(state.down_since.is_empty());
     }
 
     #[tokio::test]

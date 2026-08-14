@@ -60,12 +60,19 @@ use crate::ws::WS_MARKET_URL;
 /// monitor to track asset-level up/down status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnStatus {
-    /// Socket is open and (re-)subscribe has been written. Events should be
-    /// flowing (or are about to).
+    /// Socket is open. Each asset remains unavailable until its fresh book
+    /// snapshot arrives for this session.
     Connected,
     /// No live socket. Either we haven't connected yet, the previous session
     /// ended, or we're inside the reconnect backoff.
     Disconnected,
+}
+
+/// Transport and reconstruction events consumed by the pool health monitor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthEvent {
+    Connection { conn_id: usize, status: ConnStatus },
+    BookSnapshot { conn_id: usize, asset_id: String },
 }
 
 /// Per Polymarket docs (Market & User channels): client sends `"PING"`
@@ -99,7 +106,7 @@ pub struct Connection {
     pub index: usize,
     pub event_tx: mpsc::Sender<EventRecord>,
     pub collector: Arc<CollectorContext>,
-    pub status_tx: mpsc::UnboundedSender<(usize, ConnStatus)>,
+    pub status_tx: mpsc::UnboundedSender<HealthEvent>,
     /// Whether this socket is one of the redundant listeners for global
     /// `new_market` notifications.
     pub lifecycle_listener: bool,
@@ -111,7 +118,7 @@ impl Connection {
         index: usize,
         event_tx: mpsc::Sender<EventRecord>,
         collector: Arc<CollectorContext>,
-        status_tx: mpsc::UnboundedSender<(usize, ConnStatus)>,
+        status_tx: mpsc::UnboundedSender<HealthEvent>,
         lifecycle_listener: bool,
         lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycleObservation>>,
     ) -> Self {
@@ -182,7 +189,10 @@ impl Connection {
             // pool's pre-loaded initial Subscribe and silently drop them.
             if commands.is_closed() && commands.is_empty() {
                 info!(conn = index, "shutdown requested during reconnect delay");
-                let _ = status_tx.send((index, ConnStatus::Disconnected));
+                let _ = status_tx.send(HealthEvent::Connection {
+                    conn_id: index,
+                    status: ConnStatus::Disconnected,
+                });
                 return Ok(());
             }
 
@@ -196,7 +206,10 @@ impl Connection {
                 Err(e) => {
                     error!(conn = index, error = %e, "ws connect failed");
                     // Stay in Disconnected; loop and retry with backoff.
-                    let _ = status_tx.send((index, ConnStatus::Disconnected));
+                    let _ = status_tx.send(HealthEvent::Connection {
+                        conn_id: index,
+                        status: ConnStatus::Disconnected,
+                    });
                     continue;
                 }
             };
@@ -217,7 +230,10 @@ impl Connection {
 
             // We're connected; publish before entering the session loop so
             // the pool's health monitor sees us go up immediately.
-            let _ = status_tx.send((index, ConnStatus::Connected));
+            let _ = status_tx.send(HealthEvent::Connection {
+                conn_id: index,
+                status: ConnStatus::Connected,
+            });
 
             // Run a single connected session. A heartbeat timeout skips the
             // next reconnect backoff.
@@ -225,6 +241,7 @@ impl Connection {
                 index,
                 event_tx: &event_tx,
                 collector: &collector,
+                status_tx: &status_tx,
                 lifecycle_listener,
                 lifecycle_tx: lifecycle_tx.as_ref(),
             };
@@ -239,7 +256,10 @@ impl Connection {
 
             // Session ended for any reason → we're no longer Connected.
             // Always publish before deciding what to do next.
-            let _ = status_tx.send((index, ConnStatus::Disconnected));
+            let _ = status_tx.send(HealthEvent::Connection {
+                conn_id: index,
+                status: ConnStatus::Disconnected,
+            });
 
             match outcome {
                 SessionOutcome::HeartbeatTimeout => {
@@ -305,6 +325,7 @@ struct SessionContext<'a> {
     index: usize,
     event_tx: &'a mpsc::Sender<EventRecord>,
     collector: &'a CollectorContext,
+    status_tx: &'a mpsc::UnboundedSender<HealthEvent>,
     lifecycle_listener: bool,
     lifecycle_tx: Option<&'a mpsc::UnboundedSender<MarketLifecycleObservation>>,
 }
@@ -555,7 +576,12 @@ fn handle_text(
                 }
                 match &ev {
                     Event::Book { .. } => {
-                        sub.initialized.insert(asset_id.to_owned());
+                        if sub.initialized.insert(asset_id.to_owned()) {
+                            let _ = context.status_tx.send(HealthEvent::BookSnapshot {
+                                conn_id: context.index,
+                                asset_id: asset_id.to_owned(),
+                            });
+                        }
                     }
                     Event::PriceChange { .. } if !sub.initialized.contains(asset_id) => {
                         debug!(
@@ -662,11 +688,13 @@ mod tests {
 
     fn handle(text: &str, sub: &mut SubState, events: &mut Vec<EventRecord>) -> Result<()> {
         let (event_tx, _event_rx) = mpsc::channel(1);
+        let (status_tx, _status_rx) = mpsc::unbounded_channel();
         let collector = CollectorContext::new();
         let context = SessionContext {
             index: 0,
             event_tx: &event_tx,
             collector: &collector,
+            status_tx: &status_tx,
             lifecycle_listener: false,
             lifecycle_tx: None,
         };
@@ -846,11 +874,13 @@ mod tests {
         assert!(buf.is_empty());
 
         let (event_tx, _event_rx) = mpsc::channel(1);
+        let (status_tx, _status_rx) = mpsc::unbounded_channel();
         let collector = CollectorContext::new();
         let context = SessionContext {
             index: 0,
             event_tx: &event_tx,
             collector: &collector,
+            status_tx: &status_tx,
             lifecycle_listener: true,
             lifecycle_tx: None,
         };
@@ -869,12 +899,14 @@ mod tests {
         let mut sub = sub_state(&[]);
         let mut buf = Vec::new();
         let (event_tx, _event_rx) = mpsc::channel(1);
+        let (status_tx, _status_rx) = mpsc::unbounded_channel();
         let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
         let collector = CollectorContext::new();
         let context = SessionContext {
             index: 0,
             event_tx: &event_tx,
             collector: &collector,
+            status_tx: &status_tx,
             lifecycle_listener: true,
             lifecycle_tx: Some(&lifecycle_tx),
         };
@@ -900,12 +932,14 @@ mod tests {
         let mut sub = sub_state(&["yes", "no"]);
         let mut buf = Vec::new();
         let (event_tx, _event_rx) = mpsc::channel(1);
+        let (status_tx, _status_rx) = mpsc::unbounded_channel();
         let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
         let collector = CollectorContext::new();
         let context = SessionContext {
             index: 17,
             event_tx: &event_tx,
             collector: &collector,
+            status_tx: &status_tx,
             lifecycle_listener: false,
             lifecycle_tx: Some(&lifecycle_tx),
         };
@@ -928,12 +962,14 @@ mod tests {
         let mut sub = sub_state(&["other"]);
         let mut buf = Vec::new();
         let (event_tx, _event_rx) = mpsc::channel(1);
+        let (status_tx, _status_rx) = mpsc::unbounded_channel();
         let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
         let collector = CollectorContext::new();
         let context = SessionContext {
             index: 18,
             event_tx: &event_tx,
             collector: &collector,
+            status_tx: &status_tx,
             lifecycle_listener: false,
             lifecycle_tx: Some(&lifecycle_tx),
         };
