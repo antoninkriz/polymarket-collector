@@ -86,7 +86,7 @@ services:
       # WS pool
       SKIP_ACTIVE_MARKETS_CACHE: "false"
       QUEUE_SIZE: "5000000"
-      MAX_ASSETS_PER_CONN: "500"
+      MAX_ASSETS_PER_CONN: "250"
       # Redis Stream publisher batching
       MAX_BATCH: "200"
       LINGER_MS: "2"
