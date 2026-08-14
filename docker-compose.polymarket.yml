@@ -12,7 +12,7 @@ name: obdata-polymarket
 #
 #   obdata-polymarket-r2-archive-exporter
 #     Reads obdata-clickhouse `polymarket_orderbook_v3` and exports one
-#     replay-ordered Parquet file per event type and UTC hour.
+#     market-clustered Parquet file per event type and UTC hour.
 #
 # All services use `network_mode: host` so they reach the host-local
 # Redis (localhost:6380) and ClickHouse (localhost:8124).

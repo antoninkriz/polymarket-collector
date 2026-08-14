@@ -48,6 +48,22 @@ All decimal columns are exact decimal values, not binary floating-point
 numbers. `decimal32(9, 4)` is physically stored as Parquet `INT32`, and
 `decimal64(18, 6)` is physically stored as Parquet `INT64`.
 
+Every file uses the same writer settings:
+
+| Setting | Value |
+|---|---|
+| Parquet writer version | 2.0 |
+| Data pages | V2 |
+| Maximum row-group rows | 1,048,576 |
+| Compression | ZSTD level 9 on every column |
+| Dictionary-page limit | 8 MiB |
+| Default value encoding | `PLAIN` |
+
+The only dictionary-encoded values are `price_change.side` and
+`last_trade_price.price`, `last_trade_price.side`, and
+`last_trade_price.fee_rate_bps`. Every other scalar and nested leaf is
+`PLAIN`, as listed explicitly in the event tables below.
+
 ## `book.parquet`
 
 A row is a complete aggregated depth snapshot for one outcome asset. It
@@ -61,7 +77,7 @@ replaces the reconstructed book state for that asset.
 
 | Column | Arrow type | Parquet physical and logical type | Nullable | Value encoding | Description |
 |---|---|---|---:|---|---|
-| `timestamp_received` | `timestamp[ns, tz=UTC]` | `INT64` + `TIMESTAMP(NANOS, UTC)` | no | `PLAIN` | Collector userspace receive time, sampled when the WebSocket library yields the frame. |
+| `timestamp_received` | `timestamp[ns, tz=UTC]` | `INT64` + `TIMESTAMP(NANOS, UTC)` | no | `PLAIN` | Collector userspace receive time, sampled when the WebSocket library yields the source frame. |
 | `sequence` | `uint64` | `INT64` + `UINT(64)` | no | `PLAIN` | Globally ordered collector observation and retry identity; authoritative replay order. |
 | `timestamp` | `timestamp[ms, tz=UTC]` | `INT64` + `TIMESTAMP(MILLIS, UTC)` | no | `PLAIN` | Millisecond source timestamp supplied by Polymarket; do not use it to break ordering ties. |
 | `market` | `fixed_size_binary[32]` | `FIXED_LEN_BYTE_ARRAY(32)` | no | `PLAIN` | Market condition ID. |
@@ -95,7 +111,7 @@ values in their original array order.
 
 | Column | Arrow type | Parquet physical and logical type | Nullable | Value encoding | Description |
 |---|---|---|---:|---|---|
-| `timestamp_received` | `timestamp[ns, tz=UTC]` | `INT64` + `TIMESTAMP(NANOS, UTC)` | no | `PLAIN` | Collector userspace receive time, sampled when the WebSocket library yields the frame. |
+| `timestamp_received` | `timestamp[ns, tz=UTC]` | `INT64` + `TIMESTAMP(NANOS, UTC)` | no | `PLAIN` | Collector userspace receive time, sampled when the WebSocket library yields the source frame. |
 | `sequence` | `uint64` | `INT64` + `UINT(64)` | no | `PLAIN` | Globally ordered collector observation and retry identity; authoritative replay order. |
 | `timestamp` | `timestamp[ms, tz=UTC]` | `INT64` + `TIMESTAMP(MILLIS, UTC)` | no | `PLAIN` | Millisecond source timestamp supplied by Polymarket; do not use it to break ordering ties. |
 | `market` | `fixed_size_binary[32]` | `FIXED_LEN_BYTE_ARRAY(32)` | no | `PLAIN` | Market condition ID. |
@@ -124,7 +140,7 @@ the same transaction hash.
 
 | Column | Arrow type | Parquet physical and logical type | Nullable | Value encoding | Description |
 |---|---|---|---:|---|---|
-| `timestamp_received` | `timestamp[ns, tz=UTC]` | `INT64` + `TIMESTAMP(NANOS, UTC)` | no | `PLAIN` | Collector userspace receive time, sampled when the WebSocket library yields the frame. |
+| `timestamp_received` | `timestamp[ns, tz=UTC]` | `INT64` + `TIMESTAMP(NANOS, UTC)` | no | `PLAIN` | Collector userspace receive time, sampled when the WebSocket library yields the source frame. |
 | `sequence` | `uint64` | `INT64` + `UINT(64)` | no | `PLAIN` | Globally ordered collector observation and retry identity; authoritative replay order. |
 | `timestamp` | `timestamp[ms, tz=UTC]` | `INT64` + `TIMESTAMP(MILLIS, UTC)` | no | `PLAIN` | Millisecond source timestamp supplied by Polymarket; do not use it to break ordering ties. |
 | `market` | `fixed_size_binary[32]` | `FIXED_LEN_BYTE_ARRAY(32)` | no | `PLAIN` | Market condition ID. |
@@ -153,7 +169,7 @@ asset. It does not change depth by itself.
 
 | Column | Arrow type | Parquet physical and logical type | Nullable | Value encoding | Description |
 |---|---|---|---:|---|---|
-| `timestamp_received` | `timestamp[ns, tz=UTC]` | `INT64` + `TIMESTAMP(NANOS, UTC)` | no | `PLAIN` | Collector userspace receive time, sampled when the WebSocket library yields the frame. |
+| `timestamp_received` | `timestamp[ns, tz=UTC]` | `INT64` + `TIMESTAMP(NANOS, UTC)` | no | `PLAIN` | Collector userspace receive time, sampled when the WebSocket library yields the source frame. |
 | `sequence` | `uint64` | `INT64` + `UINT(64)` | no | `PLAIN` | Globally ordered collector observation and retry identity; authoritative replay order. |
 | `timestamp` | `timestamp[ms, tz=UTC]` | `INT64` + `TIMESTAMP(MILLIS, UTC)` | no | `PLAIN` | Millisecond source timestamp supplied by Polymarket; do not use it to break ordering ties. |
 | `market` | `fixed_size_binary[32]` | `FIXED_LEN_BYTE_ARRAY(32)` | no | `PLAIN` | Market condition ID. |
@@ -176,7 +192,7 @@ book.
 
 | Column | Arrow type | Parquet physical and logical type | Nullable | Value encoding | Description |
 |---|---|---|---:|---|---|
-| `timestamp_received` | `timestamp[ns, tz=UTC]` | `INT64` + `TIMESTAMP(NANOS, UTC)` | no | `PLAIN` | Collector userspace receive time, sampled when the WebSocket library yields the frame. |
+| `timestamp_received` | `timestamp[ns, tz=UTC]` | `INT64` + `TIMESTAMP(NANOS, UTC)` | no | `PLAIN` | Collector userspace receive time, sampled when the WebSocket library yields the source frame. |
 | `sequence` | `uint64` | `INT64` + `UINT(64)` | no | `PLAIN` | Globally ordered collector observation and retry identity; authoritative replay order. |
 | `timestamp` | `timestamp[ms, tz=UTC]` | `INT64` + `TIMESTAMP(MILLIS, UTC)` | no | `PLAIN` | Millisecond source timestamp supplied by Polymarket; do not use it to break ordering ties. |
 | `market` | `fixed_size_binary[32]` | `FIXED_LEN_BYTE_ARRAY(32)` | no | `PLAIN` | Market condition ID. |
@@ -198,7 +214,7 @@ so it has no synthetic `asset_id` column.
 
 | Column | Arrow type | Parquet physical and logical type | Nullable | Value encoding | Description |
 |---|---|---|---:|---|---|
-| `timestamp_received` | `timestamp[ns, tz=UTC]` | `INT64` + `TIMESTAMP(NANOS, UTC)` | no | `PLAIN` | Collector userspace receive time, sampled when the WebSocket library yields the frame. |
+| `timestamp_received` | `timestamp[ns, tz=UTC]` | `INT64` + `TIMESTAMP(NANOS, UTC)` | no | `PLAIN` | Collector userspace receive time, sampled when the WebSocket library yields the source frame or after a Gamma response body is available for a reconciled lifecycle observation. |
 | `sequence` | `uint64` | `INT64` + `UINT(64)` | no | `PLAIN` | Globally ordered collector observation and retry identity; authoritative replay order. |
 | `timestamp` | `timestamp[ms, tz=UTC]` | `INT64` + `TIMESTAMP(MILLIS, UTC)` | no | `PLAIN` | Millisecond source timestamp supplied by Polymarket; do not use it to break ordering ties. |
 | `market` | `fixed_size_binary[32]` | `FIXED_LEN_BYTE_ARRAY(32)` | no | `PLAIN` | Market condition ID. |
@@ -225,7 +241,7 @@ it has no synthetic `asset_id` column.
 
 | Column | Arrow type | Parquet physical and logical type | Nullable | Value encoding | Description |
 |---|---|---|---:|---|---|
-| `timestamp_received` | `timestamp[ns, tz=UTC]` | `INT64` + `TIMESTAMP(NANOS, UTC)` | no | `PLAIN` | Collector userspace receive time, sampled when the WebSocket library yields the frame. |
+| `timestamp_received` | `timestamp[ns, tz=UTC]` | `INT64` + `TIMESTAMP(NANOS, UTC)` | no | `PLAIN` | Collector userspace receive time, sampled when the WebSocket library yields the source frame or after a Gamma response body is available for a reconciled lifecycle observation. |
 | `sequence` | `uint64` | `INT64` + `UINT(64)` | no | `PLAIN` | Globally ordered collector observation and retry identity; authoritative replay order. |
 | `timestamp` | `timestamp[ms, tz=UTC]` | `INT64` + `TIMESTAMP(MILLIS, UTC)` | no | `PLAIN` | Millisecond source timestamp supplied by Polymarket; do not use it to break ordering ties. |
 | `market` | `fixed_size_binary[32]` | `FIXED_LEN_BYTE_ARRAY(32)` | no | `PLAIN` | Market condition ID. |
@@ -258,7 +274,7 @@ have an `asset_id` column. Consumers should verify the listed byte size and
 SHA-256 digest when downloading an archive. Objects from an interrupted export
 may exist without a manifest; do not treat those objects as a completed hour.
 
-## Archive destinations and local conversion
+## Archive destinations and retention
 
 `EXPORT_BACKEND=r2` uploads objects to the S3-compatible endpoint configured by
 the `R2_*` variables. `EXPORT_BACKEND=local` stores the same keys below
@@ -266,10 +282,40 @@ the `R2_*` variables. `EXPORT_BACKEND=local` stores the same keys below
 temporary sibling and atomically replaced. In both modes, `manifest.json` is
 written last.
 
+The R2 bucket must already exist. Large files use sequential 64 MiB multipart
+parts with bounded memory, SDK retries, and multipart abort on failure. The
+exporter never creates buckets.
+
+`CLICKHOUSE_RETENTION_HOURS` defaults to `3`; set it to `0` to disable cleanup.
+For an eligible old partition, the exporter reads and validates the manifest
+and confirms all seven referenced Parquet objects before issuing the exact
+hourly `DROP PARTITION`. A missing object, malformed manifest, archive error,
+or ClickHouse error retains the partition and is retried later. The newest
+active ClickHouse partition is always retained for sequence recovery.
+
 The repository's `run_local.sh` selects the local backend and maps the
 container's `/exports` directory to `.data/parquet` on the host. Set
 `EXPORT_ONCE=true` when invoking the exporter directly to backfill every
 currently eligible missing hour and exit.
+
+## Python interoperability
+
+PyArrow reads the files directly with the documented narrow decimal and
+fixed-size binary types:
+
+```python
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
+
+table = pq.read_table("2026-08-13/14/price_change.parquet")
+markets = table["market"]
+ordered = table.select(["market", "asset_id", "sequence"])
+buys = table.filter(pc.equal(table["side"], "BUY"))
+```
+
+Columnar reads, filtering, and conversion to Pandas or Polars do not require
+calling `.as_py()`. That method is needed only when deliberately converting an
+individual Arrow scalar to a native Python object.
 
 The upstream event definitions are documented by Polymarket's
 [real-time market data reference](https://docs.polymarket.com/market-data/realtime-data).

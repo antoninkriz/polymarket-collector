@@ -7,11 +7,11 @@ collector's observed order, and the normalized event:
 
 ```sql
 CREATE TABLE polymarket_orderbook_v3 (
-    timestamp_received DateTime64(9, 'UTC') CODEC(Delta, ZSTD(1)),
-    sequence           UInt64               CODEC(Delta, ZSTD(1)),
+    timestamp_received DateTime64(9, 'UTC') CODEC(Delta(8), ZSTD(1)),
+    sequence           UInt64               CODEC(Delta(8), ZSTD(1)),
     data               String               CODEC(ZSTD(1))
 )
-ENGINE = ReplacingMergeTree()
+ENGINE = ReplacingMergeTree
 PARTITION BY toStartOfHour(timestamp_received)
 ORDER BY sequence;
 ```
@@ -52,6 +52,11 @@ new generation has reached its append-only file. The supplied Redis service
 therefore runs with AOF enabled. An ordinary process restart, or loss of only
 the Redis generation key, cannot reuse an exported sequence.
 
+Archive retention always preserves the newest ClickHouse partition even when
+it is older than the configured retention interval. Because generations are
+monotonic, that partition still contains the highest ClickHouse sequence and
+remains sufficient for ordinary startup recovery.
+
 If both Redis and ClickHouse are lost while the Parquet archive survives, find
 the greatest `max_sequence` across the retained hourly manifests, shift it
 right by 48 bits, and set `PUBLISHER_GENERATION_FLOOR` to at least that
@@ -77,9 +82,22 @@ before assigning a sequence or storing a row. The three listeners remain
 connected with an empty token set if their markets are removed, including
 `--new-only` operation and reconnects.
 
-WebSocket lifecycle events add and remove subscriptions immediately. Gamma
-market discovery provides an idempotent reconciliation path for startup state,
-missed notifications, and upstream lifecycle-feed outages.
+WebSocket lifecycle events add and remove subscriptions immediately. The Rust
+publisher also owns one rate-limited Gamma client and a validated Redis restart
+cache. A valid cache is applied immediately and does not fabricate lifecycle
+rows. Gamma then performs complete keyset scans every thirty minutes,
+ten-second new-market polls, and thirty-second resolved-market polls. All
+clones share a 10 requests/second gate and bounded retry policy. WebSocket
+observations remain the low-latency primary source; Gamma only adds a missing
+active subscription or a missing lifecycle observation with a usable source
+timestamp.
+
+The lifecycle controller is the sole owner of condition and asset state. It
+serializes WebSocket and Gamma inputs, rejects conflicting asset ownership,
+prevents a stale `new_market` from reactivating a resolved condition, and
+mutates the WebSocket pool before admitting the corresponding event when a new
+subscription is needed. This lets short-lived markets subscribe directly from
+their `new_market` notification instead of waiting for polling.
 
 The client sends Polymarket's text `PING` every ten seconds and arms a separate
 five-second response deadline. Any frame received after the ping proves the
@@ -91,6 +109,12 @@ reserved for failed connection attempts and other local session errors.
 frame, before JSON parsing, fan-out, Redis, or ClickHouse work. All children of
 one frame share that nanosecond UTC wall-clock value. It is an honest userspace
 socket receive time, not a kernel or hardware packet timestamp.
+
+For a lifecycle observation recovered from Gamma, `timestamp_received` is
+sampled after the complete HTTP response body is available and before JSON
+decoding; `timestamp` comes from Gamma's creation or closure time. Such a row
+recovers lifecycle state without pretending that the missed WebSocket frame or
+its original receive time was observed.
 
 After a connection or subscription starts, the collector discards
 `price_change` events for an asset until that asset's fresh `book` snapshot has
@@ -113,10 +137,19 @@ a retry has the same `sequence`; a separate WebSocket observation does not.
 that require an immediately logical result use `FINAL`. The subscriber
 acknowledges and removes a Redis Stream entry only after ClickHouse commits it.
 
+The publisher event queue is bounded at 250,000 records and the lifecycle
+queues at 8,192 observations. The ClickHouse writer uses a 50,000-record input
+queue and a 32-batch acknowledgement queue. The services sample depth every
+second, report sixty-second high-water marks, and apply backpressure rather
+than allowing storage restarts to consume unbounded process memory. Redis is
+the durable boundary between the WebSocket publisher and ClickHouse writer.
+
 ## Parquet export
 
-The exporter reads the raw table with `FINAL` and writes one ZSTD level 9
-Parquet file per event type and UTC receive-time hour:
+The Rust exporter reads the raw table with `FINAL` and streams ClickHouse Arrow
+batches into one ZSTD level 9 Parquet file per event type and UTC receive-time
+hour. It keeps only the current Arrow batch and Parquet row-group state rather
+than buffering a complete high-volume hour in memory:
 
 ```text
 2026-08-13/14/
@@ -186,6 +219,14 @@ order, row count, byte size, digest, and minimum/maximum sequence, plus the
 hour-wide row count and sequence range. Its presence is the sole completion
 marker; data objects left by an interrupted attempt are overwritten on retry
 and are not considered a completed hour.
+
+ClickHouse retention is controlled by `CLICKHOUSE_RETENTION_HOURS`, which
+defaults to three hours and can be disabled with zero. Cleanup is not a table
+TTL. The exporter reads the archived manifest, validates its hour, source
+table, seven exact file entries, schema, ordering, statistics, and referenced
+objects, then drops only the matching old hourly partition. Missing, malformed,
+or unreachable archive data always retains ClickHouse data for a later retry.
+The newest active partition is never removed.
 
 ## Replay
 

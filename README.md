@@ -1,73 +1,89 @@
 # polymarket-orderbook-collector
 
-A collector for Polymarket's public market-data feed: market discovery,
-WebSocket ingestion, replayable ClickHouse storage, and hourly Parquet archival
-to R2-compatible or local storage. The upstream feed has no exchange sequence
-or replay cursor; v3 preserves the collector's actual observations and restores
-reconstructible book state after reconnects without claiming an exchange audit
-log.
+A Rust collector for Polymarket's public market-data feed. It discovers the
+active market universe, captures WebSocket observations in collector order,
+stores a compact durable event log, and exports completed UTC hours as typed
+Parquet files to Cloudflare R2 or the local filesystem.
 
-## Pipeline
+Polymarket exposes neither an exchange sequence nor a replay cursor. The
+archive therefore preserves exactly what this collector observed and makes
+each post-connect orderbook segment reconstructible; it does not claim to be
+an exchange audit log.
 
+## Architecture
+
+```text
+Polymarket WS lifecycle ─┐
+Polymarket Gamma REST ───┼─▶ Rust publisher ─▶ Redis Stream ─▶ Rust writer
+Redis restart cache ─────┘                         │              │
+                                                  │              ▼
+                                                  │         ClickHouse raw v3
+                                                  │              │
+                                                  └──────────────┴─▶ Rust exporter ─▶ R2/local
 ```
-Polymarket Gamma REST ─▶ active-markets ─▶ Redis cache/lifecycle stream ─┐
-Polymarket WS ──────────────────────────────────────────────────────────┴─▶ WS publisher
-WS publisher ─▶ Redis Stream `polymarket:events:v3` ─▶ ClickHouse writer
-ClickHouse writer ─▶ ClickHouse `polymarket_orderbook_v3` ─▶ Parquet exporter ─▶ R2/local
-```
 
-- `services/polymarket/polymarket-active-markets` — Python; polls the Gamma API,
-  maintains the Redis active-markets cache and lifecycle event stream.
-- `services/polymarket/polymarket-orderbook-rust-pubsub` — Rust; the only service
-  holding Polymarket WS connections. Captures receive time plus one compact
-  observed-order sequence and appends all seven event variants to a durable
-  Redis Stream. A renewable Redis lease and fenced `XADD` enforce one
-  authoritative publisher.
-- `services/polymarket/polymarket-orderbook-rust-from-pubsub` — Rust; consumes the
-  stream and acknowledges rows only after the compact raw v3 ClickHouse insert.
-  Logical ad-hoc reads use `FINAL` to collapse same-sequence transport retries.
-- `services/r2-archive/exporter` — projects each completed receive-time hour
-  into seven typed event files plus a manifest. Token events are clustered by
-  market and asset, then written to R2 or the local filesystem.
-- `shared/rust/polymarket-orderbook-rust` — shared library crate (WS pool, REST
-  client, ClickHouse sink, event types) used by both Rust binaries.
-- `shared/py` — shared Python helpers used by the Python services' Dockerfiles.
+- `services/polymarket/polymarket-orderbook-rust-pubsub` owns market
+  discovery, lifecycle state, WebSocket subscriptions, receive timestamps,
+  collector sequencing, and publication to `polymarket:events:v3`. WebSocket
+  `new_market` observations subscribe immediately; rate-limited Gamma keyset
+  scans reconcile startup state and missed lifecycle messages. A Redis restart
+  cache avoids waiting for a complete Gamma scan after an ordinary restart.
+- `services/polymarket/polymarket-orderbook-rust-from-pubsub` consumes the
+  durable Redis Stream and acknowledges entries only after ClickHouse commits
+  them to `polymarket_orderbook_v3`.
+- `services/r2-archive/exporter` streams completed receive-time hours from
+  ClickHouse into seven event-specific Parquet files and publishes
+  `manifest.json` last. It supports local atomic files and bounded multipart R2
+  uploads.
+- `shared/rust/polymarket-orderbook-rust` contains the shared event, WebSocket,
+  Gamma, lifecycle, Redis-cache, and ClickHouse code.
 
-## Running
+Redis deliberately separates live collection from ClickHouse restarts or
+backpressure. ClickHouse supplies compact queryable raw storage and a stable
+hourly export boundary. After a validated archive manifest and all seven files
+exist, the exporter removes old ClickHouse partitions while retaining roughly
+three hours and always preserving the newest partition for sequence recovery.
+
+## Running the stack
 
 ```sh
-cp .env.example .env   # fill in secrets
-docker compose -f docker-compose.infra.yml up -d       # ClickHouse, Redis, dozzle
+cp .env.example .env
+# Fill in ClickHouse and R2 credentials, then:
+docker compose -f docker-compose.infra.yml up -d
 docker compose -f docker-compose.polymarket.yml up -d --build
 ```
 
-Services use `network_mode: host` and expect Redis on `localhost:6380` and
-ClickHouse on `localhost:8124`, as provided by the infra compose file.
+The application services use host networking. The supplied infrastructure
+binds Redis to `localhost:6380` and ClickHouse HTTP to `localhost:8124`.
 
-### Complete local pipeline with local Parquet
+`EXPORT_BACKEND=r2` requires an existing R2 bucket and the four `R2_*`
+settings. Set `CLICKHOUSE_RETENTION_HOURS=0` to disable archive-gated
+ClickHouse cleanup; the default is `3`.
 
-The local runner starts Redis, ClickHouse, market discovery, WebSocket
-collection, the ClickHouse writer, and the archive exporter:
+## Complete local pipeline
+
+The local runner starts Redis, ClickHouse, collection, persistence, and local
+Parquet export:
 
 ```sh
 ./run_local.sh
 ```
 
-It automatically uses a working Docker Compose installation, or Podman with
-either `podman compose` or `podman-compose`. Docker is preferred when both are
-available. Override the selection when necessary:
+It automatically selects Docker Compose or Podman Compose. Override the
+selection when needed:
 
 ```sh
 CONTAINER_RUNTIME=podman ./run_local.sh
 CONTAINER_RUNTIME=docker ./run_local.sh
 ```
 
-It creates `.env` from `.env.example` when needed and writes the archive to
-`.data/parquet/YYYY-MM-DD/HH/EVENT_TYPE.parquet`. No R2 credentials are
-required. The files are written with the current host user ID, and an existing
-completed hour is recognized by its `manifest.json` when the stack restarts.
+No R2 credentials are required in local mode. Completed hours appear under:
 
-Useful commands are:
+```text
+.data/parquet/YYYY-MM-DD/HH/EVENT_TYPE.parquet
+```
+
+Useful commands:
 
 ```sh
 ./run_local.sh logs
@@ -76,35 +92,31 @@ Useful commands are:
 ```
 
 `down` retains Redis, ClickHouse, and Parquet data under `.data`. The first
-Parquet files cannot be produced until the receive-time hour in which
-collection began is complete and a record from the following hour has reached
-ClickHouse. This can take a little over one hour.
+archive hour is eligible only after that receive-time hour is complete and the
+following hour has reached ClickHouse, so the first files can take a little
+over one hour to appear.
 
-### Live stream without ClickHouse persistence
+## Publisher without the ClickHouse writer
 
-The WebSocket publisher queries ClickHouse once at startup to recover the
-durable sequence-generation floor, even when the ClickHouse writer is not
-started. Run Redis and ClickHouse, then omit only the writer and exporter:
+The publisher still needs Redis and a readable ClickHouse instance at startup
+to recover its durable sequence-generation floor. To inspect the Redis event
+stream without starting the writer or exporter:
 
 ```sh
 docker compose -f docker-compose.infra.yml up -d \
   obdata-redis \
   obdata-clickhouse
 docker compose -f docker-compose.polymarket.yml up -d --build \
-  obdata-polymarket-active-markets \
   obdata-polymarket-orderbook-rust-pubsub
+
+docker exec obdata-redis \
+  redis-cli XRANGE polymarket:events:v3 - + COUNT 1
 ```
 
-Then inspect the durable event stream:
+Add `obdata-polymarket-orderbook-rust-from-pubsub` when ClickHouse persistence
+is wanted.
 
-```sh
-docker exec obdata-redis redis-cli XRANGE polymarket:events:v3 - + COUNT 1
-```
-
-To persist events in ClickHouse, add
-`obdata-polymarket-orderbook-rust-from-pubsub` to the application `up` command.
-
-The v3 data contract and replay rules are documented in
-[`docs/POLYMARKET_V3.md`](docs/POLYMARKET_V3.md). The exact per-file Parquet
-schemas are documented in
+The collection, ordering, deduplication, and replay contract is documented in
+[`docs/POLYMARKET_V3.md`](docs/POLYMARKET_V3.md). Exact Parquet schemas and
+encodings are documented in
 [`docs/PARQUET_EXPORT.md`](docs/PARQUET_EXPORT.md).

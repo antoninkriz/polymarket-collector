@@ -76,8 +76,7 @@ pub enum HealthEvent {
 }
 
 /// Per Polymarket docs (Market & User channels): client sends `"PING"`
-/// every 10 seconds. We deviated to 5 s historically, matching a stale
-/// docstring in the Python service — see the module-level docs.
+/// every 10 seconds; see the module-level heartbeat documentation.
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 const PONG_TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
