@@ -57,28 +57,50 @@ PARQUET_COMPRESSION = "zstd"
 PARQUET_COMPRESSION_LEVEL = 9
 PARQUET_DICTIONARY_PAGE_SIZE_LIMIT = 8 * 1024 * 1024
 PARQUET_DICTIONARY_COLUMNS: dict[str, tuple[str, ...]] = {
-    "book": ("market", "asset_id"),
-    "price_change": ("market", "asset_id", "side", "best_bid", "best_ask"),
-    "last_trade_price": (
-        "market",
-        "asset_id",
-        "price",
-        "side",
-        "fee_rate_bps",
-    ),
-    "tick_size_change": ("market",),
-    "best_bid_ask": ("market", "asset_id", "best_bid", "best_ask"),
-    "new_market": ("market",),
-    "market_resolved": ("market",),
+    "book": (),
+    "price_change": ("side",),
+    "last_trade_price": ("price", "side", "fee_rate_bps"),
+    "tick_size_change": (),
+    "best_bid_ask": (),
+    "new_market": (),
+    "market_resolved": (),
 }
-PARQUET_DELTA_COLUMNS: dict[str, tuple[str, ...]] = {
-    "book": ("timestamp_received", "sequence"),
-    "price_change": ("sequence",),
-    "last_trade_price": ("timestamp_received", "sequence"),
-    "tick_size_change": ("timestamp_received", "sequence"),
-    "best_bid_ask": ("timestamp_received", "sequence"),
-    "new_market": ("timestamp_received", "sequence"),
-    "market_resolved": ("sequence",),
+PARQUET_COLUMN_ENCODINGS: dict[str, dict[str, str]] = {
+    "book": {
+        "timestamp_received": "BYTE_STREAM_SPLIT",
+        "sequence": "BYTE_STREAM_SPLIT",
+        "timestamp": "BYTE_STREAM_SPLIT",
+    },
+    "price_change": {
+        "timestamp_received": "BYTE_STREAM_SPLIT",
+        "sequence": "BYTE_STREAM_SPLIT",
+        "timestamp": "BYTE_STREAM_SPLIT",
+    },
+    "last_trade_price": {
+        "timestamp_received": "BYTE_STREAM_SPLIT",
+        "sequence": "BYTE_STREAM_SPLIT",
+        "timestamp": "BYTE_STREAM_SPLIT",
+    },
+    "tick_size_change": {
+        "timestamp_received": "BYTE_STREAM_SPLIT",
+        "sequence": "BYTE_STREAM_SPLIT",
+        "timestamp": "BYTE_STREAM_SPLIT",
+    },
+    "best_bid_ask": {
+        "timestamp_received": "BYTE_STREAM_SPLIT",
+        "sequence": "BYTE_STREAM_SPLIT",
+        "timestamp": "BYTE_STREAM_SPLIT",
+    },
+    "new_market": {
+        "timestamp_received": "BYTE_STREAM_SPLIT",
+        "sequence": "BYTE_STREAM_SPLIT",
+        "timestamp": "BYTE_STREAM_SPLIT",
+    },
+    "market_resolved": {
+        "timestamp_received": "BYTE_STREAM_SPLIT",
+        "sequence": "BYTE_STREAM_SPLIT",
+        "timestamp": "BYTE_STREAM_SPLIT",
+    },
 }
 ORDER_LEVEL_TYPE = pa.struct(
     [
@@ -401,11 +423,11 @@ def table_to_parquet(table: pa.Table, event_type: str) -> bytes:
         # Parquet can use physical INT32/INT64.
         table = table.cast(target_schema, safe=True)
 
-    delta_cols = [
-        column
-        for column in PARQUET_DELTA_COLUMNS[event_type]
+    column_encodings = {
+        column: encoding
+        for column, encoding in PARQUET_COLUMN_ENCODINGS[event_type].items()
         if column in table.column_names
-    ]
+    }
     dict_cols = [
         column
         for column in PARQUET_DICTIONARY_COLUMNS[event_type]
@@ -419,7 +441,7 @@ def table_to_parquet(table: pa.Table, event_type: str) -> bytes:
         compression=PARQUET_COMPRESSION,
         compression_level=PARQUET_COMPRESSION_LEVEL,
         use_dictionary=dict_cols,  # pyright: ignore[reportArgumentType]
-        column_encoding={c: "DELTA_BINARY_PACKED" for c in delta_cols},
+        column_encoding=column_encodings,
         data_page_version="2.0",
         dictionary_pagesize_limit=PARQUET_DICTIONARY_PAGE_SIZE_LIMIT,
         store_decimal_as_integer=True,

@@ -129,11 +129,13 @@ def _prepare_file(task: ReencodeTask) -> PreparedFile:
         for column in exporter.PARQUET_DICTIONARY_COLUMNS[task.event_type]
         if column in source.schema_arrow.names
     ]
-    delta_columns = [
-        column
-        for column in exporter.PARQUET_DELTA_COLUMNS[task.event_type]
+    column_encodings = {
+        column: encoding
+        for column, encoding in exporter.PARQUET_COLUMN_ENCODINGS[
+            task.event_type
+        ].items()
         if column in source.schema_arrow.names
-    ]
+    }
 
     try:
         with pq.ParquetWriter(
@@ -142,7 +144,7 @@ def _prepare_file(task: ReencodeTask) -> PreparedFile:
             compression=exporter.PARQUET_COMPRESSION,
             compression_level=exporter.PARQUET_COMPRESSION_LEVEL,
             use_dictionary=dictionary_columns,  # pyright: ignore[reportArgumentType]
-            column_encoding={column: "DELTA_BINARY_PACKED" for column in delta_columns},
+            column_encoding=column_encodings,
             data_page_version="2.0",
             dictionary_pagesize_limit=(exporter.PARQUET_DICTIONARY_PAGE_SIZE_LIMIT),
             store_decimal_as_integer=True,
