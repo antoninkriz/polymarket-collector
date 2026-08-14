@@ -2,7 +2,7 @@ use anyhow::Result;
 use polymarket_r2_archive_exporter::{Config, run};
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()

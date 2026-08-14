@@ -23,7 +23,7 @@ use polymarket_orderbook_rust_from_pubsub::pubsub_subscriber::{
     self, PubSubSubscriberConfig, SubscriberStats,
 };
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     init_tracing();

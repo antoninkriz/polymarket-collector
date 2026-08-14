@@ -33,7 +33,7 @@ use polymarket_orderbook_rust_pubsub::market_lifecycle::LifecycleCoordinator;
 use polymarket_orderbook_rust_pubsub::pubsub_sink::{PubSubSink, PubSubSinkConfig};
 use polymarket_orderbook_rust_pubsub::sequence_watermark::clickhouse_generation_floor;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     init_tracing();
