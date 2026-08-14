@@ -13,7 +13,7 @@ path = "src/main.rs"
 anyhow = "1.0.104"
 arrow-array = "58.4.0"
 arrow-cast = "58.4.0"
-arrow-ipc = "58.4.0"
+arrow-ipc = { version = "58.4.0", features = ["lz4"] }
 arrow-schema = "58.4.0"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 dotenvy = "0.15.7"
