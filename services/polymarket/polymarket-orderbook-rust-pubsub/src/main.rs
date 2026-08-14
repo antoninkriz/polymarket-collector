@@ -7,11 +7,12 @@
 //! ```text
 //!   Redis cache / Gamma API ──> initial market set ──┐
 //!   Redis lifecycle stream ──> reconciliation ───────┤
-//!   WS lifecycle leader ──> immediate updates ───────┤
+//!   WS lifecycle routes ──> deduplicated updates ────┤
 //!                                                   v
 //!   Polymarket WS pool ── (mpsc) ──> Redis XADD (durable event stream)
 //! ```
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,7 +22,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use polymarket_orderbook_rust::events::{Market, MarketLifecycle};
+use polymarket_orderbook_rust::events::{Market, MarketLifecycle, MarketLifecycleObservation};
 use polymarket_orderbook_rust::markets;
 use polymarket_orderbook_rust::markets::stream::StreamConfig;
 use polymarket_orderbook_rust::record::EventRecord;
@@ -300,10 +301,25 @@ async fn wait_for_shutdown() {
 }
 
 async fn run_websocket_lifecycle(
-    mut lifecycle_rx: mpsc::UnboundedReceiver<MarketLifecycle>,
+    mut lifecycle_rx: mpsc::UnboundedReceiver<MarketLifecycleObservation>,
     pool: Arc<Mutex<Pool>>,
 ) {
-    while let Some(update) = lifecycle_rx.recv().await {
+    let mut seen = HashSet::<(&'static str, String)>::new();
+    while let Some(observation) = lifecycle_rx.recv().await {
+        let Some(update) = observation.event.market_lifecycle() else {
+            warn!("lifecycle controller received a token-scoped event");
+            continue;
+        };
+        let key = match &update {
+            MarketLifecycle::NewMarket { market, .. } => ("new_market", market.clone()),
+            MarketLifecycle::MarketResolved { market } => ("market_resolved", market.clone()),
+        };
+        if !seen.insert(key) {
+            continue;
+        }
+
+        let mut pool = pool.lock().await;
+        pool.admit_lifecycle(observation.event, observation.timestamp_received_ns);
         let result = match update {
             MarketLifecycle::NewMarket {
                 market,
@@ -320,10 +336,10 @@ async fn run_websocket_lifecycle(
                     );
                     continue;
                 };
-                pool.lock().await.subscribe_markets(vec![market]).await
+                pool.subscribe_markets(vec![market]).await
             }
             MarketLifecycle::MarketResolved { market } => {
-                pool.lock().await.unsubscribe_markets(vec![market]).await
+                pool.unsubscribe_markets(vec![market]).await
             }
         };
         if let Err(error) = result {
@@ -400,6 +416,7 @@ async fn stats_loop(
             subscribed_markets = stats.market_count,
             cache_active_markets,
             connections = stats.connection_count,
+            lifecycle_listeners = stats.lifecycle_listener_count,
             asset_down_events = stats.asset_down_events,
             conn_down_events = stats.conn_down_events,
             "[QUEUE-STATS]",
@@ -415,6 +432,7 @@ async fn stats_loop(
                 "subscribed_markets": stats.market_count,
                 "cache_active_markets": cache_active_markets,
                 "connections": stats.connection_count,
+                "lifecycle_listeners": stats.lifecycle_listener_count,
                 "queue_size": queue_used,
                 "queue_max": queue_max,
                 "queue_pct": format!("{:.1}", queue_pct),

@@ -16,15 +16,17 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::events::{Market, MarketLifecycle};
+use crate::events::{Event, Market, MarketLifecycleObservation};
 use crate::record::{CollectorContext, EventRecord};
 use crate::ws::connection::{Command, ConnStatus, Connection};
 
 const COMMAND_CHANNEL_SIZE: usize = 64;
+const LIFECYCLE_LISTENER_CONNECTIONS: usize = 3;
 
 struct ConnHandle {
     conn_id: usize,
     assets: HashSet<String>,
+    lifecycle_listener: bool,
     cmd_tx: mpsc::Sender<Command>,
     join: JoinHandle<Result<()>>,
 }
@@ -32,6 +34,7 @@ struct ConnHandle {
 pub struct PoolStats {
     pub market_count: usize,
     pub connection_count: usize,
+    pub lifecycle_listener_count: usize,
     pub asset_down_events: u64,
     pub conn_down_events: u64,
     pub conns_down: usize,
@@ -56,10 +59,10 @@ pub struct Pool {
     market_to_conn: HashMap<String, usize>,
     asset_to_conn: HashMap<String, usize>,
     next_conn_id: usize,
-    /// Stable ID of the one socket allowed to emit connection-wide market
-    /// lifecycle events. The leader remains alive even with no data assets.
+    /// Stable ID of the lifecycle anchor. It remains alive with no data
+    /// assets so `--new-only` still has one lifecycle listener.
     lifecycle_conn_id: Option<usize>,
-    lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycle>>,
+    lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycleObservation>>,
     health_counters: Arc<HealthCounters>,
     monitor_join: Option<JoinHandle<()>>,
     status_event_tx: mpsc::UnboundedSender<(usize, ConnStatus)>,
@@ -83,7 +86,7 @@ impl Pool {
         max_assets_per_conn: usize,
         event_tx: mpsc::Sender<EventRecord>,
         publisher_generation: u64,
-        lifecycle_tx: mpsc::UnboundedSender<MarketLifecycle>,
+        lifecycle_tx: mpsc::UnboundedSender<MarketLifecycleObservation>,
     ) -> Self {
         Self::build(
             max_assets_per_conn,
@@ -97,7 +100,7 @@ impl Pool {
         max_assets_per_conn: usize,
         event_tx: mpsc::Sender<EventRecord>,
         publisher_generation: u64,
-        lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycle>>,
+        lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycleObservation>>,
     ) -> Self {
         let collector = Arc::new(CollectorContext::with_publisher_generation(
             publisher_generation,
@@ -134,7 +137,7 @@ impl Pool {
         self.markets.len()
     }
 
-    /// Ensure the lifecycle leader exists. This is required even with no
+    /// Ensure the lifecycle anchor exists. This is required even with no
     /// preloaded assets so `--new-only` can receive `new_market` events.
     pub async fn start(&mut self) {
         if self.lifecycle_conn_id.is_none() {
@@ -151,6 +154,11 @@ impl Pool {
         PoolStats {
             market_count: self.markets.len(),
             connection_count: self.connections.len(),
+            lifecycle_listener_count: self
+                .connections
+                .iter()
+                .filter(|connection| connection.lifecycle_listener)
+                .count(),
             asset_down_events: self
                 .health_counters
                 .asset_down_events
@@ -161,6 +169,26 @@ impl Pool {
                 .load(Ordering::Relaxed),
             conns_down: self.health_counters.conns_down.load(Ordering::Relaxed) as usize,
             assets_down: self.health_counters.assets_down.load(Ordering::Relaxed) as usize,
+        }
+    }
+
+    /// Assign a sequence and enqueue one centrally accepted lifecycle event.
+    pub fn admit_lifecycle(&self, event: Event, timestamp_received_ns: i64) {
+        let record = self.collector.record(event, timestamp_received_ns);
+        match self.event_tx.try_send(record) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::error!(
+                    capacity = self.event_tx.capacity(),
+                    max_capacity = self.event_tx.max_capacity(),
+                    "[QUEUE-OVERFLOW] lifecycle event channel full, exiting"
+                );
+                std::process::exit(1);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::error!("lifecycle event sink closed; exiting before losing data");
+                std::process::exit(1);
+            }
         }
     }
 
@@ -326,7 +354,7 @@ impl Pool {
         let mut index = 0;
         while index < self.connections.len() {
             if self.connections[index].assets.is_empty()
-                && Some(self.connections[index].conn_id) != self.lifecycle_conn_id
+                && !self.connections[index].lifecycle_listener
             {
                 let handle = self.connections.swap_remove(index);
                 let conn_id = handle.conn_id;
@@ -392,29 +420,34 @@ impl Pool {
     async fn spawn_connection(&mut self) {
         let conn_id = self.next_conn_id;
         self.next_conn_id += 1;
-        let lifecycle_leader = self.lifecycle_conn_id.is_none();
-        if lifecycle_leader {
+        let lifecycle_anchor = self.lifecycle_conn_id.is_none();
+        if lifecycle_anchor {
             self.lifecycle_conn_id = Some(conn_id);
         }
+        let lifecycle_listener = lifecycle_anchor
+            || (self.lifecycle_tx.is_some()
+                && self.connections.len() < LIFECYCLE_LISTENER_CONNECTIONS);
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_SIZE);
         let connection = Connection::new(
             conn_id,
             self.event_tx.clone(),
             Arc::clone(&self.collector),
             self.status_event_tx.clone(),
-            lifecycle_leader,
+            lifecycle_listener,
             self.lifecycle_tx.clone(),
         );
         let join = tokio::spawn(connection.run(cmd_rx));
         self.connections.push(ConnHandle {
             conn_id,
             assets: HashSet::new(),
+            lifecycle_listener,
             cmd_tx,
             join,
         });
         info!(
             conn = conn_id,
-            lifecycle_leader,
+            lifecycle_anchor,
+            lifecycle_listener,
             total = self.connections.len(),
             "spawned connection"
         );
@@ -629,7 +662,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsubscribe_keeps_empty_lifecycle_leader() {
+    async fn unsubscribe_keeps_empty_lifecycle_anchor() {
         let mut pool = pool(200);
         pool.subscribe_markets(vec![market("m1", "a1y", "a1n")])
             .await
@@ -643,7 +676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_creates_one_empty_lifecycle_leader() {
+    async fn start_creates_one_empty_lifecycle_anchor() {
         let mut pool = pool(200);
         pool.start().await;
         pool.start().await;
@@ -651,5 +684,40 @@ mod tests {
         assert_eq!(pool.connection_count(), 1);
         assert!(pool.connections[0].assets.is_empty());
         assert_eq!(pool.lifecycle_conn_id, Some(pool.connections[0].conn_id));
+    }
+
+    #[tokio::test]
+    async fn first_three_connections_listen_for_global_lifecycle_events() {
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::unbounded_channel();
+        let mut pool = Pool::new_with_lifecycle(2, event_tx, 0, lifecycle_tx);
+
+        pool.subscribe_markets(vec![
+            market("m1", "a1y", "a1n"),
+            market("m2", "a2y", "a2n"),
+            market("m3", "a3y", "a3n"),
+            market("m4", "a4y", "a4n"),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(pool.connection_count(), 4);
+        assert!(pool.connections[0].lifecycle_listener);
+        assert!(pool.connections[1].lifecycle_listener);
+        assert!(pool.connections[2].lifecycle_listener);
+        assert!(!pool.connections[3].lifecycle_listener);
+
+        pool.unsubscribe_markets(vec!["m1".into(), "m2".into(), "m3".into()])
+            .await
+            .unwrap();
+        assert_eq!(pool.connection_count(), 4);
+        assert_eq!(pool.pool_stats().lifecycle_listener_count, 3);
+
+        pool.unsubscribe_markets(vec!["m4".into()]).await.unwrap();
+        assert_eq!(pool.connection_count(), 3);
+        assert!(pool
+            .connections
+            .iter()
+            .all(|connection| connection.lifecycle_listener));
     }
 }

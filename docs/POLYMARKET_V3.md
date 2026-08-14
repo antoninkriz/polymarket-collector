@@ -67,11 +67,14 @@ stream append.
 
 Every subscription enables Polymarket's `custom_feature_enabled` wire option.
 `best_bid_ask` remains token-scoped and is accepted only from that token's
-authoritative route. `new_market` and `market_resolved` are connection-wide, so
-only one designated lifecycle connection stores and acts on them; accepting
-them from every pooled socket would duplicate each notification by the number
-of connections. The lifecycle connection stays subscribed with an empty token
-set when necessary, including `--new-only` operation and reconnects.
+authoritative route. `market_resolved` is accepted on the route that owns one
+of the event's `assets_ids`; this is where Polymarket delivers the
+market-scoped notification. `new_market` is accepted on three lifecycle
+listeners so one disconnected socket does not hide global discovery. A central
+controller suppresses repeated `(event_type, market)` lifecycle observations
+before assigning a sequence or storing a row. The three listeners remain
+connected with an empty token set if their markets are removed, including
+`--new-only` operation and reconnects.
 
 WebSocket lifecycle events add and remove subscriptions immediately. The
 Gamma pollers remain an idempotent reconciliation path for startup state,

@@ -301,6 +301,15 @@ pub enum MarketLifecycle {
     },
 }
 
+/// Full lifecycle observation forwarded from a WebSocket to the central
+/// lifecycle controller. The controller assigns the collector sequence only
+/// after suppressing copies delivered to redundant lifecycle listeners.
+#[derive(Debug, Clone)]
+pub struct MarketLifecycleObservation {
+    pub event: Event,
+    pub timestamp_received_ns: i64,
+}
+
 impl Event {
     /// Return the token ID for token-scoped events. Market lifecycle events
     /// intentionally return `None`: exploding one lifecycle notification

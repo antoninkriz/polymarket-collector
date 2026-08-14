@@ -51,7 +51,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
-use crate::events::{explode, Event, MarketLifecycle, WireMessage};
+use crate::events::{explode, Event, MarketLifecycleObservation, WireMessage};
 use crate::record::{now_ns, CollectorContext, EventRecord};
 use crate::ws::WS_MARKET_URL;
 
@@ -100,10 +100,10 @@ pub struct Connection {
     pub event_tx: mpsc::Sender<EventRecord>,
     pub collector: Arc<CollectorContext>,
     pub status_tx: mpsc::UnboundedSender<(usize, ConnStatus)>,
-    /// Lifecycle messages are broadcast to every custom-enabled socket. Only
-    /// the pool's designated leader admits them to storage.
-    pub lifecycle_leader: bool,
-    pub lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycle>>,
+    /// Whether this socket is one of the redundant listeners for global
+    /// `new_market` notifications.
+    pub lifecycle_listener: bool,
+    pub lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycleObservation>>,
 }
 
 impl Connection {
@@ -112,15 +112,15 @@ impl Connection {
         event_tx: mpsc::Sender<EventRecord>,
         collector: Arc<CollectorContext>,
         status_tx: mpsc::UnboundedSender<(usize, ConnStatus)>,
-        lifecycle_leader: bool,
-        lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycle>>,
+        lifecycle_listener: bool,
+        lifecycle_tx: Option<mpsc::UnboundedSender<MarketLifecycleObservation>>,
     ) -> Self {
         Self {
             index,
             event_tx,
             collector,
             status_tx,
-            lifecycle_leader,
+            lifecycle_listener,
             lifecycle_tx,
         }
     }
@@ -140,7 +140,7 @@ impl Connection {
             event_tx,
             collector,
             status_tx,
-            lifecycle_leader,
+            lifecycle_listener,
             lifecycle_tx,
         } = self;
         let mut sub = SubState::default();
@@ -225,7 +225,7 @@ impl Connection {
                 index,
                 event_tx: &event_tx,
                 collector: &collector,
-                lifecycle_leader,
+                lifecycle_listener,
                 lifecycle_tx: lifecycle_tx.as_ref(),
             };
             let outcome = run_session(
@@ -306,8 +306,8 @@ struct SessionContext<'a> {
     index: usize,
     event_tx: &'a mpsc::Sender<EventRecord>,
     collector: &'a CollectorContext,
-    lifecycle_leader: bool,
-    lifecycle_tx: Option<&'a mpsc::UnboundedSender<MarketLifecycle>>,
+    lifecycle_listener: bool,
+    lifecycle_tx: Option<&'a mpsc::UnboundedSender<MarketLifecycleObservation>>,
 }
 
 /// Run a single connected WebSocket session: send the initial subscription,
@@ -326,7 +326,7 @@ async fn run_session(
     let (mut write, mut read) = ws_stream.split();
 
     // (Re-)subscribe everything we want.
-    if !sub.desired.is_empty() || context.lifecycle_leader {
+    if !sub.desired.is_empty() || context.lifecycle_listener {
         let assets: Vec<String> = sub.desired.iter().cloned().collect();
         if let Err(e) = send_subscribe(&mut write, sub, &assets, index).await {
             return SessionOutcome::Error(e);
@@ -542,7 +542,7 @@ fn handle_text(
         let mut staged: Vec<Event> = Vec::new();
         explode(msg, &mut staged);
         for ev in staged {
-            let lifecycle = if let Some(asset_id) = ev.asset_id() {
+            if let Some(asset_id) = ev.asset_id() {
                 if !sub.desired.contains(asset_id) {
                     continue;
                 }
@@ -559,23 +559,38 @@ fn handle_text(
                     }
                     _ => {}
                 }
-                None
-            } else if !context.lifecycle_leader {
-                // Lifecycle events are connection-wide when the custom
-                // feature is enabled. Admitting them on every data socket
-                // would duplicate one upstream notification N times.
+                events_buf.push(context.collector.record(ev, timestamp_received_ns));
                 continue;
-            } else {
-                ev.market_lifecycle()
-            };
-            events_buf.push(context.collector.record(ev, timestamp_received_ns));
-            if let (Some(lifecycle_tx), Some(lifecycle)) = (context.lifecycle_tx, lifecycle) {
-                if lifecycle_tx.send(lifecycle).is_err() {
-                    warn!(
-                        conn = context.index,
-                        "market lifecycle controller stopped; event remains stored"
-                    );
+            }
+
+            let authoritative = match &ev {
+                Event::NewMarket { .. } => context.lifecycle_listener,
+                Event::MarketResolved { assets_ids, .. } => {
+                    assets_ids.iter().any(|asset| sub.desired.contains(asset))
+                        || (assets_ids.is_empty() && context.lifecycle_listener)
                 }
+                _ => unreachable!("every token event has an asset ID"),
+            };
+            if !authoritative {
+                continue;
+            }
+
+            if let Some(lifecycle_tx) = context.lifecycle_tx {
+                if lifecycle_tx
+                    .send(MarketLifecycleObservation {
+                        event: ev,
+                        timestamp_received_ns,
+                    })
+                    .is_err()
+                {
+                    error!(
+                        conn = context.index,
+                        "market lifecycle controller stopped; exiting before losing data"
+                    );
+                    std::process::exit(1);
+                }
+            } else {
+                events_buf.push(context.collector.record(ev, timestamp_received_ns));
             }
         }
     }
@@ -645,7 +660,7 @@ mod tests {
             index: 0,
             event_tx: &event_tx,
             collector: &collector,
-            lifecycle_leader: false,
+            lifecycle_listener: false,
             lifecycle_tx: None,
         };
         handle_text(text, sub, events, &context, 123)
@@ -812,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn only_lifecycle_leader_keeps_connection_wide_events() {
+    fn only_lifecycle_listener_keeps_new_market_events() {
         let raw = r#"{
             "event_type": "new_market", "id": "1", "market": "m",
             "assets_ids": ["yes", "no"], "outcomes": ["Yes", "No"],
@@ -829,7 +844,7 @@ mod tests {
             index: 0,
             event_tx: &event_tx,
             collector: &collector,
-            lifecycle_leader: true,
+            lifecycle_listener: true,
             lifecycle_tx: None,
         };
         handle_text(raw, &mut sub, &mut buf, &context, 123).unwrap();
@@ -838,11 +853,11 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_leader_forwards_pool_update() {
+    fn lifecycle_listener_forwards_full_observation() {
         let raw = r#"{
-            "event_type": "market_resolved", "id": "1", "market": "m",
-            "assets_ids": ["yes", "no"], "winning_asset_id": "yes",
-            "winning_outcome": "Yes", "timestamp": "1"
+            "event_type": "new_market", "id": "1", "market": "m",
+            "assets_ids": ["yes", "no"], "outcomes": ["Yes", "No"],
+            "timestamp": "1"
         }"#;
         let mut sub = sub_state(&[]);
         let mut buf = Vec::new();
@@ -853,16 +868,73 @@ mod tests {
             index: 0,
             event_tx: &event_tx,
             collector: &collector,
-            lifecycle_leader: true,
+            lifecycle_listener: true,
             lifecycle_tx: Some(&lifecycle_tx),
         };
 
         handle_text(raw, &mut sub, &mut buf, &context, 123).unwrap();
 
-        assert_eq!(
-            lifecycle_rx.try_recv().unwrap(),
-            MarketLifecycle::MarketResolved { market: "m".into() }
-        );
+        let observation = lifecycle_rx.try_recv().unwrap();
+        assert_eq!(observation.timestamp_received_ns, 123);
+        assert!(matches!(
+            observation.event,
+            Event::NewMarket { ref market, .. } if market == "m"
+        ));
+        assert!(buf.is_empty(), "the central controller stores the event");
+    }
+
+    #[test]
+    fn subscribed_asset_socket_forwards_market_resolved() {
+        let raw = r#"{
+            "event_type": "market_resolved", "id": "1", "market": "m",
+            "assets_ids": ["yes", "no"], "winning_asset_id": "yes",
+            "winning_outcome": "Yes", "timestamp": "1"
+        }"#;
+        let mut sub = sub_state(&["yes", "no"]);
+        let mut buf = Vec::new();
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let collector = CollectorContext::new();
+        let context = SessionContext {
+            index: 17,
+            event_tx: &event_tx,
+            collector: &collector,
+            lifecycle_listener: false,
+            lifecycle_tx: Some(&lifecycle_tx),
+        };
+
+        handle_text(raw, &mut sub, &mut buf, &context, 456).unwrap();
+
+        let observation = lifecycle_rx.try_recv().unwrap();
+        assert_eq!(observation.timestamp_received_ns, 456);
+        assert!(matches!(observation.event, Event::MarketResolved { .. }));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn unrelated_asset_socket_drops_market_resolved() {
+        let raw = r#"{
+            "event_type": "market_resolved", "id": "1", "market": "m",
+            "assets_ids": ["yes", "no"], "winning_asset_id": "yes",
+            "winning_outcome": "Yes", "timestamp": "1"
+        }"#;
+        let mut sub = sub_state(&["other"]);
+        let mut buf = Vec::new();
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let collector = CollectorContext::new();
+        let context = SessionContext {
+            index: 18,
+            event_tx: &event_tx,
+            collector: &collector,
+            lifecycle_listener: false,
+            lifecycle_tx: Some(&lifecycle_tx),
+        };
+
+        handle_text(raw, &mut sub, &mut buf, &context, 456).unwrap();
+
+        assert!(lifecycle_rx.try_recv().is_err());
+        assert!(buf.is_empty());
     }
 
     #[test]
@@ -878,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_leader_can_subscribe_without_assets() {
+    fn lifecycle_listener_can_subscribe_without_assets() {
         let mut sub = SubState::default();
         let initial = subscribe_payload(&mut sub, &[]);
         assert_eq!(initial["assets_ids"], serde_json::json!([]));
