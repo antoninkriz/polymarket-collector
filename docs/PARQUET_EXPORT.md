@@ -31,19 +31,10 @@ order clusters rows by market and asset for compression and selective reads.
 To replay across assets, markets, or event files, combine the relevant rows and
 order them by `sequence`.
 
-## How to read the schema tables
+## Schema conventions
 
 Each event section below is self-contained. Its table lists every exported
 column, including the four columns shared by all event types.
-
-`Value encoding` describes Parquet value pages. Parquet also uses RLE for
-definition and repetition levels, particularly for nullable and nested fields;
-that structural RLE does not change the listed value encoding. A requested
-`RLE_DICTIONARY` can fall back to `PLAIN` within a row group. The dictionary
-page itself is also stored with `PLAIN`, so metadata for a dictionary column
-normally reports `PLAIN`, `RLE`, and `RLE_DICTIONARY` together.
-The measurements behind these choices are documented in
-[`PARQUET_ENCODING_BENCHMARK.md`](PARQUET_ENCODING_BENCHMARK.md).
 
 All binary identifiers are validated before export. `market` and
 `transaction_hash` contain the raw 32 bytes decoded from their source `0x`
@@ -67,8 +58,6 @@ replaces the reconstructed book state for that asset.
 | Path | `YYYY-MM-DD/HH/book.parquet` |
 | Physical row order | `market`, `asset_id`, `sequence` ascending |
 | Compression | ZSTD level 9 on every column |
-| Parquet data pages | Version 2.0 |
-| Dictionary columns | None |
 
 | Column | Arrow type | Parquet physical and logical type | Nullable | Value encoding | Description |
 |---|---|---|---:|---|---|
@@ -103,8 +92,6 @@ values in their original array order.
 | Path | `YYYY-MM-DD/HH/price_change.parquet` |
 | Physical row order | `market`, `asset_id`, `sequence` ascending |
 | Compression | ZSTD level 9 on every column |
-| Parquet data pages | Version 2.0 |
-| Dictionary columns | `side`, with an 8 MiB dictionary-page limit |
 
 | Column | Arrow type | Parquet physical and logical type | Nullable | Value encoding | Description |
 |---|---|---|---:|---|---|
@@ -115,7 +102,7 @@ values in their original array order.
 | `asset_id` | `fixed_size_binary[32]` | `FIXED_LEN_BYTE_ARRAY(32)` | no | `PLAIN` | Outcome token being changed. |
 | `price` | `decimal32(9, 4)` | `INT32` + `DECIMAL(9, 4)` | no | `PLAIN` | Affected price level. |
 | `size` | `decimal64(18, 6)` | `INT64` + `DECIMAL(18, 6)` | no | `PLAIN` | New aggregate size, not a signed delta. Zero removes the level. |
-| `side` | `string` | `BYTE_ARRAY` + `STRING` | no | `RLE_DICTIONARY`, with `PLAIN` fallback | `BUY` for the bid side or `SELL` for the ask side. |
+| `side` | `string` | `BYTE_ARRAY` + `STRING` | no | `RLE_DICTIONARY` | `BUY` for the bid side or `SELL` for the ask side. |
 | `best_bid` | `decimal32(9, 4)` | `INT32` + `DECIMAL(9, 4)` | yes | `PLAIN` | Source-provided best bid after the change, when present. |
 | `best_ask` | `decimal32(9, 4)` | `INT32` + `DECIMAL(9, 4)` | yes | `PLAIN` | Source-provided best ask after the change, when present. |
 
@@ -134,8 +121,6 @@ the same transaction hash.
 | Path | `YYYY-MM-DD/HH/last_trade_price.parquet` |
 | Physical row order | `market`, `asset_id`, `sequence` ascending |
 | Compression | ZSTD level 9 on every column |
-| Parquet data pages | Version 2.0 |
-| Dictionary columns | `price`, `side`, `fee_rate_bps`, with an 8 MiB dictionary-page limit |
 
 | Column | Arrow type | Parquet physical and logical type | Nullable | Value encoding | Description |
 |---|---|---|---:|---|---|
@@ -144,10 +129,10 @@ the same transaction hash.
 | `timestamp` | `timestamp[ms, tz=UTC]` | `INT64` + `TIMESTAMP(MILLIS, UTC)` | no | `PLAIN` | Millisecond source timestamp supplied by Polymarket; do not use it to break ordering ties. |
 | `market` | `fixed_size_binary[32]` | `FIXED_LEN_BYTE_ARRAY(32)` | no | `PLAIN` | Market condition ID. |
 | `asset_id` | `fixed_size_binary[32]` | `FIXED_LEN_BYTE_ARRAY(32)` | no | `PLAIN` | Outcome token that traded. |
-| `price` | `decimal32(9, 4)` | `INT32` + `DECIMAL(9, 4)` | no | `RLE_DICTIONARY`, with `PLAIN` fallback | Execution price. |
+| `price` | `decimal32(9, 4)` | `INT32` + `DECIMAL(9, 4)` | no | `RLE_DICTIONARY` | Execution price. |
 | `size` | `decimal64(18, 6)` | `INT64` + `DECIMAL(18, 6)` | no | `PLAIN` | Executed size. |
-| `side` | `string` | `BYTE_ARRAY` + `STRING` | no | `RLE_DICTIONARY`, with `PLAIN` fallback | `BUY` or `SELL`, from the taker's perspective. |
-| `fee_rate_bps` | `uint16` | `INT32` + `UINT(16)` | no | `RLE_DICTIONARY`, with `PLAIN` fallback | Fee rate in basis points. |
+| `side` | `string` | `BYTE_ARRAY` + `STRING` | no | `RLE_DICTIONARY` | `BUY` or `SELL`, from the taker's perspective. |
+| `fee_rate_bps` | `uint16` | `INT32` + `UINT(16)` | no | `RLE_DICTIONARY` | Fee rate in basis points. |
 | `transaction_hash` | `fixed_size_binary[32]` | `FIXED_LEN_BYTE_ARRAY(32)` | no | `PLAIN` | Polygon transaction containing the fill; metadata, not a unique fill identity. |
 
 One Polygon transaction can settle multiple fills. Never deduplicate on
@@ -165,8 +150,6 @@ asset. It does not change depth by itself.
 | Path | `YYYY-MM-DD/HH/tick_size_change.parquet` |
 | Physical row order | `market`, `asset_id`, `sequence` ascending |
 | Compression | ZSTD level 9 on every column |
-| Parquet data pages | Version 2.0 |
-| Dictionary columns | None |
 
 | Column | Arrow type | Parquet physical and logical type | Nullable | Value encoding | Description |
 |---|---|---|---:|---|---|
@@ -190,8 +173,6 @@ book.
 | Path | `YYYY-MM-DD/HH/best_bid_ask.parquet` |
 | Physical row order | `market`, `asset_id`, `sequence` ascending |
 | Compression | ZSTD level 9 on every column |
-| Parquet data pages | Version 2.0 |
-| Dictionary columns | None |
 
 | Column | Arrow type | Parquet physical and logical type | Nullable | Value encoding | Description |
 |---|---|---|---:|---|---|
@@ -214,8 +195,6 @@ so it has no synthetic `asset_id` column.
 | Path | `YYYY-MM-DD/HH/new_market.parquet` |
 | Physical row order | `market`, `sequence` ascending |
 | Compression | ZSTD level 9 on every column |
-| Parquet data pages | Version 2.0 |
-| Dictionary columns | None |
 
 | Column | Arrow type | Parquet physical and logical type | Nullable | Value encoding | Description |
 |---|---|---|---:|---|---|
@@ -243,8 +222,6 @@ it has no synthetic `asset_id` column.
 | Path | `YYYY-MM-DD/HH/market_resolved.parquet` |
 | Physical row order | `market`, `sequence` ascending |
 | Compression | ZSTD level 9 on every column |
-| Parquet data pages | Version 2.0 |
-| Dictionary columns | None |
 
 | Column | Arrow type | Parquet physical and logical type | Nullable | Value encoding | Description |
 |---|---|---|---:|---|---|
