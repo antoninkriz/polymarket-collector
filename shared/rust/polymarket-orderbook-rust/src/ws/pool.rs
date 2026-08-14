@@ -523,6 +523,9 @@ impl HealthState {
                     *generation = generation.wrapping_add(1);
                 }
                 self.conn_status.insert(conn_id, status);
+                // Connection transitions are rare. Recompute here because one
+                // transition changes readiness for every asset on the route.
+                self.update_gauges(counters);
             }
             HealthEvent::BookSnapshot { conn_id, asset_id } => {
                 if let Some(assigned_conn) = self.asset_conns.get(&asset_id) {
@@ -533,13 +536,25 @@ impl HealthState {
                             expected_conn = assigned_conn,
                             "ignoring book readiness from non-authoritative connection"
                         );
-                        self.update_gauges(counters);
                         return;
                     }
                 }
+                let was_ready = self.asset_is_ready(&asset_id, conn_id);
                 let generation = self.conn_generation.get(&conn_id).copied().unwrap_or(0);
                 self.asset_ready_generation
                     .insert(asset_id.clone(), generation);
+                // Snapshots are the hot path at startup and after a batch
+                // reconnect. Updating this one asset must remain O(1), not
+                // scan the complete subscription universe.
+                if self.asset_conns.contains_key(&asset_id)
+                    && !was_ready
+                    && self.asset_is_ready(&asset_id, conn_id)
+                {
+                    let assets_down = counters.assets_down.load(Ordering::Relaxed);
+                    counters
+                        .assets_down
+                        .store(assets_down.saturating_sub(1), Ordering::Relaxed);
+                }
                 if let Some(started) = self.down_since.remove(&asset_id) {
                     info!(
                         asset = asset_id,
@@ -550,7 +565,6 @@ impl HealthState {
                 }
             }
         }
-        self.update_gauges(counters);
     }
 
     fn update_mappings(&mut self, asset_conns: HashMap<String, usize>, counters: &HealthCounters) {
