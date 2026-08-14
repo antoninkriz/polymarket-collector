@@ -149,7 +149,7 @@ def _prepare_file(task: ReencodeTask) -> PreparedFile:
         ) as writer:
             for row_group in range(source_metadata.num_row_groups):
                 table = source.read_row_group(row_group)
-                writer.write_table(table, row_group_size=table.num_rows)
+                writer.write_table(table, row_group_size=max(1, table.num_rows))
 
         os.chmod(temporary, task.path.stat().st_mode & 0o777)
         with temporary.open("rb") as output:

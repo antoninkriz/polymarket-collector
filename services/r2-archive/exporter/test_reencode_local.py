@@ -18,6 +18,25 @@ import run as exporter
 
 
 class ReencodeLocalTest(unittest.TestCase):
+    def test_preserves_empty_row_group(self) -> None:
+        with TemporaryDirectory() as directory:
+            parquet_path = Path(directory) / "price_change.parquet"
+            empty = self._price_changes().slice(0, 0)
+            parquet_path.write_bytes(exporter.table_to_parquet(empty, "price_change"))
+            task = reencoder.ReencodeTask(
+                path=parquet_path,
+                event_type="price_change",
+                expected_size=parquet_path.stat().st_size,
+                expected_rows=0,
+            )
+
+            prepared = reencoder._prepare_file(task)
+            replacement = pq.ParquetFile(prepared.temporary)
+
+            self.assertEqual(replacement.metadata.num_rows, 0)
+            self.assertEqual(replacement.metadata.num_row_groups, 1)
+            prepared.temporary.unlink()
+
     def test_prepares_and_commits_completed_hour(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
