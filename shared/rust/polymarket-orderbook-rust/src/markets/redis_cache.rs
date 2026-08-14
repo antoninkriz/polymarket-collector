@@ -144,6 +144,12 @@ pub async fn save(redis_url: &str, key: &str, document: &CacheDocument) -> Resul
     // Serialize and validate before opening Redis so a bad snapshot cannot
     // replace the last known-good restart cache.
     let raw = document.to_json()?;
+    save_json(redis_url, key, raw).await
+}
+
+/// Atomically store JSON previously produced by [`CacheDocument::to_json`].
+/// This split lets callers move serialization to `spawn_blocking`.
+pub async fn save_json(redis_url: &str, key: &str, raw: String) -> Result<()> {
     let client = redis::Client::open(redis_url).context("open redis client")?;
     let mut conn = client
         .get_multiplexed_async_connection()

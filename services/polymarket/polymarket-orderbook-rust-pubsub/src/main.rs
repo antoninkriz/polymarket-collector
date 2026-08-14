@@ -13,9 +13,10 @@
 //! ```
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
@@ -29,6 +30,7 @@ use polymarket_orderbook_rust::record::EventRecord;
 use polymarket_orderbook_rust::ws::pool::Pool;
 
 use polymarket_orderbook_rust_pubsub::config::Config;
+use polymarket_orderbook_rust_pubsub::gamma_reconcile::{self, ReconciliationStats};
 use polymarket_orderbook_rust_pubsub::lease::{PublisherLease, PublisherLeaseConfig};
 use polymarket_orderbook_rust_pubsub::market_lifecycle::LifecycleCoordinator;
 use polymarket_orderbook_rust_pubsub::pubsub_sink::{PubSubSink, PubSubSinkConfig};
@@ -124,18 +126,22 @@ async fn main() -> Result<()> {
         LifecycleCoordinator::new(Arc::clone(&pool), websocket_lifecycle_rx, reconciliation_rx);
     let mut coordinator_handle = tokio::spawn(coordinator.run());
 
-    if !cli.new_only {
-        let markets = preload_markets(&cfg).await?;
-        let market_count = markets.len();
-        apply_bootstrap(&reconciliation_tx, markets).await?;
+    let (cached_markets, cache_fetched_at) = if cli.new_only {
+        info!("--new-only set, skipping active market restart cache");
+        (Vec::new(), None)
+    } else {
+        load_restart_cache(&cfg).await
+    };
+    let cold_start = cached_markets.is_empty();
+    if !cached_markets.is_empty() {
+        let market_count = cached_markets.len();
+        apply_bootstrap(&reconciliation_tx, cached_markets).await?;
         if market_count > 0 {
             info!(
                 markets = pool.lock().await.subscribed_market_count(),
                 "pre-loaded markets",
             );
         }
-    } else {
-        info!("--new-only set, skipping active market pre-load");
     }
 
     let stream_cfg = StreamConfig {
@@ -149,18 +155,67 @@ async fn main() -> Result<()> {
     let mut stream_handle: JoinHandle<Result<()>> =
         tokio::spawn(async move { markets::stream::run(stream_cfg, stream_lifecycle_tx).await });
 
+    let gamma_http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build Gamma HTTP client")?;
+    let gamma_client = markets::gamma::GammaClient::new(gamma_http);
+    let reconciliation_stats = Arc::new(ReconciliationStats::default());
+    let (cache_trigger_tx, cache_trigger_rx) = mpsc::channel(1);
+    let (gamma_shutdown_tx, gamma_shutdown_rx) = watch::channel(false);
+    let mut full_scan_handle: JoinHandle<Result<()>> = if cli.new_only {
+        tokio::spawn(async move {
+            let mut shutdown = gamma_shutdown_rx;
+            shutdown
+                .changed()
+                .await
+                .context("Gamma shutdown sender dropped")
+        })
+    } else {
+        tokio::spawn(gamma_reconcile::run_full_scans(
+            gamma_client.clone(),
+            reconciliation_tx.clone(),
+            cold_start,
+            cache_trigger_tx,
+            Arc::clone(&reconciliation_stats),
+            gamma_shutdown_rx,
+        ))
+    };
+    let startup_poll_time = Utc::now();
+    let mut new_poll_handle = tokio::spawn(gamma_reconcile::run_new_market_polls(
+        gamma_client.clone(),
+        reconciliation_tx.clone(),
+        startup_poll_time,
+        Arc::clone(&reconciliation_stats),
+    ));
+    let mut closed_poll_handle = tokio::spawn(gamma_reconcile::run_closed_market_polls(
+        gamma_client,
+        reconciliation_tx.clone(),
+        cache_fetched_at.unwrap_or(startup_poll_time),
+        Arc::clone(&reconciliation_stats),
+    ));
+    let mut cache_saver_handle = tokio::spawn(gamma_reconcile::run_cache_saver(
+        reconciliation_tx.clone(),
+        cfg.redis_url.clone(),
+        cfg.redis_key_active_markets.clone(),
+        cache_trigger_rx,
+        Arc::clone(&reconciliation_stats),
+    ));
+
     let stats_pool = Arc::clone(&pool);
     let stats_event_tx = event_tx.clone();
     let stats_redis_url = cfg.redis_url.clone();
     let stats_cache_count_key = cfg.redis_key_active_markets_count.clone();
     let stats_websocket_lifecycle_tx = websocket_lifecycle_tx.clone();
     let stats_reconciliation_tx = reconciliation_tx.clone();
+    let stats_reconciliation = Arc::clone(&reconciliation_stats);
     let stats_handle = tokio::spawn(async move {
         stats_loop(
             stats_pool,
             stats_event_tx,
             stats_websocket_lifecycle_tx,
             stats_reconciliation_tx,
+            stats_reconciliation,
             stats_redis_url,
             stats_cache_count_key,
         )
@@ -170,6 +225,10 @@ async fn main() -> Result<()> {
     let mut sink_outcome = None;
     let mut stream_stopped = false;
     let mut coordinator_stopped = false;
+    let mut full_scan_stopped = false;
+    let mut new_poll_stopped = false;
+    let mut closed_poll_stopped = false;
+    let mut cache_saver_stopped = false;
     tokio::select! {
         _ = wait_for_shutdown() => info!("shutdown signal received"),
         lease_error = lease_failure_rx.recv() => {
@@ -187,6 +246,39 @@ async fn main() -> Result<()> {
             warn!(?outcome, "market lifecycle coordinator stopped; stopping collector");
             coordinator_stopped = true;
         }
+        outcome = &mut full_scan_handle => {
+            warn!(?outcome, "Gamma full scan task stopped; stopping collector");
+            full_scan_stopped = true;
+        }
+        outcome = &mut new_poll_handle => {
+            warn!(?outcome, "Gamma new-market poll task stopped; stopping collector");
+            new_poll_stopped = true;
+        }
+        outcome = &mut closed_poll_handle => {
+            warn!(?outcome, "Gamma closed-market poll task stopped; stopping collector");
+            closed_poll_stopped = true;
+        }
+        outcome = &mut cache_saver_handle => {
+            warn!(?outcome, "market restart-cache task stopped; stopping collector");
+            cache_saver_stopped = true;
+        }
+    }
+
+    let _ = gamma_shutdown_tx.send(true);
+    if !full_scan_stopped {
+        let _ = full_scan_handle.await;
+    }
+    if !new_poll_stopped {
+        new_poll_handle.abort();
+        let _ = new_poll_handle.await;
+    }
+    if !closed_poll_stopped {
+        closed_poll_handle.abort();
+        let _ = closed_poll_handle.await;
+    }
+    if !cache_saver_stopped {
+        cache_saver_handle.abort();
+        let _ = cache_saver_handle.await;
     }
 
     if !stream_stopped {
@@ -194,6 +286,18 @@ async fn main() -> Result<()> {
         let _ = stream_handle.await;
     }
     info!("stream listener stopped");
+
+    if !coordinator_stopped {
+        if let Err(error) = gamma_reconcile::persist_final_snapshot(
+            &reconciliation_tx,
+            &cfg.redis_url,
+            &cfg.redis_key_active_markets,
+        )
+        .await
+        {
+            warn!(%error, "final market restart-cache save failed");
+        }
+    }
 
     if !coordinator_stopped {
         coordinator_handle.abort();
@@ -277,49 +381,24 @@ fn init_tracing() {
         .init();
 }
 
-async fn preload_markets(cfg: &Config) -> Result<Vec<Market>> {
+async fn load_restart_cache(cfg: &Config) -> (Vec<Market>, Option<DateTime<Utc>>) {
     if cfg.skip_active_markets_cache {
-        info!("SKIP_ACTIVE_MARKETS_CACHE=true, fetching from Gamma API");
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .context("build gamma http client")?;
-        let markets = markets::gamma::fetch_active_markets(&http).await?;
-        info!(count = markets.len(), "fetched active markets from gamma");
-        return Ok(markets);
+        info!("SKIP_ACTIVE_MARKETS_CACHE=true, starting cold Gamma reconciliation");
+        return (Vec::new(), None);
     }
-
-    let minimum_cache_timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before Unix epoch")?
-        .as_secs()
-        .saturating_sub(1);
-    let updated_at_key = format!("{}:updated_at", cfg.redis_key_active_markets);
-    let mut waiting_logged = false;
-    loop {
-        let updated_at = markets::redis_cache::last_updated(&cfg.redis_url, &updated_at_key)
-            .await
-            .context("load active markets cache timestamp")?;
-        if updated_at.is_some_and(|timestamp| timestamp >= minimum_cache_timestamp) {
-            if let Some(markets) =
-                markets::redis_cache::load(&cfg.redis_url, &cfg.redis_key_active_markets)
-                    .await
-                    .context("load active markets from redis")?
-            {
-                return Ok(markets);
-            }
+    match markets::redis_cache::load_document(&cfg.redis_url, &cfg.redis_key_active_markets).await {
+        Ok(Some(document)) => {
+            let fetched_at = document.fetched_at();
+            (document.into_markets(), Some(fetched_at))
         }
-
-        if !waiting_logged {
-            warn!(
-                key = cfg.redis_key_active_markets,
-                ?updated_at,
-                minimum_cache_timestamp,
-                "fresh active markets cache not ready; waiting"
-            );
-            waiting_logged = true;
+        Ok(None) => {
+            info!("market restart cache is absent; starting cold Gamma reconciliation");
+            (Vec::new(), None)
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        Err(error) => {
+            warn!(%error, "market restart cache is invalid; starting cold Gamma reconciliation");
+            (Vec::new(), None)
+        }
     }
 }
 
@@ -344,6 +423,7 @@ async fn stats_loop(
     event_tx: mpsc::Sender<EventRecord>,
     websocket_lifecycle_tx: mpsc::Sender<MarketLifecycleObservation>,
     reconciliation_tx: mpsc::Sender<LifecycleRequest>,
+    reconciliation_stats: Arc<ReconciliationStats>,
     redis_url: String,
     cache_count_key: String,
 ) {
@@ -387,6 +467,7 @@ async fn stats_loop(
             let p = pool.lock().await;
             p.pool_stats()
         };
+        let reconciliation_ages = reconciliation_stats.ages();
 
         let queue_pct = if queue_max > 0 {
             (queue_used as f64 / queue_max as f64) * 100.0
@@ -458,6 +539,10 @@ async fn stats_loop(
             cache_active_markets,
             connections = stats.connection_count,
             lifecycle_listeners = stats.lifecycle_listener_count,
+            gamma_full_scan_age_s = ?reconciliation_ages.full_scan_seconds,
+            gamma_new_poll_age_s = ?reconciliation_ages.new_poll_seconds,
+            gamma_closed_poll_age_s = ?reconciliation_ages.closed_poll_seconds,
+            restart_cache_save_age_s = ?reconciliation_ages.cache_save_seconds,
             asset_down_events = stats.asset_down_events,
             conn_down_events = stats.conn_down_events,
             "[QUEUE-STATS]",
@@ -489,6 +574,10 @@ async fn stats_loop(
                 "reconciliation_queue_high_water_pct": format!("{:.1}", reconciliation_high_water_pct),
                 "asset_down_events_total": stats.asset_down_events,
                 "conn_down_events_total": stats.conn_down_events,
+                "gamma_full_scan_age_s": reconciliation_ages.full_scan_seconds,
+                "gamma_new_poll_age_s": reconciliation_ages.new_poll_seconds,
+                "gamma_closed_poll_age_s": reconciliation_ages.closed_poll_seconds,
+                "restart_cache_save_age_s": reconciliation_ages.cache_save_seconds,
             }),
             "pool_stats",
         );

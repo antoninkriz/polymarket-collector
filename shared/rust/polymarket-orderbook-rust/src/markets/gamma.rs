@@ -40,6 +40,7 @@ pub struct GammaMarket {
     pub slug: String,
     pub active: bool,
     pub closed: bool,
+    pub uma_resolution_status: String,
     pub assets_ids: Vec<String>,
     pub outcomes: Vec<String>,
     pub outcome_prices: Vec<Decimal>,
@@ -76,7 +77,7 @@ impl GammaMarket {
     /// Return an unambiguous resolved winner when exactly one aligned outcome
     /// has a settlement price of one.
     pub fn winner(&self) -> Option<GammaWinner<'_>> {
-        if !self.closed
+        if !self.is_resolved()
             || self.outcomes.len() != self.assets_ids.len()
             || self.outcome_prices.len() != self.assets_ids.len()
         {
@@ -98,6 +99,10 @@ impl GammaMarket {
         })
     }
 
+    pub fn is_resolved(&self) -> bool {
+        self.closed && self.uma_resolution_status.eq_ignore_ascii_case("resolved")
+    }
+
     pub fn new_market_timestamp_ms(&self) -> Option<i64> {
         self.created_at_ms.or(self.start_date_ms)
     }
@@ -107,6 +112,31 @@ impl GammaMarket {
 pub struct GammaWinner<'a> {
     pub asset_id: &'a str,
     pub outcome: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeysetScanKind {
+    FullActive,
+    ActiveSince(i64),
+    ClosedSince(i64),
+}
+
+pub struct KeysetScan {
+    kind: KeysetScanKind,
+    cursor: Option<String>,
+    seen_cursors: HashSet<String>,
+    finished: bool,
+}
+
+impl KeysetScan {
+    fn new(kind: KeysetScanKind) -> Self {
+        Self {
+            kind,
+            cursor: None,
+            seen_cursors: HashSet::new(),
+            finished: false,
+        }
+    }
 }
 
 /// Rate-limited Gamma client. Clones share one request gate.
@@ -128,6 +158,73 @@ impl GammaClient {
             base_url: base_url.into(),
             next_request_at: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn full_active_scan(&self) -> KeysetScan {
+        KeysetScan::new(KeysetScanKind::FullActive)
+    }
+
+    pub fn active_since_scan(&self, since_ms: i64) -> KeysetScan {
+        KeysetScan::new(KeysetScanKind::ActiveSince(since_ms))
+    }
+
+    pub fn closed_since_scan(&self, since_ms: i64) -> KeysetScan {
+        KeysetScan::new(KeysetScanKind::ClosedSince(since_ms))
+    }
+
+    /// Fetch one filtered keyset page. Returning `None` means the scan is
+    /// complete. Incremental scans stop after the first page whose newest
+    /// relevant timestamp predates their overlap boundary.
+    pub async fn next_keyset_page(
+        &self,
+        scan: &mut KeysetScan,
+    ) -> Result<Option<Vec<GammaMarket>>> {
+        if scan.finished {
+            return Ok(None);
+        }
+        let params = scan_params(scan.kind, scan.cursor.as_deref());
+        let received: Received<KeysetPage> = self
+            .get_json("/markets/keyset", &params)
+            .await
+            .context("fetch Gamma market keyset page")?;
+        let mut newest_relevant_timestamp = None::<i64>;
+        let mut markets = Vec::new();
+        for raw in received.value.markets {
+            let market = match GammaMarket::from_raw(raw, received.received_at_ns) {
+                Ok(market) => market,
+                Err(error) => {
+                    warn!(%error, "ignoring malformed Gamma market");
+                    continue;
+                }
+            };
+            let include = match scan.kind {
+                KeysetScanKind::FullActive => market.active_subscription().is_some(),
+                KeysetScanKind::ActiveSince(since_ms) => {
+                    let timestamp = market.start_date_ms;
+                    newest_relevant_timestamp = newest_relevant_timestamp.max(timestamp);
+                    timestamp.is_some_and(|timestamp| timestamp >= since_ms)
+                        && market.active_subscription().is_some()
+                }
+                KeysetScanKind::ClosedSince(since_ms) => {
+                    newest_relevant_timestamp =
+                        newest_relevant_timestamp.max(market.closed_time_ms);
+                    market.is_resolved()
+                        && market
+                            .closed_time_ms
+                            .is_some_and(|timestamp| timestamp >= since_ms)
+                }
+            };
+            if include {
+                markets.push(market);
+            }
+        }
+
+        scan.finished = incremental_boundary_reached(scan.kind, newest_relevant_timestamp);
+        if !scan.finished {
+            scan.cursor = next_cursor(received.value.next_cursor, &mut scan.seen_cursors)?;
+            scan.finished = scan.cursor.is_none();
+        }
+        Ok(Some(markets))
     }
 
     async fn get_json<T>(&self, path: &str, params: &[(&str, String)]) -> Result<Received<T>>
@@ -242,35 +339,19 @@ pub async fn fetch_active_markets(http: &reqwest::Client) -> Result<Vec<Market>>
 
 /// Fetch all active/open Gamma records that describe a valid binary market.
 pub async fn fetch_active_market_records(client: &GammaClient) -> Result<Vec<GammaMarket>> {
-    let mut cursor: Option<String> = None;
-    let mut seen_cursors = HashSet::new();
+    let mut scan = client.full_active_scan();
     let mut seen_markets = HashSet::new();
     let mut markets = Vec::new();
     let mut page_number = 0_usize;
 
     loop {
-        let params = keyset_params(cursor.as_deref());
-        let received: Received<KeysetPage> = client
-            .get_json("/markets/keyset", &params)
-            .await
-            .context("fetch Gamma market keyset page")?;
+        let Some(page) = client.next_keyset_page(&mut scan).await? else {
+            break;
+        };
         page_number += 1;
-        let page_size = received.value.markets.len();
+        let page_size = page.len();
 
-        for raw in received.value.markets {
-            if !raw.active || raw.closed {
-                continue;
-            }
-            let market = match GammaMarket::from_raw(raw, received.received_at_ns) {
-                Ok(market) => market,
-                Err(error) => {
-                    warn!(page_number, %error, "ignoring malformed Gamma market");
-                    continue;
-                }
-            };
-            if market.active_subscription().is_none() {
-                continue;
-            }
+        for market in page {
             if seen_markets.insert(market.condition_id.clone()) {
                 markets.push(market);
             }
@@ -289,11 +370,6 @@ pub async fn fetch_active_market_records(client: &GammaClient) -> Result<Vec<Gam
                 "Gamma active-market fetch progress"
             );
         }
-
-        cursor = next_cursor(received.value.next_cursor, &mut seen_cursors)?;
-        if cursor.is_none() {
-            break;
-        }
     }
 
     info!(
@@ -304,16 +380,50 @@ pub async fn fetch_active_market_records(client: &GammaClient) -> Result<Vec<Gam
     Ok(markets)
 }
 
-fn keyset_params(cursor: Option<&str>) -> Vec<(&'static str, String)> {
-    let mut params = vec![
-        ("active", "true".to_string()),
-        ("closed", "false".to_string()),
-        ("limit", FETCH_BATCH_SIZE.to_string()),
-    ];
+fn scan_params(kind: KeysetScanKind, cursor: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut params = vec![("limit", FETCH_BATCH_SIZE.to_string())];
+    match kind {
+        KeysetScanKind::FullActive => {
+            params.push(("active", "true".to_string()));
+            params.push(("closed", "false".to_string()));
+        }
+        KeysetScanKind::ActiveSince(_) => {
+            // start_date_min is the only documented keyset lower bound for
+            // discovery. This poll is deliberately best-effort: late/backfilled
+            // markets with an old startDate are recovered by the full scan.
+            params.push(("active", "true".to_string()));
+            params.push(("closed", "false".to_string()));
+            if let KeysetScanKind::ActiveSince(since_ms) = kind {
+                if let Some(since) = DateTime::<Utc>::from_timestamp_millis(since_ms) {
+                    params.push(("start_date_min", since.to_rfc3339()));
+                }
+            }
+            params.push(("order", "startDate".to_string()));
+            params.push(("ascending", "false".to_string()));
+        }
+        KeysetScanKind::ClosedSince(_) => {
+            params.push(("closed", "true".to_string()));
+            params.push(("uma_resolution_status", "resolved".to_string()));
+            params.push(("order", "closedTime".to_string()));
+            params.push(("ascending", "false".to_string()));
+        }
+    }
     if let Some(cursor) = cursor {
         params.push(("after_cursor", cursor.to_string()));
     }
     params
+}
+
+fn incremental_boundary_reached(
+    kind: KeysetScanKind,
+    newest_relevant_timestamp: Option<i64>,
+) -> bool {
+    match kind {
+        KeysetScanKind::FullActive => false,
+        KeysetScanKind::ActiveSince(since_ms) | KeysetScanKind::ClosedSince(since_ms) => {
+            newest_relevant_timestamp.is_some_and(|timestamp| timestamp < since_ms)
+        }
+    }
 }
 
 fn next_cursor(
@@ -382,6 +492,8 @@ struct RawMarket {
     #[serde(default)]
     closed: bool,
     #[serde(default)]
+    uma_resolution_status: String,
+    #[serde(default)]
     clob_token_ids: StringOrJsonArray,
     #[serde(default)]
     outcomes: StringOrJsonArray,
@@ -421,6 +533,7 @@ impl GammaMarket {
             slug: raw.slug,
             active: raw.active,
             closed: raw.closed,
+            uma_resolution_status: raw.uma_resolution_status,
             assets_ids,
             outcomes,
             outcome_prices,
@@ -557,6 +670,7 @@ mod tests {
                 "conditionId": "m",
                 "active": true,
                 "closed": true,
+                "umaResolutionStatus": "resolved",
                 "clobTokenIds": ["a", "b"],
                 "outcomes": ["A", "B"],
                 "outcomePrices": ["0", "1"],
@@ -597,22 +711,75 @@ mod tests {
     #[test]
     fn keyset_parameters_use_documented_page_size_and_cursor() {
         assert_eq!(
-            keyset_params(None),
+            scan_params(KeysetScanKind::FullActive, None),
             vec![
+                ("limit", "100".into()),
                 ("active", "true".into()),
                 ("closed", "false".into()),
-                ("limit", "100".into()),
             ]
         );
         assert_eq!(
-            keyset_params(Some("opaque")),
+            scan_params(KeysetScanKind::FullActive, Some("opaque")),
             vec![
+                ("limit", "100".into()),
                 ("active", "true".into()),
                 ("closed", "false".into()),
-                ("limit", "100".into()),
                 ("after_cursor", "opaque".into()),
             ]
         );
+    }
+
+    #[test]
+    fn incremental_queries_and_page_boundaries_overlap() {
+        let since = 1_786_708_862_345;
+        assert_eq!(
+            scan_params(KeysetScanKind::ActiveSince(since), None),
+            vec![
+                ("limit", "100".into()),
+                ("active", "true".into()),
+                ("closed", "false".into()),
+                ("start_date_min", "2026-08-14T12:01:02.345+00:00".into()),
+                ("order", "startDate".into()),
+                ("ascending", "false".into()),
+            ]
+        );
+        assert_eq!(
+            scan_params(KeysetScanKind::ClosedSince(since), None),
+            vec![
+                ("limit", "100".into()),
+                ("closed", "true".into()),
+                ("uma_resolution_status", "resolved".into()),
+                ("order", "closedTime".into()),
+                ("ascending", "false".into()),
+            ]
+        );
+        assert!(!incremental_boundary_reached(
+            KeysetScanKind::ClosedSince(since),
+            Some(since)
+        ));
+        assert!(incremental_boundary_reached(
+            KeysetScanKind::ClosedSince(since),
+            Some(since - 1)
+        ));
+        assert!(!incremental_boundary_reached(
+            KeysetScanKind::ActiveSince(since),
+            None
+        ));
+    }
+
+    #[test]
+    fn closed_pending_market_is_not_resolved() {
+        let market = parse_market(
+            r#"{
+                "conditionId":"m", "active":false, "closed":true,
+                "umaResolutionStatus":"pending",
+                "clobTokenIds":["a","b"], "outcomes":["Yes","No"],
+                "outcomePrices":["1","0"], "closedTime":"2026-08-14T13:00:00Z"
+            }"#,
+            1,
+        );
+        assert!(!market.is_resolved());
+        assert!(market.winner().is_none());
     }
 
     #[test]

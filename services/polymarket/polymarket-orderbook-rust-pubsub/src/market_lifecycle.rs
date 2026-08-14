@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use polymarket_orderbook_rust::events::{Market, MarketLifecycle, MarketLifecycleObservation};
 use polymarket_orderbook_rust::markets;
 use polymarket_orderbook_rust::markets::lifecycle::{
-    ActiveMarketSnapshot, LifecycleRequest, LifecycleSource,
+    ActiveMarketSnapshot, LifecycleRequest, LifecycleSource, ScannedActiveMarket,
 };
 use polymarket_orderbook_rust::ws::pool::Pool;
 
@@ -32,9 +32,23 @@ enum PlannedObservation {
 
 #[derive(Default)]
 struct LifecycleState {
-    active: HashMap<String, Market>,
+    active: HashMap<String, ActiveMarket>,
     asset_owner: HashMap<String, String>,
     first_source: HashMap<LifecycleKey, LifecycleSource>,
+    revision: u64,
+    scan: Option<FullScanState>,
+}
+
+struct ActiveMarket {
+    market: Market,
+    revision: u64,
+}
+
+struct FullScanState {
+    id: u64,
+    start_revision: u64,
+    cold_start: bool,
+    seen: std::collections::HashSet<String>,
 }
 
 impl LifecycleState {
@@ -43,10 +57,16 @@ impl LifecycleState {
         let mut asset_owner = self.asset_owner.clone();
         let mut planned = Vec::new();
         for market in markets {
+            if self
+                .first_source
+                .contains_key(&LifecycleKey::MarketResolved(market.hash.clone()))
+            {
+                continue;
+            }
             validate_market(&market)?;
             let assets = canonical_assets(&market.assets);
             if let Some(existing) = self.active.get(&market.hash) {
-                let existing_assets = canonical_assets(&existing.assets);
+                let existing_assets = canonical_assets(&existing.market.assets);
                 ensure!(
                     existing_assets == assets,
                     "market {} changed assets from {:?} to {:?}",
@@ -90,7 +110,14 @@ impl LifecycleState {
             for asset in &assets {
                 self.asset_owner.insert(asset.clone(), market.hash.clone());
             }
-            self.active.insert(market.hash.clone(), market.clone());
+            let revision = self.next_revision();
+            self.active.insert(
+                market.hash.clone(),
+                ActiveMarket {
+                    market: market.clone(),
+                    revision,
+                },
+            );
         }
     }
 
@@ -129,7 +156,7 @@ impl LifecycleState {
                 validate_market(&subscription)?;
                 let assets = canonical_assets(&subscription.assets);
                 if let Some(existing) = self.active.get(&market) {
-                    let existing_assets = canonical_assets(&existing.assets);
+                    let existing_assets = canonical_assets(&existing.market.assets);
                     ensure!(
                         existing_assets == assets,
                         "market {market} changed assets from {:?} to {:?}",
@@ -172,6 +199,12 @@ impl LifecycleState {
                 self.first_source.insert(key.clone(), source);
             }
             PlannedObservation::AdmitExisting { key } => {
+                if let LifecycleKey::NewMarket(market) = key {
+                    let revision = self.next_revision();
+                    if let Some(active) = self.active.get_mut(market) {
+                        active.revision = revision;
+                    }
+                }
                 self.first_source.insert(key.clone(), source);
             }
             PlannedObservation::Subscribe { key, market } => {
@@ -179,14 +212,22 @@ impl LifecycleState {
                 for asset in &assets {
                     self.asset_owner.insert(asset.clone(), market.hash.clone());
                 }
-                self.active.insert(market.hash.clone(), market.clone());
+                let revision = self.next_revision();
+                self.active.insert(
+                    market.hash.clone(),
+                    ActiveMarket {
+                        market: market.clone(),
+                        revision,
+                    },
+                );
                 self.first_source.insert(key.clone(), source);
             }
             PlannedObservation::Resolve { key, market } => {
                 if let Some(active_market) = self.active.remove(market) {
-                    for asset in active_market.assets {
+                    for asset in active_market.market.assets {
                         self.asset_owner.remove(&asset);
                     }
+                    self.next_revision();
                 }
                 self.first_source.insert(key.clone(), source);
             }
@@ -194,12 +235,75 @@ impl LifecycleState {
     }
 
     fn snapshot(&self) -> ActiveMarketSnapshot {
-        let mut markets: Vec<_> = self.active.values().cloned().collect();
+        let mut markets: Vec<_> = self
+            .active
+            .values()
+            .map(|active| active.market.clone())
+            .collect();
         markets.sort_unstable_by(|left, right| left.hash.cmp(&right.hash));
         ActiveMarketSnapshot {
+            revision: self.revision,
             active_count: self.active.len(),
             markets,
         }
+    }
+
+    fn next_revision(&mut self) -> u64 {
+        self.revision = self.revision.saturating_add(1);
+        self.revision
+    }
+
+    fn start_scan(&mut self, scan_id: u64, cold_start: bool) -> Result<()> {
+        ensure!(self.scan.is_none(), "full Gamma scan already active");
+        self.scan = Some(FullScanState {
+            id: scan_id,
+            start_revision: self.revision,
+            cold_start,
+            seen: std::collections::HashSet::new(),
+        });
+        Ok(())
+    }
+
+    fn scan_cold_start(&self, scan_id: u64) -> Result<bool> {
+        let scan = self.scan.as_ref().context("no full Gamma scan active")?;
+        ensure!(scan.id == scan_id, "stale Gamma scan page {scan_id}");
+        Ok(scan.cold_start)
+    }
+
+    fn mark_scan_seen(&mut self, scan_id: u64, market: &str) -> Result<()> {
+        let scan = self.scan.as_mut().context("no full Gamma scan active")?;
+        ensure!(scan.id == scan_id, "stale Gamma scan page {scan_id}");
+        scan.seen.insert(market.to_string());
+        Ok(())
+    }
+
+    fn finish_scan(&mut self, scan_id: u64) -> Result<(usize, usize)> {
+        let scan = self.scan.as_ref().context("no full Gamma scan active")?;
+        ensure!(scan.id == scan_id, "stale Gamma scan finish {scan_id}");
+        let unseen = self
+            .active
+            .values()
+            .filter(|active| !scan.seen.contains(&active.market.hash))
+            .count();
+        let changed_after_start = self
+            .active
+            .values()
+            .filter(|active| {
+                active.revision > scan.start_revision && !scan.seen.contains(&active.market.hash)
+            })
+            .count();
+        // Absence is not a terminal signal: filtering or a malformed Gamma row
+        // can omit a still-live market. Recent-closed reconciliation is the
+        // authoritative removal path, so a full scan only adds and confirms.
+        self.scan = None;
+        Ok((unseen, changed_after_start))
+    }
+
+    fn abort_scan(&mut self, scan_id: u64) -> Result<()> {
+        if self.scan.as_ref().is_some_and(|scan| scan.id == scan_id) {
+            self.scan = None;
+        }
+        Ok(())
     }
 }
 
@@ -272,7 +376,109 @@ impl LifecycleCoordinator {
                 }
                 Ok(())
             }
+            LifecycleRequest::ScanStart {
+                scan_id,
+                cold_start,
+                completion,
+            } => {
+                let result = self.state.start_scan(scan_id, cold_start);
+                complete_or_fail(completion, result)
+            }
+            LifecycleRequest::ScanPage {
+                scan_id,
+                markets,
+                completion,
+            } => {
+                let result = self.apply_scan_page(scan_id, markets).await;
+                complete_or_fail(completion, result)
+            }
+            LifecycleRequest::ScanFinish {
+                scan_id,
+                completion,
+            } => {
+                let result = self.apply_scan_finish(scan_id).await;
+                complete_or_fail(completion, result)
+            }
+            LifecycleRequest::ScanAbort {
+                scan_id,
+                completion,
+            } => complete_or_fail(completion, self.state.abort_scan(scan_id)),
         }
+    }
+
+    async fn apply_scan_page(
+        &mut self,
+        scan_id: u64,
+        markets: Vec<ScannedActiveMarket>,
+    ) -> Result<()> {
+        let cold_start = self.state.scan_cold_start(scan_id)?;
+        let mut cold_missing = Vec::new();
+        let mut warm_missing = Vec::new();
+        let mut warm_silent = Vec::new();
+        for scanned in markets {
+            validate_scanned_market(&scanned)?;
+            self.state.mark_scan_seen(scan_id, &scanned.market.hash)?;
+            if let Some(existing) = self.state.active.get(&scanned.market.hash) {
+                ensure!(
+                    canonical_assets(&existing.market.assets)
+                        == canonical_assets(&scanned.market.assets),
+                    "Gamma scan changed assets for {}",
+                    scanned.market.hash
+                );
+                continue;
+            }
+            if self
+                .state
+                .first_source
+                .contains_key(&LifecycleKey::MarketResolved(scanned.market.hash.clone()))
+            {
+                continue;
+            }
+            if cold_start {
+                cold_missing.push(scanned.market);
+            } else if let Some(observation) = scanned.observation {
+                warm_missing.push(observation);
+            } else {
+                warm_silent.push(scanned.market);
+            }
+        }
+        if !cold_missing.is_empty() {
+            let planned = self.state.plan_bootstrap(cold_missing)?;
+            self.pool
+                .lock()
+                .await
+                .subscribe_markets(planned.clone())
+                .await
+                .context("subscribe cold Gamma scan page")?;
+            self.state.commit_bootstrap(&planned);
+        }
+        for observation in warm_missing {
+            self.apply_observation(LifecycleSource::Gamma, observation)
+                .await?;
+        }
+        if !warm_silent.is_empty() {
+            let planned = self.state.plan_bootstrap(warm_silent)?;
+            self.pool
+                .lock()
+                .await
+                .subscribe_markets(planned.clone())
+                .await
+                .context("subscribe Gamma markets without source timestamps")?;
+            self.state.commit_bootstrap(&planned);
+        }
+        Ok(())
+    }
+
+    async fn apply_scan_finish(&mut self, scan_id: u64) -> Result<()> {
+        let (unseen, changed_after_start) = self.state.finish_scan(scan_id)?;
+        info!(
+            scan_id,
+            unseen,
+            changed_after_start,
+            active_markets = self.state.active.len(),
+            "full Gamma reconciliation applied"
+        );
+        Ok(())
     }
 
     async fn apply_bootstrap(&mut self, markets: Vec<Market>) -> Result<()> {
@@ -300,6 +506,21 @@ impl LifecycleCoordinator {
         source: LifecycleSource,
         observation: MarketLifecycleObservation,
     ) -> Result<()> {
+        if source == LifecycleSource::Gamma {
+            match observation.event.market_lifecycle() {
+                Some(MarketLifecycle::NewMarket { market, .. })
+                    if self.state.active.contains_key(&market) =>
+                {
+                    return Ok(());
+                }
+                Some(MarketLifecycle::MarketResolved { market })
+                    if !self.state.active.contains_key(&market) =>
+                {
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         let plan = self.state.plan_observation(&observation)?;
         match &plan {
             PlannedObservation::Drop => {
@@ -378,6 +599,35 @@ fn validate_market(market: &Market) -> Result<()> {
         "market {} assigns both outcomes to asset {}",
         market.hash,
         market.assets[0]
+    );
+    Ok(())
+}
+
+fn validate_scanned_market(scanned: &ScannedActiveMarket) -> Result<()> {
+    validate_market(&scanned.market)?;
+    let Some(observation) = &scanned.observation else {
+        return Ok(());
+    };
+    let MarketLifecycle::NewMarket {
+        market,
+        assets_ids,
+        outcomes,
+    } = observation
+        .event
+        .market_lifecycle()
+        .context("Gamma scan contains token-scoped event")?
+    else {
+        anyhow::bail!("Gamma active scan contains market_resolved event");
+    };
+    ensure!(
+        market == scanned.market.hash,
+        "Gamma scan condition mismatch"
+    );
+    let normalized = markets::binary_market_from_outcomes(market, &outcomes, &assets_ids)
+        .context("Gamma scan contains non-binary new_market")?;
+    ensure!(
+        canonical_assets(&normalized.assets) == canonical_assets(&scanned.market.assets),
+        "Gamma scan asset pair mismatch"
     );
     Ok(())
 }
@@ -575,6 +825,11 @@ mod tests {
             state.first_source.get(&LifecycleKey::NewMarket("m".into())),
             Some(&LifecycleSource::RedisStream)
         );
+
+        assert!(state
+            .plan_bootstrap(vec![market("m", "a", "b")])
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -619,5 +874,73 @@ mod tests {
         assert_eq!(coordinator.state.active.len(), 1);
         assert_eq!(snapshot.active_count, 2);
         assert_eq!(snapshot.markets.len(), 2);
+    }
+
+    #[test]
+    fn admitted_ws_observation_after_scan_start_advances_revision() {
+        let mut state = LifecycleState::default();
+        let planned = state.plan_bootstrap(vec![market("m", "a", "b")]).unwrap();
+        state.commit_bootstrap(&planned);
+        state.start_scan(7, false).unwrap();
+
+        let observation = new_market("m", ["a", "b"]);
+        let admitted = state.plan_observation(&observation).unwrap();
+        state.commit_observation(&admitted, LifecycleSource::WebSocket);
+        let (unseen, changed_after_start) = state.finish_scan(7).unwrap();
+
+        assert_eq!(unseen, 1);
+        assert_eq!(changed_after_start, 1);
+        assert!(state.active.contains_key("m"));
+    }
+
+    #[test]
+    fn aborted_scan_can_be_retried_without_removing_markets() {
+        let mut state = LifecycleState::default();
+        let planned = state.plan_bootstrap(vec![market("m", "a", "b")]).unwrap();
+        state.commit_bootstrap(&planned);
+        state.start_scan(1, true).unwrap();
+        state.abort_scan(1).unwrap();
+        state.start_scan(2, true).unwrap();
+        assert!(state.active.contains_key("m"));
+        assert_eq!(state.scan.as_ref().map(|scan| scan.id), Some(2));
+    }
+
+    #[tokio::test]
+    async fn unknown_gamma_resolution_is_dropped_without_dedup_state() {
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let pool = Arc::new(Mutex::new(Pool::new(2, event_tx)));
+        let (_websocket_tx, websocket_rx) = mpsc::channel(8);
+        let (_reconciliation_tx, reconciliation_rx) = mpsc::channel(8);
+        let mut coordinator = LifecycleCoordinator::new(pool, websocket_rx, reconciliation_rx);
+
+        coordinator
+            .apply_observation(LifecycleSource::Gamma, resolved("unknown"))
+            .await
+            .unwrap();
+
+        assert!(coordinator.state.first_source.is_empty());
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn gamma_new_market_does_not_replay_bootstrapped_condition() {
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let pool = Arc::new(Mutex::new(Pool::new(2, event_tx)));
+        let (_websocket_tx, websocket_rx) = mpsc::channel(8);
+        let (_reconciliation_tx, reconciliation_rx) = mpsc::channel(8);
+        let mut coordinator = LifecycleCoordinator::new(pool, websocket_rx, reconciliation_rx);
+        let planned = coordinator
+            .state
+            .plan_bootstrap(vec![market("m", "a", "b")])
+            .unwrap();
+        coordinator.state.commit_bootstrap(&planned);
+
+        coordinator
+            .apply_observation(LifecycleSource::Gamma, new_market("m", ["a", "b"]))
+            .await
+            .unwrap();
+
+        assert!(coordinator.state.first_source.is_empty());
+        assert!(event_rx.try_recv().is_err());
     }
 }
