@@ -32,16 +32,11 @@ pub trait EventSource: Send + Sync {
 #[derive(Clone)]
 pub struct ClickHouseSource {
     cfg: Config,
-    http: Client,
 }
 
 impl ClickHouseSource {
     pub fn new(cfg: Config) -> Result<Self> {
-        let http = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .context("build ClickHouse HTTP client")?;
-        Ok(Self { cfg, http })
+        Ok(Self { cfg })
     }
 
     fn query_hour(&self, aggregate: &str) -> Result<Option<DateTime<Utc>>> {
@@ -89,8 +84,11 @@ impl ClickHouseSource {
     }
 
     fn send(&self, query: &str, timeout: Duration) -> Result<Response> {
-        let response = self
-            .http
+        let http = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .context("build ClickHouse HTTP client")?;
+        let response = http
             .post(&self.cfg.clickhouse_url)
             .basic_auth(
                 &self.cfg.clickhouse_user,
@@ -186,9 +184,33 @@ fn read_limited(mut response: Take<Response>) -> std::io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn source_can_be_constructed_and_dropped_on_async_worker() {
+        let source = ClickHouseSource::new(Config {
+            clickhouse_url: "http://example.invalid:8123/".to_owned(),
+            clickhouse_user: "default".to_owned(),
+            clickhouse_password: String::new(),
+            clickhouse_database: "default".to_owned(),
+            clickhouse_table: "polymarket_orderbook_v3".to_owned(),
+            local_export_dir: PathBuf::from("/tmp/archive"),
+            export_once: true,
+            export_delay_minutes: 5,
+            export_lag_hours: 1,
+            loop_check_interval: Duration::from_secs(60),
+            query_max_retries: 1,
+            query_retry_delay: Duration::from_secs(1),
+            metadata_query_timeout: Duration::from_secs(1),
+            event_query_timeout: Duration::from_secs(1),
+        })
+        .unwrap();
+        tokio::task::yield_now().await;
+        drop(source);
+    }
 
     #[test]
     fn retry_is_bounded_and_recovers() {
