@@ -2,7 +2,7 @@ use std::io::{Read, Take};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use arrow_ipc::reader::StreamReader;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use reqwest::StatusCode;
@@ -10,16 +10,25 @@ use reqwest::blocking::{Client, Response};
 use tracing::warn;
 
 use crate::archive::Archive;
-use crate::config::Config;
+use crate::config::{Config, validate_identifier};
 use crate::event::{EventType, build_event_query, ensure_utc_hour};
 use crate::parquet_file::{StagedArtifact, write_arrow_batches};
 
 const MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
+const MAX_METADATA_BODY_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivePartition {
+    pub hour: DateTime<Utc>,
+    pub partition_id: String,
+}
 
 pub trait EventSource: Send + Sync {
     fn earliest_hour(&self) -> Result<Option<DateTime<Utc>>>;
     fn latest_received_hour(&self) -> Result<Option<DateTime<Utc>>>;
+    fn active_partitions(&self) -> Result<Vec<ActivePartition>>;
+    fn drop_partition(&self, partition: &ActivePartition) -> Result<()>;
     fn export_event(
         &self,
         archive: &dyn Archive,
@@ -44,7 +53,7 @@ impl ClickHouseSource {
             "SELECT toStartOfHour({aggregate}(timestamp_received)) FROM {} FORMAT TabSeparated",
             self.cfg.clickhouse_table
         );
-        let text = self.query_text_with_retry(&query)?;
+        let text = self.query_text_with_retry(&query, "ClickHouse hour query")?;
         let text = text.trim();
         if text.is_empty() || text.starts_with("1970") {
             return Ok(None);
@@ -56,11 +65,11 @@ impl ClickHouseSource {
         Ok(Some(hour))
     }
 
-    fn query_text_with_retry(&self, query: &str) -> Result<String> {
+    fn query_text_with_retry(&self, query: &str, operation: &str) -> Result<String> {
         retry(
             self.cfg.query_max_retries,
             self.cfg.query_retry_delay,
-            "ClickHouse metadata query",
+            operation,
             || {
                 let response = self.send(query, self.cfg.metadata_query_timeout)?;
                 read_response_text(response)
@@ -115,6 +124,21 @@ impl EventSource for ClickHouseSource {
         self.query_hour("max")
     }
 
+    fn active_partitions(&self) -> Result<Vec<ActivePartition>> {
+        let query = build_active_partitions_query(
+            &self.cfg.clickhouse_database,
+            &self.cfg.clickhouse_table,
+        )?;
+        let text = self.query_text_with_retry(&query, "ClickHouse active partition query")?;
+        parse_active_partitions(&text)
+    }
+
+    fn drop_partition(&self, partition: &ActivePartition) -> Result<()> {
+        let query = build_drop_partition_query(&self.cfg.clickhouse_table, partition)?;
+        self.query_text_with_retry(&query, "ClickHouse partition drop")?;
+        Ok(())
+    }
+
     fn export_event(
         &self,
         archive: &dyn Archive,
@@ -129,6 +153,67 @@ impl EventSource for ClickHouseSource {
             || self.export_event_once(archive, key, hour, event),
         )
     }
+}
+
+fn build_active_partitions_query(database: &str, table: &str) -> Result<String> {
+    validate_identifier("CLICKHOUSE_DATABASE", database)?;
+    validate_identifier("CLICKHOUSE_TABLE", table)?;
+    Ok(format!(
+        "SELECT partition, partition_id FROM system.parts \
+         WHERE active = 1 AND database = '{database}' AND table = '{table}' \
+         GROUP BY partition, partition_id ORDER BY partition FORMAT TabSeparated"
+    ))
+}
+
+fn parse_active_partitions(text: &str) -> Result<Vec<ActivePartition>> {
+    let mut partitions = Vec::new();
+    for line in text.lines() {
+        ensure!(!line.is_empty(), "empty ClickHouse partition row");
+        let (partition, partition_id) = line
+            .split_once('\t')
+            .with_context(|| format!("partition row has no tab separator: {line:?}"))?;
+        ensure!(
+            !partition_id.contains('\t'),
+            "partition row has extra columns: {line:?}"
+        );
+        let naive = NaiveDateTime::parse_from_str(partition, "%Y-%m-%d %H:%M:%S")
+            .with_context(|| format!("parse ClickHouse UTC partition {partition:?}"))?;
+        let hour = Utc.from_utc_datetime(&naive);
+        ensure!(
+            hour.format("%Y-%m-%d %H:%M:%S").to_string() == partition,
+            "ClickHouse partition is not a canonical UTC hour: {partition:?}"
+        );
+        validate_partition_identity(hour, partition_id)?;
+        partitions.push(ActivePartition {
+            hour,
+            partition_id: partition_id.to_owned(),
+        });
+    }
+    Ok(partitions)
+}
+
+fn validate_partition_identity(hour: DateTime<Utc>, partition_id: &str) -> Result<()> {
+    ensure_utc_hour(hour)?;
+    ensure!(
+        !partition_id.is_empty() && partition_id.bytes().all(|byte| byte.is_ascii_digit()),
+        "ClickHouse partition ID must contain decimal digits only: {partition_id:?}"
+    );
+    let timestamp =
+        u64::try_from(hour.timestamp()).context("partition hour predates Unix epoch")?;
+    ensure!(
+        partition_id == timestamp.to_string(),
+        "ClickHouse partition ID {partition_id:?} does not equal UTC hour Unix seconds {timestamp}"
+    );
+    Ok(())
+}
+
+fn build_drop_partition_query(table: &str, partition: &ActivePartition) -> Result<String> {
+    validate_identifier("CLICKHOUSE_TABLE", table)?;
+    validate_partition_identity(partition.hour, &partition.partition_id)?;
+    Ok(format!(
+        "ALTER TABLE {table} DROP PARTITION ID '{}'",
+        partition.partition_id
+    ))
 }
 
 fn retry<T>(
@@ -173,7 +258,7 @@ fn read_response_text(response: Response) -> Result<String> {
     if status != StatusCode::OK {
         return response_error(response).map(|_| unreachable!());
     }
-    read_limited(response.take(MAX_ERROR_BODY_BYTES)).context("read ClickHouse text response")
+    read_limited(response.take(MAX_METADATA_BODY_BYTES)).context("read ClickHouse text response")
 }
 
 fn read_limited(mut response: Take<Response>) -> std::io::Result<String> {
@@ -203,6 +288,7 @@ mod tests {
             export_once: true,
             export_delay_minutes: 5,
             export_lag_hours: 1,
+            clickhouse_retention_hours: 3,
             loop_check_interval: Duration::from_secs(60),
             query_max_retries: 1,
             query_retry_delay: Duration::from_secs(1),
@@ -236,5 +322,50 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("after 2 attempts"));
         assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn active_partition_query_is_scoped_to_validated_table() {
+        let query = build_active_partitions_query("market_data", "events_v3").unwrap();
+        assert!(query.contains("FROM system.parts"));
+        assert!(query.contains("active = 1"));
+        assert!(query.contains("database = 'market_data'"));
+        assert!(query.contains("table = 'events_v3'"));
+        assert!(query.contains("GROUP BY partition, partition_id"));
+        assert!(build_active_partitions_query("default; DROP", "events").is_err());
+        assert!(build_active_partitions_query("default", "events' OR 1=1").is_err());
+    }
+
+    #[test]
+    fn partition_rows_and_drop_queries_require_canonical_unix_hour_ids() {
+        let hour = Utc.with_ymd_and_hms(2026, 8, 14, 14, 0, 0).unwrap();
+        let partition_id = hour.timestamp().to_string();
+        let partitions =
+            parse_active_partitions(&format!("2026-08-14 14:00:00\t{partition_id}\n")).unwrap();
+        assert_eq!(
+            partitions,
+            [ActivePartition {
+                hour,
+                partition_id: partition_id.clone(),
+            }]
+        );
+        assert_eq!(
+            build_drop_partition_query("events_v3", &partitions[0]).unwrap(),
+            format!("ALTER TABLE events_v3 DROP PARTITION ID '{partition_id}'")
+        );
+
+        assert!(parse_active_partitions("2026-08-14 14:00:00\t123\n").is_err());
+        assert!(parse_active_partitions("2026-08-14 14:00:00\t1786716000x\n").is_err());
+        assert!(parse_active_partitions("2026-08-14 14:00:00\t01786716000\n").is_err());
+        assert!(parse_active_partitions("2026-08-14 14:00:01\t1786716001\n").is_err());
+        assert!(parse_active_partitions("2026-8-14 14:00:00\t1786716000\n").is_err());
+        assert!(parse_active_partitions("2026-08-14 14:00:00\t1786716000\textra\n").is_err());
+
+        let invalid = ActivePartition {
+            hour,
+            partition_id: "1786716000' OR 1=1".to_owned(),
+        };
+        assert!(build_drop_partition_query("events_v3", &invalid).is_err());
+        assert!(build_drop_partition_query("events; DROP", &partitions[0]).is_err());
     }
 }

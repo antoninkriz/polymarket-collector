@@ -10,6 +10,8 @@ pub const DEFAULT_EXPORT_LAG_HOURS: i64 = 1;
 pub const DEFAULT_LOOP_CHECK_INTERVAL_SECONDS: u64 = 60;
 pub const DEFAULT_QUERY_MAX_RETRIES: usize = 10;
 pub const DEFAULT_QUERY_RETRY_DELAY_SECONDS: u64 = 1;
+pub const DEFAULT_CLICKHOUSE_RETENTION_HOURS: u32 = 3;
+pub const MAX_CLICKHOUSE_RETENTION_HOURS: u32 = 24 * 365;
 
 #[derive(Clone, Eq, PartialEq)]
 pub enum ExportBackend {
@@ -52,6 +54,7 @@ pub struct Config {
     pub export_once: bool,
     pub export_delay_minutes: u32,
     pub export_lag_hours: i64,
+    pub clickhouse_retention_hours: u32,
     pub loop_check_interval: Duration,
     pub query_max_retries: usize,
     pub query_retry_delay: Duration,
@@ -86,6 +89,15 @@ impl Config {
         );
         let export_lag_hours = parse_or(&mut lookup, "EXPORT_LAG_HOURS", DEFAULT_EXPORT_LAG_HOURS)?;
         ensure!(export_lag_hours >= 1, "EXPORT_LAG_HOURS must be positive");
+        let clickhouse_retention_hours = parse_or(
+            &mut lookup,
+            "CLICKHOUSE_RETENTION_HOURS",
+            DEFAULT_CLICKHOUSE_RETENTION_HOURS,
+        )?;
+        ensure!(
+            clickhouse_retention_hours <= MAX_CLICKHOUSE_RETENTION_HOURS,
+            "CLICKHOUSE_RETENTION_HOURS must not exceed {MAX_CLICKHOUSE_RETENTION_HOURS}"
+        );
         let query_max_retries =
             parse_or(&mut lookup, "QUERY_MAX_RETRIES", DEFAULT_QUERY_MAX_RETRIES)?;
         ensure!(query_max_retries > 0, "QUERY_MAX_RETRIES must be positive");
@@ -131,6 +143,7 @@ impl Config {
             export_once: parse_bool(&mut lookup, "EXPORT_ONCE", false)?,
             export_delay_minutes,
             export_lag_hours,
+            clickhouse_retention_hours,
             loop_check_interval: Duration::from_secs(loop_check_interval_seconds),
             query_max_retries,
             query_retry_delay: Duration::from_secs(query_retry_delay_seconds),
@@ -285,6 +298,7 @@ mod tests {
         assert!(!defaults.export_once);
         assert_eq!(defaults.export_delay_minutes, 5);
         assert_eq!(defaults.export_lag_hours, 1);
+        assert_eq!(defaults.clickhouse_retention_hours, 3);
         assert_eq!(defaults.query_max_retries, 10);
 
         let overridden = config(&[
@@ -294,6 +308,7 @@ mod tests {
             ("CLICKHOUSE_TABLE", "events_v3"),
             ("LOCAL_EXPORT_DIR", "/tmp/archive"),
             ("EXPORT_ONCE", "yes"),
+            ("CLICKHOUSE_RETENTION_HOURS", "0"),
             ("QUERY_MAX_RETRIES", "3"),
         ])
         .unwrap();
@@ -307,6 +322,7 @@ mod tests {
             }
         );
         assert!(overridden.export_once);
+        assert_eq!(overridden.clickhouse_retention_hours, 0);
         assert_eq!(overridden.query_max_retries, 3);
     }
 
@@ -365,11 +381,13 @@ mod tests {
 
     #[test]
     fn unsafe_configuration_is_rejected() {
+        let excessive_retention = (MAX_CLICKHOUSE_RETENTION_HOURS + 1).to_string();
         assert!(config(&[("EXPORT_BACKEND", "unknown")]).is_err());
         assert!(config(&[("CLICKHOUSE_TABLE", "events; DROP TABLE events")]).is_err());
         assert!(config(&[("CLICKHOUSE_TABLE", "default.events")]).is_err());
         assert!(config(&[("CLICKHOUSE_DATABASE", "9default")]).is_err());
         assert!(config(&[("EXPORT_DELAY_MINUTES", "60")]).is_err());
+        assert!(config(&[("CLICKHOUSE_RETENTION_HOURS", excessive_retention.as_str(),)]).is_err());
         assert!(config(&[("QUERY_MAX_RETRIES", "0")]).is_err());
         assert!(config(&[("QUERY_RETRY_DELAY_SECONDS", "0")]).is_err());
         assert!(config(&[("LOOP_CHECK_INTERVAL_SECONDS", "0")]).is_err());
