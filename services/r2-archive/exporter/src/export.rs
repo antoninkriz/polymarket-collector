@@ -135,8 +135,7 @@ impl Exporter {
         let mut exported = 0_u64;
         let mut existing = 0_u64;
         while hour <= latest {
-            let completion_key = hour_to_completion_key(hour)?;
-            if self.archive.exists(&completion_key)? {
+            if self.archive_hour_complete(hour)? {
                 existing += 1;
             } else {
                 self.export_hour(hour)?;
@@ -185,8 +184,7 @@ impl Exporter {
             },
         };
         while next_hour <= latest {
-            let completion_key = hour_to_completion_key(next_hour)?;
-            if !self.archive.exists(&completion_key)? {
+            if !self.archive_hour_complete(next_hour)? {
                 self.export_hour(next_hour)?;
             }
             next_hour = add_hour(next_hour)?;
@@ -239,9 +237,9 @@ impl Exporter {
                 return;
             }
         };
-        let manifest_data = match self.archive.get(&completion_key, MAX_MANIFEST_BYTES) {
-            Ok(Some(data)) => data,
-            Ok(None) => {
+        match self.archive_hour_complete(partition.hour) {
+            Ok(true) => {}
+            Ok(false) => {
                 warn!(
                     %completion_key,
                     partition_id = %partition.partition_id,
@@ -254,41 +252,10 @@ impl Exporter {
                     %error,
                     %completion_key,
                     partition_id = %partition.partition_id,
-                    "retaining ClickHouse partition after manifest read failure",
+                    "retaining ClickHouse partition after archive completion validation failure",
                 );
                 return;
             }
-        };
-        let manifest = match serde_json::from_slice::<Manifest>(&manifest_data) {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                warn!(
-                    %error,
-                    %completion_key,
-                    partition_id = %partition.partition_id,
-                    "retaining ClickHouse partition with malformed manifest",
-                );
-                return;
-            }
-        };
-        if let Err(error) = validate_manifest(&manifest, partition.hour, &self.cfg.clickhouse_table)
-        {
-            warn!(
-                %error,
-                %completion_key,
-                partition_id = %partition.partition_id,
-                "retaining ClickHouse partition with mismatched manifest",
-            );
-            return;
-        }
-        if let Err(error) = self.validate_manifest_objects(&manifest) {
-            warn!(
-                %error,
-                %completion_key,
-                partition_id = %partition.partition_id,
-                "retaining ClickHouse partition with incomplete archive objects",
-            );
-            return;
         }
         if let Err(error) = self.source.drop_partition(partition) {
             warn!(
@@ -307,7 +274,19 @@ impl Exporter {
         );
     }
 
-    fn validate_manifest_objects(&self, manifest: &Manifest) -> Result<()> {
+    fn archive_hour_complete(&self, hour: DateTime<Utc>) -> Result<bool> {
+        let completion_key = hour_to_completion_key(hour)?;
+        let Some(manifest_data) = self
+            .archive
+            .get(&completion_key, MAX_MANIFEST_BYTES)
+            .with_context(|| format!("read archive manifest {completion_key}"))?
+        else {
+            return Ok(false);
+        };
+        let manifest = serde_json::from_slice::<Manifest>(&manifest_data)
+            .with_context(|| format!("parse archive manifest {completion_key}"))?;
+        validate_manifest(&manifest, hour, &self.cfg.clickhouse_table)
+            .with_context(|| format!("validate archive manifest {completion_key}"))?;
         for event in EventType::ALL {
             let file = manifest
                 .files
@@ -321,7 +300,7 @@ impl Exporter {
                 file.file
             );
         }
-        Ok(())
+        Ok(true)
     }
 
     fn latest_exportable_hour(&self, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
@@ -924,12 +903,11 @@ mod tests {
     #[test]
     fn backfill_checks_exact_manifests_and_preserves_next_hour() {
         let archive = Arc::new(MemoryArchive::new());
-        archive
-            .put_bytes(
-                &hour_to_completion_key(hour(10)).unwrap(),
-                br#"{"complete":true}"#,
-            )
-            .unwrap();
+        put_manifest_with_files(
+            archive.as_ref(),
+            hour(10),
+            &valid_manifest(hour(10), "polymarket_orderbook_v3"),
+        );
         let source = Arc::new(FakeSource::new(Some(hour(10)), Some(hour(13)), 1));
         let exporter = Exporter::new(
             test_config(archive.directory.path()),
@@ -957,6 +935,107 @@ mod tests {
                 .filter(|key| key.as_str() == "2026-08-13/10/manifest.json")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn completion_validation_is_exact_and_fail_closed() {
+        let archive = Arc::new(MemoryArchive::new());
+        let exporter = Exporter::new(
+            test_config(archive.directory.path()),
+            Arc::new(FakeSource::new(None, None, 0)),
+            archive.clone(),
+        );
+        let target_hour = hour(10);
+        let completion_key = hour_to_completion_key(target_hour).unwrap();
+
+        assert!(!exporter.archive_hour_complete(target_hour).unwrap());
+
+        archive.put_bytes(&completion_key, b"not json").unwrap();
+        let error = exporter.archive_hour_complete(target_hour).unwrap_err();
+        assert!(format!("{error:#}").contains("parse archive manifest"));
+
+        let mut wrong_hour = valid_manifest(target_hour, "polymarket_orderbook_v3");
+        wrong_hour.hour_utc = format_datetime(hour(11));
+        let wrong_table = valid_manifest(target_hour, "another_table");
+        let mut wrong_schema = valid_manifest(target_hour, "polymarket_orderbook_v3");
+        wrong_schema.files.get_mut("book").unwrap().columns = vec!["wrong".to_owned()];
+        let mut wrong_order = valid_manifest(target_hour, "polymarket_orderbook_v3");
+        wrong_order.files.get_mut("book").unwrap().order_by = vec!["sequence".to_owned()];
+        let mut wrong_stats = valid_manifest(target_hour, "polymarket_orderbook_v3");
+        wrong_stats.files.get_mut("book").unwrap().row_count = 1;
+        for (manifest, expected_error) in [
+            (wrong_hour, "hour_utc"),
+            (wrong_table, "source_table"),
+            (wrong_schema, "columns"),
+            (wrong_order, "order_by"),
+            (wrong_stats, "sequence bounds"),
+        ] {
+            put_manifest(archive.as_ref(), target_hour, &manifest);
+            let error = exporter.archive_hour_complete(target_hour).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected_error),
+                "unexpected validation error: {error:#}"
+            );
+        }
+
+        let valid = valid_manifest(target_hour, "polymarket_orderbook_v3");
+        put_manifest(archive.as_ref(), target_hour, &valid);
+        for (event, file) in &valid.files {
+            if event != EventType::Book.as_str() {
+                archive.put_bytes(&file.file, b"x").unwrap();
+            }
+        }
+        let error = exporter.archive_hour_complete(target_hour).unwrap_err();
+        assert!(format!("{error:#}").contains("book.parquet is missing"));
+
+        let book = valid.files.get(EventType::Book.as_str()).unwrap();
+        archive.put_bytes(&book.file, b"x").unwrap();
+        assert!(exporter.archive_hour_complete(target_hour).unwrap());
+
+        *archive.get_error.lock().unwrap() = Some("manifest GET failed".to_owned());
+        let error = exporter.archive_hour_complete(target_hour).unwrap_err();
+        assert!(format!("{error:#}").contains("manifest GET failed"));
+        *archive.get_error.lock().unwrap() = None;
+
+        *archive.exists_error.lock().unwrap() = Some("object HEAD failed".to_owned());
+        let error = exporter.archive_hour_complete(target_hour).unwrap_err();
+        assert!(format!("{error:#}").contains("object HEAD failed"));
+        *archive.exists_error.lock().unwrap() = None;
+
+        assert!(
+            archive
+                .get_limits
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|limit| *limit == MAX_MANIFEST_BYTES)
+        );
+    }
+
+    #[test]
+    fn invalid_completion_blocks_backfill_and_steady_state() {
+        let archive = Arc::new(MemoryArchive::new());
+        let completion_key = hour_to_completion_key(hour(10)).unwrap();
+        archive.put_bytes(&completion_key, b"not json").unwrap();
+        let source = Arc::new(FakeSource::new(Some(hour(10)), Some(hour(11)), 1));
+        let exporter = Exporter::new(
+            test_config(archive.directory.path()),
+            source,
+            archive.clone(),
+        );
+        let publication_count = archive.order.lock().unwrap().len();
+        let now = hour(12) + ChronoDuration::minutes(10);
+
+        let error = exporter.backfill(now).unwrap_err();
+        assert!(format!("{error:#}").contains("parse archive manifest"));
+        let error = exporter.steady_state_step(now, Some(hour(10))).unwrap_err();
+        assert!(format!("{error:#}").contains("parse archive manifest"));
+
+        assert_eq!(archive.order.lock().unwrap().len(), publication_count);
+        assert_eq!(
+            archive.objects.lock().unwrap()[&completion_key],
+            b"not json"
         );
     }
 
