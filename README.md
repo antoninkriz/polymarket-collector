@@ -293,14 +293,12 @@ RAM sizing assumes the ClickHouse writer is healthy. A writer outage leaves the 
 
 ## Thanks
 
-This project builds on the work and public datasets that made independent Polymarket market-data research practical:
+This project builds on the shoulders of giants from [PMXT](https://www.pmxt.dev/) and their original collector codebase. The schema of the data is an iterative improvement on their V2 schema, which is why you might see V3 references in the code. Public datasets like theirs and others make independent personal research of prediction markets possible.
 
+- [Original `pmxt-dev/polymarket-orderbook-collector` repository](https://github.com/pmxt-dev/polymarket-orderbook-collector)
 - [PMXT archive](https://archive.pmxt.dev/)
 - [AG6 Polymarket archive](https://polymarket-archive.ag6.ai/)
-- [Original](https://github.com/pmxt-dev/polymarket-orderbook-collector) `pmxt-dev/polymarket-orderbook-collector` [repository](https://github.com/pmxt-dev/polymarket-orderbook-collector)
-
-
 
 ## Vibecoded
 
-This project has been extensively ✨vibecoded✨ step by step with *some* human reviews in the process, with all its drawbacks and benefits . Please keep that in mind.
+This project has been extensively ✨vibecoded✨ step by step with *some* human reviews in the process, with all its drawbacks and benefits. Please keep that in mind.
