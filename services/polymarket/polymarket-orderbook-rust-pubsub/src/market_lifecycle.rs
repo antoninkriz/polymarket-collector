@@ -1,6 +1,6 @@
 //! Authoritative lifecycle state and pool mutation coordinator.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{ensure, Context, Result};
 use tokio::sync::{mpsc, oneshot};
@@ -14,28 +14,20 @@ use polymarket_orderbook_rust::markets::lifecycle::{
 };
 use polymarket_orderbook_rust::ws::pool::Pool;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum LifecycleKey {
-    NewMarket(String),
-    MarketResolved(String),
-}
-
 #[derive(Debug, Clone)]
 enum PlannedObservation {
     Drop,
     Duplicate,
     SuppressTerminal {
-        key: LifecycleKey,
+        market: String,
     },
     AdmitExisting {
-        key: LifecycleKey,
+        market: String,
     },
     Subscribe {
-        key: LifecycleKey,
         market: Market,
     },
     Resolve {
-        key: LifecycleKey,
         market: String,
         active_assets: Option<[String; 2]>,
     },
@@ -50,7 +42,8 @@ struct PlannedGammaPage {
 struct LifecycleState {
     active: HashMap<String, Market>,
     asset_owner: HashMap<String, String>,
-    first_source: HashMap<LifecycleKey, LifecycleSource>,
+    seen_new: HashSet<String>,
+    seen_resolved: HashSet<String>,
     revision: u64,
 }
 
@@ -60,10 +53,7 @@ impl LifecycleState {
         let mut batch_asset_owner = HashMap::<String, String>::new();
         let mut planned = Vec::new();
         for market in markets {
-            if self
-                .first_source
-                .contains_key(&LifecycleKey::MarketResolved(market.hash.clone()))
-            {
+            if self.seen_resolved.contains(&market.hash) {
                 continue;
             }
             validate_market(&market)?;
@@ -142,15 +132,11 @@ impl LifecycleState {
                 if market.is_empty() {
                     return Ok(PlannedObservation::Drop);
                 }
-                let key = LifecycleKey::NewMarket(market.clone());
-                if self.first_source.contains_key(&key) {
+                if self.seen_new.contains(&market) {
                     return Ok(PlannedObservation::Duplicate);
                 }
-                if self
-                    .first_source
-                    .contains_key(&LifecycleKey::MarketResolved(market.clone()))
-                {
-                    return Ok(PlannedObservation::SuppressTerminal { key });
+                if self.seen_resolved.contains(&market) {
+                    return Ok(PlannedObservation::SuppressTerminal { market });
                 }
                 let Some(subscription) =
                     markets::binary_market_from_outcomes(market.clone(), &outcomes, &assets_ids)
@@ -167,7 +153,7 @@ impl LifecycleState {
                         existing_assets,
                         assets
                     );
-                    return Ok(PlannedObservation::AdmitExisting { key });
+                    return Ok(PlannedObservation::AdmitExisting { market });
                 }
                 for asset in &assets {
                     if let Some(owner) = self.asset_owner.get(asset) {
@@ -178,7 +164,6 @@ impl LifecycleState {
                     }
                 }
                 Ok(PlannedObservation::Subscribe {
-                    key,
                     market: subscription,
                 })
             }
@@ -187,13 +172,11 @@ impl LifecycleState {
                     !market.is_empty(),
                     "market_resolved has an empty condition ID"
                 );
-                let key = LifecycleKey::MarketResolved(market.clone());
-                if self.first_source.contains_key(&key) {
+                if self.seen_resolved.contains(&market) {
                     return Ok(PlannedObservation::Duplicate);
                 }
                 let active_assets = self.active.get(&market).map(|active| active.assets.clone());
                 Ok(PlannedObservation::Resolve {
-                    key,
                     market,
                     active_assets,
                 })
@@ -224,10 +207,7 @@ impl LifecycleState {
                 );
                 continue;
             }
-            if self
-                .first_source
-                .contains_key(&LifecycleKey::MarketResolved(market.condition_id.clone()))
-            {
+            if self.seen_resolved.contains(&market.condition_id) {
                 continue;
             }
             let subscription = market
@@ -274,32 +254,32 @@ impl LifecycleState {
         })
     }
 
-    fn commit_observation(&mut self, plan: &PlannedObservation, source: LifecycleSource) {
+    fn commit_observation(&mut self, plan: &PlannedObservation) {
         match plan {
             PlannedObservation::Drop | PlannedObservation::Duplicate => {}
-            PlannedObservation::SuppressTerminal { key } => {
-                self.first_source.insert(key.clone(), source);
+            PlannedObservation::SuppressTerminal { market } => {
+                self.seen_new.insert(market.clone());
             }
-            PlannedObservation::AdmitExisting { key } => {
-                self.first_source.insert(key.clone(), source);
+            PlannedObservation::AdmitExisting { market } => {
+                self.seen_new.insert(market.clone());
             }
-            PlannedObservation::Subscribe { key, market } => {
+            PlannedObservation::Subscribe { market } => {
                 let assets = canonical_assets(&market.assets);
                 for asset in &assets {
                     self.asset_owner.insert(asset.clone(), market.hash.clone());
                 }
                 self.active.insert(market.hash.clone(), market.clone());
                 self.bump_revision();
-                self.first_source.insert(key.clone(), source);
+                self.seen_new.insert(market.hash.clone());
             }
-            PlannedObservation::Resolve { key, market, .. } => {
+            PlannedObservation::Resolve { market, .. } => {
                 if let Some(active_market) = self.active.remove(market) {
                     for asset in active_market.assets {
                         self.asset_owner.remove(&asset);
                     }
                     self.bump_revision();
                 }
-                self.first_source.insert(key.clone(), source);
+                self.seen_resolved.insert(market.clone());
             }
         }
     }
@@ -545,7 +525,7 @@ impl LifecycleCoordinator {
                 info!(source = ?source, market, "[MARKET_EVENT] market_resolved");
             }
         }
-        self.state.commit_observation(&plan, source);
+        self.state.commit_observation(&plan);
         Ok(())
     }
 }
@@ -658,6 +638,30 @@ mod tests {
         }
     }
 
+    async fn assert_lifecycle_sources_deduplicate(first: LifecycleSource, second: LifecycleSource) {
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let pool = Pool::new(2, event_tx);
+        let (_websocket_tx, websocket_rx) = mpsc::channel(8);
+        let (_reconciliation_tx, reconciliation_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mut coordinator =
+            LifecycleCoordinator::new(pool, websocket_rx, reconciliation_rx, shutdown_rx);
+        let observation = new_market("m", ["a", "b"]);
+
+        coordinator
+            .apply_observation(first, observation.clone())
+            .await
+            .unwrap();
+        coordinator
+            .apply_observation(second, observation)
+            .await
+            .unwrap();
+
+        assert!(coordinator.state.seen_new.contains("m"));
+        assert!(event_rx.try_recv().is_ok());
+        assert!(event_rx.try_recv().is_err());
+    }
+
     #[test]
     fn bootstrap_seeds_state_without_an_export_action() {
         let mut state = LifecycleState::default();
@@ -666,7 +670,8 @@ mod tests {
         state.commit_bootstrap(&planned);
         assert_eq!(state.active.len(), 1);
         assert_eq!(state.asset_owner.len(), 2);
-        assert!(state.first_source.is_empty());
+        assert!(state.seen_new.is_empty());
+        assert!(state.seen_resolved.is_empty());
 
         let observation = new_market("m", ["a", "b"]);
         let first_observation = state.plan_observation(&observation).unwrap();
@@ -674,42 +679,30 @@ mod tests {
             first_observation,
             PlannedObservation::AdmitExisting { .. }
         ));
-        state.commit_observation(&first_observation, LifecycleSource::WebSocket);
-        assert_eq!(
-            state.first_source.get(&LifecycleKey::NewMarket("m".into())),
-            Some(&LifecycleSource::WebSocket)
-        );
+        state.commit_observation(&first_observation);
+        assert!(state.seen_new.contains("m"));
     }
 
     #[test]
-    fn duplicate_ws_and_gamma_inputs_keep_first_source() {
+    fn duplicate_observations_are_deduplicated() {
         let mut state = LifecycleState::default();
         let observation = new_market("m", ["a", "b"]);
         let first = state.plan_observation(&observation).unwrap();
         assert!(matches!(first, PlannedObservation::Subscribe { .. }));
-        state.commit_observation(&first, LifecycleSource::WebSocket);
+        state.commit_observation(&first);
 
         let duplicate = state.plan_observation(&observation).unwrap();
         assert!(matches!(duplicate, PlannedObservation::Duplicate));
-        state.commit_observation(&duplicate, LifecycleSource::Gamma);
-        assert_eq!(
-            state.first_source.get(&LifecycleKey::NewMarket("m".into())),
-            Some(&LifecycleSource::WebSocket)
-        );
+        state.commit_observation(&duplicate);
+        assert!(state.seen_new.contains("m"));
     }
 
-    #[test]
-    fn gamma_can_win_source_precedence() {
-        let mut state = LifecycleState::default();
-        let observation = new_market("m", ["a", "b"]);
-        let first = state.plan_observation(&observation).unwrap();
-        state.commit_observation(&first, LifecycleSource::Gamma);
-        let duplicate = state.plan_observation(&observation).unwrap();
-        state.commit_observation(&duplicate, LifecycleSource::WebSocket);
-        assert_eq!(
-            state.first_source.get(&LifecycleKey::NewMarket("m".into())),
-            Some(&LifecycleSource::Gamma)
-        );
+    #[tokio::test]
+    async fn websocket_and_gamma_observations_deduplicate_in_either_order() {
+        assert_lifecycle_sources_deduplicate(LifecycleSource::WebSocket, LifecycleSource::Gamma)
+            .await;
+        assert_lifecycle_sources_deduplicate(LifecycleSource::Gamma, LifecycleSource::WebSocket)
+            .await;
     }
 
     #[test]
@@ -760,8 +753,9 @@ mod tests {
 
         let dropped = state.plan_observation(&incomplete).unwrap();
         assert!(matches!(dropped, PlannedObservation::Drop));
-        state.commit_observation(&dropped, LifecycleSource::Gamma);
-        assert!(state.first_source.is_empty());
+        state.commit_observation(&dropped);
+        assert!(state.seen_new.is_empty());
+        assert!(state.seen_resolved.is_empty());
 
         assert!(matches!(
             state
@@ -786,19 +780,14 @@ mod tests {
                 ..
             } if assets == &["a", "b"]
         ));
-        state.commit_observation(&resolution, LifecycleSource::WebSocket);
+        state.commit_observation(&resolution);
         assert!(state.active.is_empty());
         assert!(state.asset_owner.is_empty());
 
         let duplicate = state.plan_observation(&observation).unwrap();
         assert!(matches!(duplicate, PlannedObservation::Duplicate));
-        state.commit_observation(&duplicate, LifecycleSource::Gamma);
-        assert_eq!(
-            state
-                .first_source
-                .get(&LifecycleKey::MarketResolved("m".into())),
-            Some(&LifecycleSource::WebSocket)
-        );
+        state.commit_observation(&duplicate);
+        assert!(state.seen_resolved.contains("m"));
     }
 
     #[test]
@@ -806,7 +795,7 @@ mod tests {
         let mut state = LifecycleState::default();
         let resolution = resolved("m");
         let planned_resolution = state.plan_observation(&resolution).unwrap();
-        state.commit_observation(&planned_resolution, LifecycleSource::WebSocket);
+        state.commit_observation(&planned_resolution);
 
         let late_new_market = new_market("m", ["a", "b"]);
         let suppressed = state.plan_observation(&late_new_market).unwrap();
@@ -814,14 +803,12 @@ mod tests {
             suppressed,
             PlannedObservation::SuppressTerminal { .. }
         ));
-        state.commit_observation(&suppressed, LifecycleSource::Gamma);
+        state.commit_observation(&suppressed);
 
         assert!(state.active.is_empty());
         assert!(state.asset_owner.is_empty());
-        assert_eq!(
-            state.first_source.get(&LifecycleKey::NewMarket("m".into())),
-            Some(&LifecycleSource::Gamma)
-        );
+        assert!(state.seen_new.contains("m"));
+        assert!(state.seen_resolved.contains("m"));
 
         assert!(state
             .plan_bootstrap(vec![market("m", "a", "b")])
@@ -866,9 +853,7 @@ mod tests {
 
         let resolution = resolved("a");
         let plan = coordinator.state.plan_observation(&resolution).unwrap();
-        coordinator
-            .state
-            .commit_observation(&plan, LifecycleSource::WebSocket);
+        coordinator.state.commit_observation(&plan);
         assert_eq!(coordinator.state.active.len(), 1);
         assert_eq!(snapshot.markets.len(), 2);
     }
@@ -923,7 +908,7 @@ mod tests {
 
         let observation = new_market("m", ["a", "b"]);
         let admitted = state.plan_observation(&observation).unwrap();
-        state.commit_observation(&admitted, LifecycleSource::WebSocket);
+        state.commit_observation(&admitted);
 
         assert_eq!(state.revision, revision);
         assert!(state.active.contains_key("m"));
@@ -992,10 +977,7 @@ mod tests {
     #[test]
     fn gamma_page_does_not_reactivate_resolved_market() {
         let mut state = LifecycleState::default();
-        state.first_source.insert(
-            LifecycleKey::MarketResolved("terminal".into()),
-            LifecycleSource::WebSocket,
-        );
+        state.seen_resolved.insert("terminal".into());
 
         let plan = state
             .plan_gamma_page(vec![gamma_market("terminal")], false)
@@ -1019,7 +1001,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(coordinator.state.first_source.is_empty());
+        assert!(coordinator.state.seen_new.is_empty());
+        assert!(coordinator.state.seen_resolved.is_empty());
         assert!(event_rx.try_recv().is_err());
     }
 
@@ -1043,7 +1026,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(coordinator.state.first_source.is_empty());
+        assert!(coordinator.state.seen_new.is_empty());
+        assert!(coordinator.state.seen_resolved.is_empty());
         assert!(event_rx.try_recv().is_err());
     }
 }
