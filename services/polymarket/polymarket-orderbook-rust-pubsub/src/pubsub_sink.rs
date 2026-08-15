@@ -29,10 +29,19 @@ const FENCED_APPEND_SCRIPT: &str = r#"
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then
     return redis.error_reply('PUBLISHER_LEASE_LOST')
 end
-for i = 2, #ARGV do
-    redis.call('XADD', KEYS[2], '*', 'payload', ARGV[i])
+local record_arg_count = #ARGV - 1
+if record_arg_count % 3 ~= 0 then
+    return redis.error_reply('INVALID_FENCED_APPEND_ARGUMENTS')
 end
-return #ARGV - 1
+for i = 2, #ARGV, 3 do
+    redis.call(
+        'XADD', KEYS[2], '*',
+        'timestamp_received', ARGV[i],
+        'sequence', ARGV[i + 1],
+        'data', ARGV[i + 2]
+    )
+end
+return record_arg_count / 3
 "#;
 
 pub struct PubSubSink {
@@ -106,9 +115,9 @@ impl PubSubSink {
             return Ok(());
         }
         let batch_size = batch.len();
-        let payloads: Vec<String> = batch
+        let event_json: Vec<String> = batch
             .iter()
-            .map(serde_json::to_string)
+            .map(|record| serde_json::to_string(&record.event))
             .collect::<std::result::Result<_, _>>()
             .context("serialize v3 stream batch")?;
 
@@ -120,8 +129,11 @@ impl PubSubSink {
                 .key(&self.cfg.publisher_lease_key)
                 .key(&self.cfg.stream)
                 .arg(&self.cfg.publisher_lease_token);
-            for payload in &payloads {
-                invocation.arg(payload);
+            for (record, data) in batch.iter().zip(&event_json) {
+                invocation
+                    .arg(record.timestamp_received_ns)
+                    .arg(record.sequence)
+                    .arg(data);
             }
             let result: redis::RedisResult<u64> = invocation.invoke_async(&mut self.conn).await;
             match result {
@@ -147,7 +159,7 @@ impl PubSubSink {
                 }
             }
         }
-        self.total_published += payloads.len() as u64;
+        self.total_published += batch_size as u64;
         batch.clear();
         Ok(())
     }
