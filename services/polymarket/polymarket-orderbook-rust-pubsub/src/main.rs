@@ -116,12 +116,7 @@ async fn main() -> Result<()> {
     let (mut cached_markets, cache_fetched_at) = load_restart_cache(&cfg).await;
     let cold_start = cached_markets.is_empty();
     if !cached_markets.is_empty() {
-        match gamma_reconcile::prioritize_restart_markets(
-            &gamma_client,
-            &mut cached_markets,
-            Utc::now(),
-        )
-        .await
+        match gamma_reconcile::prioritize_restart_markets(&gamma_client, &mut cached_markets).await
         {
             Ok(prioritized) => info!(prioritized, "prioritized recent restart-cache markets"),
             Err(error) => warn!(%error, "could not prioritize restart-cache markets"),

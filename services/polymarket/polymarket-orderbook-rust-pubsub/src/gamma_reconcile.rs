@@ -23,7 +23,7 @@ const NEW_MARKET_INTERVAL: Duration = Duration::from_secs(10);
 const CLOSED_MARKET_INTERVAL: Duration = Duration::from_secs(30);
 const CACHE_INTERVAL: Duration = Duration::from_secs(60);
 const POLL_OVERLAP: TimeDelta = TimeDelta::minutes(2);
-const RESTART_PRIORITY_WINDOW: TimeDelta = TimeDelta::hours(24);
+const RESTART_PRIORITY_PAGES: usize = 20;
 
 #[derive(Debug, Clone, Copy)]
 pub enum CacheSaveTrigger {
@@ -64,20 +64,22 @@ impl ReconciliationStats {
     }
 }
 
-/// Move recently started active markets to the front of a restart cache.
+/// Move recently created active markets to the front of a restart cache.
 ///
 /// The cache remains authoritative for the complete universe; Gamma is used
-/// only to assign subscription priority. Failure therefore never discards a
-/// cached market or blocks the later full reconciliation scan.
+/// only to assign subscription priority. The scan is deliberately bounded so
+/// a valid cache always begins subscribing within a few seconds. Failure never
+/// discards a cached market or blocks the later full reconciliation scan.
 pub async fn prioritize_restart_markets(
     client: &GammaClient,
     markets: &mut [Market],
-    now: DateTime<Utc>,
 ) -> Result<usize> {
-    let cutoff = (now - RESTART_PRIORITY_WINDOW).timestamp_millis();
-    let mut scan = client.active_since_scan(cutoff);
+    let mut scan = client.full_active_scan();
     let mut priorities = Vec::new();
-    while let Some(page) = client.next_keyset_page(&mut scan).await? {
+    for _ in 0..RESTART_PRIORITY_PAGES {
+        let Some(page) = client.next_keyset_page(&mut scan).await? else {
+            break;
+        };
         priorities.extend(page.into_iter().map(|market| market.condition_id));
     }
     Ok(reorder_cached_markets(markets, &priorities))

@@ -7,7 +7,7 @@
 //! merged correctly. V3 chooses correctness over seamless failover. After a
 //! reconnect, fresh `book` snapshots replace the full local state.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -301,7 +301,7 @@ impl Pool {
             "subscribing markets on authoritative connections",
         );
 
-        let mut pending: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut pending: BTreeMap<usize, Vec<String>> = BTreeMap::new();
         let mut assigned_routes = Vec::with_capacity(new_markets.len() * 2);
         for market in new_markets {
             let conn_index = match self.find_conn_with_capacity(2, &pending) {
@@ -436,7 +436,7 @@ impl Pool {
     fn find_conn_with_capacity(
         &self,
         required: usize,
-        pending: &HashMap<usize, Vec<String>>,
+        pending: &BTreeMap<usize, Vec<String>>,
     ) -> Option<usize> {
         self.connections
             .iter()
