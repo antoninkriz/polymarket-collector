@@ -54,7 +54,7 @@ struct FullScanState {
 impl LifecycleState {
     fn plan_bootstrap(&self, markets: Vec<Market>) -> Result<Vec<Market>> {
         let mut batch = HashMap::<String, [String; 2]>::new();
-        let mut asset_owner = self.asset_owner.clone();
+        let mut batch_asset_owner = HashMap::<String, String>::new();
         let mut planned = Vec::new();
         for market in markets {
             if self
@@ -87,16 +87,21 @@ impl LifecycleState {
                 continue;
             }
             for asset in &assets {
-                if let Some(owner) = asset_owner.get(asset) {
+                if let Some(owner) = self.asset_owner.get(asset) {
                     ensure!(
                         owner == &market.hash,
                         "asset {asset} is already owned by market {owner}, cannot assign it to {}",
                         market.hash
                     );
                 }
-            }
-            for asset in &assets {
-                asset_owner.insert(asset.clone(), market.hash.clone());
+                if let Some(owner) = batch_asset_owner.get(asset) {
+                    ensure!(
+                        owner == &market.hash,
+                        "asset {asset} is already owned by market {owner}, cannot assign it to {}",
+                        market.hash
+                    );
+                }
+                batch_asset_owner.insert(asset.clone(), market.hash.clone());
             }
             batch.insert(market.hash.clone(), assets);
             planned.push(market);
@@ -755,6 +760,17 @@ mod tests {
             .plan_observation(&new_market("second", ["a", "c"]))
             .unwrap_err()
             .to_string();
+        assert!(error.contains("already owned by market first"), "{error}");
+    }
+
+    #[test]
+    fn bootstrap_rejects_an_asset_shared_within_one_batch() {
+        let state = LifecycleState::default();
+        let error = state
+            .plan_bootstrap(vec![market("first", "a", "b"), market("second", "a", "c")])
+            .unwrap_err()
+            .to_string();
+
         assert!(error.contains("already owned by market first"), "{error}");
     }
 

@@ -33,6 +33,12 @@ use polymarket_orderbook_rust_pubsub::market_lifecycle::LifecycleCoordinator;
 use polymarket_orderbook_rust_pubsub::pubsub_sink::{PubSubSink, PubSubSinkConfig};
 use polymarket_orderbook_rust_pubsub::sequence_watermark::clickhouse_generation_floor;
 
+const CACHE_BOOTSTRAP_BATCH_SIZE: usize = 100;
+// A valid restart cache is much faster than a full Gamma scan, but opening the
+// entire 1,000+ socket universe at once leaves some upstream sessions silent.
+// Recent markets remain first while the long tail is admitted at a steady rate.
+const CACHE_BOOTSTRAP_BATCH_INTERVAL: Duration = Duration::from_millis(100);
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
@@ -122,7 +128,7 @@ async fn main() -> Result<()> {
             Err(error) => warn!(%error, "could not prioritize restart-cache markets"),
         }
         let market_count = cached_markets.len();
-        apply_bootstrap(&reconciliation_tx, cached_markets).await?;
+        apply_bootstrap_batched(&reconciliation_tx, cached_markets).await?;
         if market_count > 0 {
             info!(
                 markets = pool.lock().await.subscribed_market_count(),
@@ -316,6 +322,21 @@ async fn apply_bootstrap(
         .await
         .context("lifecycle coordinator dropped bootstrap completion")?
         .map_err(anyhow::Error::msg)
+}
+
+async fn apply_bootstrap_batched(
+    lifecycle_tx: &mpsc::Sender<LifecycleRequest>,
+    markets: Vec<Market>,
+) -> Result<()> {
+    let mut markets = markets.into_iter().peekable();
+    while markets.peek().is_some() {
+        let batch = markets.by_ref().take(CACHE_BOOTSTRAP_BATCH_SIZE).collect();
+        apply_bootstrap(lifecycle_tx, batch).await?;
+        if markets.peek().is_some() {
+            tokio::time::sleep(CACHE_BOOTSTRAP_BATCH_INTERVAL).await;
+        }
+    }
+    Ok(())
 }
 
 fn init_tracing() {
