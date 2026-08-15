@@ -171,12 +171,15 @@ CONTAINER_RUNTIME=podman ./run_local.sh
 CONTAINER_RUNTIME=docker ./run_local.sh
 ```
 
-| Command                 | Action                                          |
-| ----------------------- | ----------------------------------------------- |
-| `./run_local.sh`        | Build and start the entire local pipeline.      |
-| `./run_local.sh logs`   | Follow publisher, writer, and exporter logs.    |
+| Command | Action |
+| --- | --- |
+| `./run_local.sh` | Build and start the stack without recreating unchanged services. |
+| `./run_local.sh redeploy` | Rebuild and recreate every application service. |
+| `./run_local.sh logs` | Follow publisher, writer, and exporter logs. |
 | `./run_local.sh status` | Show infrastructure and application containers. |
-| `./run_local.sh down`   | Stop everything while retaining collected data. |
+| `./run_local.sh down` | Stop everything while retaining collected data. |
+
+After changing source code, use `./run_local.sh redeploy`, especially with Podman Compose, which may build a new image without replacing an existing container.
 
 Redis, ClickHouse, and Parquet data remain under `.data`. Completed files appear in `.data/parquet/YYYY-MM-DD/HH/`. An hour becomes exportable only after it is complete and the following receive-time hour has reached ClickHouse, so the first archive can take a little over one hour to appear.
 

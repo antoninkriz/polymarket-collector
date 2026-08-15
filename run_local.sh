@@ -22,16 +22,18 @@ LOCAL_EXPORT_HOST_DIR="$REPOSITORY_DIR/.data/parquet"
 
 usage() {
     cat <<'EOF'
-Usage: ./run_local.sh [up|logs|status|down]
+Usage: ./run_local.sh [up|redeploy|logs|status|down]
 
-  up      Build and start the complete local collection and export pipeline.
-  logs    Follow application logs.
-  status  Show infrastructure and application container status.
-  down    Stop the local stack without deleting collected data.
+  up        Build and start the stack without recreating unchanged services.
+  redeploy  Rebuild and recreate every application service.
+  logs      Follow application logs.
+  status    Show infrastructure and application container status.
+  down      Stop the local stack without deleting collected data.
 
 The default action is "up". Parquet files are written under .data/parquet.
 Docker Compose and Podman Compose are both supported. Set CONTAINER_RUNTIME to
-"docker" or "podman" to override automatic selection.
+"docker" or "podman" to override automatic selection. After changing source
+code, use "redeploy", especially with Podman Compose.
 EOF
 }
 
@@ -134,6 +136,8 @@ wait_for_service() {
 }
 
 start_stack() {
+    local force_recreate=${1:-false}
+
     "${INFRA_COMPOSE[@]}" up -d obdata-redis obdata-clickhouse
     wait_for_service Redis "${CONTAINER_COMMAND[@]}" exec \
         obdata-redis redis-cli ping
@@ -143,10 +147,14 @@ start_stack() {
         obdata-clickhouse sh -ec \
         'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --query "SELECT 1"'
 
-    # podman-compose does not consistently replace containers after rebuilding
-    # their images, so make the deployment of freshly built code explicit.
-    "${LOCAL_COMPOSE[@]}" up -d --build --force-recreate --remove-orphans \
-        "${APPLICATION_SERVICES[@]}"
+    local application_up=(up -d --build)
+    if [[ $force_recreate == true ]]; then
+        # podman-compose does not consistently replace containers after rebuilding
+        # their images, so redeployment makes replacement explicit.
+        application_up+=(--force-recreate)
+    fi
+    application_up+=(--remove-orphans "${APPLICATION_SERVICES[@]}")
+    "${LOCAL_COMPOSE[@]}" "${application_up[@]}"
 
     cat <<EOF
 
@@ -158,6 +166,7 @@ ClickHouse. Depending on when collection starts, the first files can therefore
 take a little over one hour to appear.
 
 Follow logs with: ./run_local.sh logs
+Redeploy code with: ./run_local.sh redeploy
 Stop services with: ./run_local.sh down
 EOF
 }
@@ -167,7 +176,12 @@ case "$action" in
     up)
         select_runtime
         ensure_environment
-        start_stack
+        start_stack false
+        ;;
+    redeploy)
+        select_runtime
+        ensure_environment
+        start_stack true
         ;;
     logs)
         select_runtime
