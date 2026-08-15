@@ -123,6 +123,7 @@ Parquet
 `[polymarket-orderbook-rust-from-pubsub](services/polymarket/polymarket-orderbook-rust-from-pubsub)`
 
 - Batches Redis records into `polymarket_orderbook_v3`.
+- Uses one bounded actor for Redis reads, ClickHouse commits, and Redis acknowledgements; there are no in-process handoff queues.
 - Stores only receive time, collector sequence, and normalized JSON in hourly partitions.
 - Collapses delivery retries by `sequence`; it never deduplicates by payload.
 - Keeps ClickHouse as a short queryable export window. Validated archived partitions expire after three hours by default, while the newest is retained for sequence recovery.
@@ -246,7 +247,7 @@ The most useful signals are:
 | ---------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | Publisher  | `[QUEUE-STATS]` reports low queue depths, route health, recovery latency, and current Gamma/cache ages.          | Queue high-water repeatedly approaches capacity, Gamma ages keep growing, or `assets_down` remains elevated. |
 | Reconnects | `[CONNECTION-DATA-GAP]` and `[CONN-GAP]` are followed by asset recoveries in `[QUEUE-STATS]`.                    | Recovery latency grows, connections stay down, or gaps cluster continuously.                                 |
-| Writer     | `[POLYMARKET-FROM-PUBSUB-STATS]` shows low queue depth, zero parse failures, and advancing acknowledgement counts. | Pending work grows from minute to minute or ClickHouse retries persist.                                      |
+| Writer     | `[POLYMARKET-FROM-PUBSUB-STATS]` shows a bounded batch, zero parse failures, and advancing read, commit, and acknowledgement counts. | Redis lag grows from minute to minute or ClickHouse retries persist.                                         |
 | Redis      | Stream consumer lag and `used_memory` remain bounded.                                                           | The writer is unavailable and the stream grows; current traffic can consume many GiB per hour.               |
 | Exporter   | One `completed receive-time hour` per hour, followed by safe partition cleanup.                                 | Export retries continue, no new manifest appears, or cleanup repeatedly retains a supposedly complete hour.  |
 

@@ -82,6 +82,7 @@ services:
       - path: .env
         required: false
     restart: unless-stopped
+    stop_grace_period: 20s
     logging: *default-logging
     networks:
       - obdata
@@ -107,8 +108,6 @@ services:
       CLICKHOUSE_TABLE: polymarket_orderbook_v3
       FLUSH_BATCH_SIZE: "5000"
       FLUSH_INTERVAL_MS: "500"
-      QUEUE_SIZE: "50000"
-      ACK_QUEUE_SIZE: "32"
       RUST_LOG: info,polymarket_orderbook_rust_from_pubsub=info,polymarket_orderbook_rust=info
 
   obdata-polymarket-r2-archive-exporter:

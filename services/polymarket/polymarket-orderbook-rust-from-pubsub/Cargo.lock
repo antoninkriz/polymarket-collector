@@ -1021,6 +1021,7 @@ dependencies = [
  "dotenvy",
  "polymarket-orderbook-rust",
  "redis",
+ "reqwest",
  "serde_json",
  "tokio",
  "tracing",

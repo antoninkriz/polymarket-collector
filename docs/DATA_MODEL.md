@@ -105,16 +105,14 @@ Only retries of the same collector record are collapsed. They carry the same `se
 
 Payload-based deduplication is intentionally forbidden for market-data events. `transaction_hash`, market, asset, timestamp, price, size, side, and fee do not form a unique fill identity: Polygon can settle multiple fills in one transaction, and the feed may legitimately deliver identical-looking observations. A repeated source observation therefore receives a new sequence and remains in the archive. Lifecycle state is the exception: the central controller admits each market transition once.
 
-All internal queues are bounded and backpressured:
+The publisher's internal queues are bounded and backpressured:
 
 | Queue | Capacity |
 |---|---:|
-| Publisher events | 250,000 records |
+| Publisher events | 1,000,000 records |
 | WebSocket and reconciliation lifecycle inputs | 8,192 observations each |
-| ClickHouse writer input | 50,000 records |
-| ClickHouse acknowledgement channel | 32 batches |
 
-Services sample depths each second and log 60-second high-water marks. Redis is the durable buffer; the in-process queues are deliberately not sized as a second database.
+The ClickHouse writer has no in-process handoff queues. One actor owns at most one 5,000-record batch, retains its Redis delivery IDs until ClickHouse commits, and acknowledges them directly with `XACKDEL`. While ClickHouse is unavailable it stops reading rather than accumulating a second volatile backlog; unread records remain durable in Redis. `EVENT_CONSUMER_GROUP` and `EVENT_CONSUMER_NAME` must remain stable across restarts; changing either requires explicitly migrating or claiming pending entries and cleaning up the old group when applicable. Services log 60-second high-water marks and counters for their bounded state.
 
 ## Archive and replay
 

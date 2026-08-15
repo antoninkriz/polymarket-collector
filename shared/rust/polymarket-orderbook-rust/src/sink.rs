@@ -1,21 +1,20 @@
 //! Compact Polymarket v3 ClickHouse sink.
 //!
-//! The sink is a single actor that owns its buffer and HTTP client. It writes
-//! the three-column raw event log, retries failed inserts without dropping the
-//! batch, and returns Redis delivery IDs only after ClickHouse commits.
+//! The sink owns the ClickHouse HTTP client and writes complete caller-owned
+//! batches to the three-column raw event log. Failed inserts retry the same
+//! serialized body so callers can retain delivery ownership until commit.
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Serialize;
-use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use crate::record::EventRecord;
 
 /// One durable Redis Stream delivery awaiting a ClickHouse commit.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SinkItem {
     pub record: EventRecord,
     pub delivery_id: String,
@@ -27,14 +26,11 @@ pub struct SinkConfig {
     pub password: String,
     pub database: String,
     pub table: String,
-    pub batch_size: usize,
-    pub flush_interval: Duration,
 }
 
 pub struct Sink {
     cfg: SinkConfig,
     http: Client,
-    buffer: Vec<SinkItem>,
     total_flushed: u64,
     total_failures: u64,
 }
@@ -50,7 +46,6 @@ impl Sink {
         let sink = Self {
             cfg,
             http,
-            buffer: Vec::new(),
             total_flushed: 0,
             total_failures: 0,
         };
@@ -61,66 +56,18 @@ impl Sink {
             url = %sink.cfg.url,
             db = %sink.cfg.database,
             table = %sink.cfg.table,
-            batch_size = sink.cfg.batch_size,
-            flush_ms = sink.cfg.flush_interval.as_millis() as u64,
             "ClickHouse sink connected",
         );
         Ok(sink)
     }
 
-    /// Consume records until the input closes, then flush and acknowledge all.
-    pub async fn run(
-        mut self,
-        mut rx: mpsc::Receiver<SinkItem>,
-        ack_tx: mpsc::Sender<Vec<String>>,
-    ) -> Result<()> {
-        let mut tick = tokio::time::interval(self.cfg.flush_interval);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tick.tick().await;
-
-        loop {
-            tokio::select! {
-                item = rx.recv() => match item {
-                    Some(item) => {
-                        self.buffer.push(item);
-                        if self.buffer.len() >= self.cfg.batch_size {
-                            self.flush_and_ack(&ack_tx).await?;
-                        }
-                    }
-                    None => break,
-                },
-                _ = tick.tick() => self.flush_and_ack(&ack_tx).await?,
-            }
+    /// Insert one complete batch, retrying transient ClickHouse failures.
+    pub async fn insert(&mut self, batch: &[SinkItem]) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
         }
-
-        self.flush_and_ack(&ack_tx).await?;
-        info!(
-            total_flushed = self.total_flushed,
-            total_failures = self.total_failures,
-            "ClickHouse sink shut down cleanly",
-        );
-        Ok(())
-    }
-
-    async fn flush_and_ack(&mut self, ack_tx: &mpsc::Sender<Vec<String>>) -> Result<()> {
-        let delivery_ids = self.flush().await?;
-        if !delivery_ids.is_empty() {
-            ack_tx
-                .send(delivery_ids)
-                .await
-                .map_err(|_| anyhow!("Redis acknowledgement channel closed"))?;
-        }
-        Ok(())
-    }
-
-    async fn flush(&mut self) -> Result<Vec<String>> {
-        if self.buffer.is_empty() {
-            return Ok(Vec::new());
-        }
-        let count = self.buffer.len();
-        let body = self
-            .serialize_batch()
-            .context("serialize ClickHouse batch")?;
+        let count = batch.len();
+        let body = Self::serialize_batch(batch).context("serialize ClickHouse batch")?;
         let mut retry_delay = Duration::from_secs(1);
         loop {
             match self.send_insert(body.clone()).await {
@@ -141,18 +88,20 @@ impl Sink {
         }
 
         self.total_flushed += count as u64;
-        let delivery_ids = self
-            .buffer
-            .iter()
-            .map(|item| item.delivery_id.clone())
-            .collect();
-        self.buffer.clear();
-        Ok(delivery_ids)
+        Ok(())
     }
 
-    fn serialize_batch(&self) -> Result<Vec<u8>> {
-        let mut body = Vec::with_capacity(self.buffer.len() * 256);
-        for item in &self.buffer {
+    pub fn total_flushed(&self) -> u64 {
+        self.total_flushed
+    }
+
+    pub fn total_failures(&self) -> u64 {
+        self.total_failures
+    }
+
+    fn serialize_batch(batch: &[SinkItem]) -> Result<Vec<u8>> {
+        let mut body = Vec::with_capacity(batch.len() * 256);
+        for item in batch {
             let data = serde_json::to_string(&item.record.event).context("serialize v3 event")?;
             serde_json::to_writer(
                 &mut body,
@@ -273,24 +222,6 @@ mod tests {
         value.parse().unwrap()
     }
 
-    fn sink() -> Sink {
-        Sink {
-            cfg: SinkConfig {
-                url: "http://example.invalid:8123".into(),
-                user: "default".into(),
-                password: String::new(),
-                database: "default".into(),
-                table: "test_table".into(),
-                batch_size: 10,
-                flush_interval: Duration::from_millis(500),
-            },
-            http: Client::new(),
-            buffer: Vec::new(),
-            total_flushed: 0,
-            total_failures: 0,
-        }
-    }
-
     fn item(event: Event, sequence: u64) -> SinkItem {
         let collector = CollectorContext::with_publisher_generation(42);
         let mut record = collector.record(event, 1_757_908_892_351_123_456);
@@ -303,8 +234,7 @@ mod tests {
 
     #[test]
     fn serializes_only_receive_time_sequence_and_event_json() {
-        let mut sink = sink();
-        sink.buffer.push(item(
+        let batch = [item(
             Event::LastTradePrice {
                 market: "m".into(),
                 asset_id: "a".into(),
@@ -316,9 +246,9 @@ mod tests {
                 transaction_hash: "0xtx".into(),
             },
             0,
-        ));
+        )];
 
-        let body = sink.serialize_batch().unwrap();
+        let body = Sink::serialize_batch(&batch).unwrap();
         let row: serde_json::Value =
             serde_json::from_slice(body.strip_suffix(b"\n").unwrap()).unwrap();
         assert_eq!(row.as_object().unwrap().len(), 3);
@@ -338,11 +268,9 @@ mod tests {
             old_tick_size: dec("0.01"),
             new_tick_size: dec("0.001"),
         };
-        let mut sink = sink();
-        sink.buffer.push(item(event.clone(), 0));
-        sink.buffer.push(item(event, 1));
+        let batch = [item(event.clone(), 0), item(event, 1)];
 
-        let body = sink.serialize_batch().unwrap();
+        let body = Sink::serialize_batch(&batch).unwrap();
         let rows = std::str::from_utf8(&body)
             .unwrap()
             .lines()

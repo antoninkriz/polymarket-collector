@@ -3,7 +3,7 @@ name = "polymarket-orderbook-rust-from-pubsub"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Polymarket orderbook → ClickHouse writer fed from Redis pub/sub"
+description = "Polymarket Redis Stream to ClickHouse writer"
 
 [[bin]]
 name = "polymarket-orderbook-rust-from-pubsub"
@@ -19,6 +19,9 @@ dotenvy = "0.15.7"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json"] }
 anyhow = "1.0.104"
+
+[dev-dependencies]
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 
 [profile.release]
 opt-level = 3

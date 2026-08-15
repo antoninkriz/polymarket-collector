@@ -6,15 +6,12 @@
 //! cargo test --test sink_integration -- --ignored --nocapture
 //! ```
 
-use std::time::Duration;
-
 use anyhow::Result;
 use polymarket_orderbook_rust::events::Event;
 use polymarket_orderbook_rust::record::CollectorContext;
 use polymarket_orderbook_rust::sink::{Sink, SinkConfig, SinkItem};
 use reqwest::Client;
 use rust_decimal::Decimal;
-use tokio::sync::mpsc;
 
 const CH_URL: &str = "http://localhost:8124";
 const CH_USER: &str = "default";
@@ -52,14 +49,12 @@ async fn sink_collapses_only_same_sequence_retry() -> Result<()> {
     )
     .await?;
 
-    let sink = Sink::connect(SinkConfig {
+    let mut sink = Sink::connect(SinkConfig {
         url: CH_URL.into(),
         user: CH_USER.into(),
         password: ch_password(),
         database: CH_DATABASE.into(),
         table: CH_TABLE.into(),
-        batch_size: 3,
-        flush_interval: Duration::from_millis(200),
     })
     .await?;
     let trade = Event::LastTradePrice {
@@ -76,27 +71,23 @@ async fn sink_collapses_only_same_sequence_retry() -> Result<()> {
     let first = collector.record(trade.clone(), 1_757_908_892_351_123_456);
     let second = collector.record(trade, 1_757_908_892_351_123_457);
 
-    let (tx, rx) = mpsc::channel::<SinkItem>(8);
-    let (ack_tx, mut ack_rx) = mpsc::channel(8);
-    let handle = tokio::spawn(sink.run(rx, ack_tx));
-    tx.send(SinkItem {
-        record: first.clone(),
-        delivery_id: "1-0".into(),
-    })
-    .await?;
-    tx.send(SinkItem {
-        record: first,
-        delivery_id: "1-1".into(),
-    })
-    .await?;
-    tx.send(SinkItem {
-        record: second,
-        delivery_id: "1-2".into(),
-    })
-    .await?;
-    drop(tx);
-    handle.await??;
-    assert_eq!(ack_rx.recv().await.unwrap(), ["1-0", "1-1", "1-2"]);
+    let batch = [
+        SinkItem {
+            record: first.clone(),
+            delivery_id: "1-0".into(),
+        },
+        SinkItem {
+            record: first,
+            delivery_id: "1-1".into(),
+        },
+        SinkItem {
+            record: second,
+            delivery_id: "1-2".into(),
+        },
+    ];
+    sink.insert(&batch).await?;
+    assert_eq!(sink.total_flushed(), 3);
+    assert_eq!(sink.total_failures(), 0);
 
     let final_count = query(
         &http,
