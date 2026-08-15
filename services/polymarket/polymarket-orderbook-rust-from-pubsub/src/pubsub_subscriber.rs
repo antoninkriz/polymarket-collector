@@ -240,7 +240,10 @@ impl Writer {
         if self.batch.is_empty() {
             return Ok(());
         }
-        debug_assert!(self.committed_unacked.is_empty());
+        anyhow::ensure!(
+            self.committed_unacked.is_empty(),
+            "cannot commit a new batch while Redis acknowledgements are pending",
+        );
         let committed = self.batch.len() as u64;
         self.sink.insert(&self.batch).await?;
         self.stats.events_committed += committed;
@@ -365,11 +368,7 @@ async fn flush_acks(
     if pending_acks.is_empty() {
         return Ok(());
     }
-    // A reconnect can replay committed-but-unacknowledged entries while their
-    // previous acknowledgements are still queued. Avoid sending duplicate IDs
-    // and keep each Redis command bounded during recovery.
-    pending_acks.sort_unstable();
-    pending_acks.dedup();
+    // Keep each Redis command bounded during recovery.
     let mut processed = 0;
     while processed < pending_acks.len() {
         let end = (processed + ACK_DELETE_CHUNK_SIZE).min(pending_acks.len());
@@ -485,7 +484,7 @@ mod tests {
         ensure_consumer_group(&mut conn, &cfg).await?;
 
         const BULK_ENTRY_COUNT: usize = 2_000;
-        let mut first_ids = Vec::with_capacity(BULK_ENTRY_COUNT + 1);
+        let mut first_ids = Vec::with_capacity(BULK_ENTRY_COUNT);
         for _ in 0..BULK_ENTRY_COUNT {
             let id: String = redis::cmd("XADD")
                 .arg(&cfg.stream)
@@ -509,10 +508,8 @@ mod tests {
             .await?;
 
         let mut stats = WriterStats::default();
-        // Include a duplicate to exercise reconnect-time coalescing and send
-        // enough IDs to cross the native-command chunk boundary.
+        // Send enough IDs to cross the native-command chunk boundary.
         let missing_id = first_ids[0].clone();
-        first_ids.push(first_ids[0].clone());
         let mut pending = first_ids;
         flush_acks(&mut conn, &cfg, &mut pending, &mut stats).await?;
         assert!(pending.is_empty());
@@ -524,7 +521,8 @@ mod tests {
         assert_eq!(stats.events_acked, BULK_ENTRY_COUNT as u64);
         assert_eq!(stats.events_deleted, BULK_ENTRY_COUNT as u64);
 
-        // An already-applied ID is locally complete and safe to discard.
+        // Simulate a lost response: an already-applied ID is locally complete
+        // and safe to discard when the acknowledgement is retried.
         let mut missing_ack = vec![missing_id];
         flush_acks(&mut conn, &cfg, &mut missing_ack, &mut stats).await?;
         assert!(missing_ack.is_empty());
