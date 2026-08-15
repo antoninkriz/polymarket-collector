@@ -295,12 +295,6 @@ impl Pool {
         // recent markets first so their lower-numbered connections establish
         // subscriptions before the long tail of the active universe.
 
-        info!(
-            new_markets = new_markets.len(),
-            new_assets = new_markets.len() * 2,
-            "subscribing markets on authoritative connections",
-        );
-
         let mut pending: BTreeMap<usize, Vec<String>> = BTreeMap::new();
         let mut assigned_routes = Vec::with_capacity(new_markets.len() * 2);
         for market in new_markets {
@@ -341,25 +335,16 @@ impl Pool {
             }
         }
 
-        info!(
-            total_markets = self.markets.len(),
-            total_connections = self.connections.len(),
-            total_assets_tracked = self.asset_to_conn.len(),
-            "subscribe_markets complete",
-        );
         Ok(())
     }
 
     pub async fn unsubscribe_markets(&mut self, market_hashes: Vec<String>) -> Result<()> {
         let mut conn_unsubs: HashMap<usize, Vec<String>> = HashMap::new();
         let mut removed_routes = Vec::new();
-        let mut removed_count = 0_usize;
-
         for hash in market_hashes {
             let Some(market) = self.markets.remove(&hash) else {
                 continue;
             };
-            removed_count += 1;
             if let Some(conn_id) = self.market_to_conn.remove(&hash) {
                 for asset in market.assets {
                     self.asset_to_conn.remove(&asset);
@@ -391,13 +376,7 @@ impl Pool {
                 && !self.connections[index].lifecycle_listener
             {
                 let handle = self.connections.swap_remove(index);
-                let conn_id = handle.conn_id;
                 drop(handle.cmd_tx);
-                info!(
-                    conn = conn_id,
-                    remaining = self.connections.len(),
-                    "removed empty connection"
-                );
                 tokio::spawn(async move {
                     let _ = handle.join.await;
                 });
@@ -406,11 +385,6 @@ impl Pool {
             }
         }
 
-        info!(
-            unsubscribed = removed_count,
-            remaining_markets = self.markets.len(),
-            "unsubscribe_markets complete",
-        );
         Ok(())
     }
 
@@ -475,13 +449,6 @@ impl Pool {
             cmd_tx,
             join,
         });
-        info!(
-            conn = conn_id,
-            lifecycle_anchor,
-            lifecycle_listener,
-            total = self.connections.len(),
-            "spawned connection"
-        );
     }
 
     async fn send_route_update(&self, update: RouteUpdate) {

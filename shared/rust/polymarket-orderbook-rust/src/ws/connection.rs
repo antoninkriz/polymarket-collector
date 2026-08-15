@@ -187,7 +187,6 @@ impl Connection {
             // `try_recv()` would consume buffered commands like the
             // pool's pre-loaded initial Subscribe and silently drop them.
             if commands.is_closed() && commands.is_empty() {
-                info!(conn = index, "shutdown requested during reconnect delay");
                 let _ = status_tx.send(HealthEvent::Connection {
                     conn_id: index,
                     status: ConnStatus::Disconnected,
@@ -198,7 +197,6 @@ impl Connection {
             // Connect.
             let ws_stream = match tokio_tungstenite::connect_async(WS_MARKET_URL).await {
                 Ok((stream, _resp)) => {
-                    info!(conn = index, "ws connected");
                     backoff = Duration::from_secs(1);
                     stream
                 }
@@ -268,11 +266,9 @@ impl Connection {
                     fast_reconnect_reason = Some("session ended");
                 }
                 SessionOutcome::ChannelClosed => {
-                    info!(conn = index, "event sink closed, shutting down connection");
                     return Ok(());
                 }
                 SessionOutcome::Shutdown => {
-                    info!(conn = index, "shutdown requested");
                     return Ok(());
                 }
                 SessionOutcome::Error(e) => {
@@ -347,7 +343,7 @@ async fn run_session(
     // (Re-)subscribe everything we want.
     if !sub.desired.is_empty() || context.lifecycle_listener {
         let assets: Vec<String> = sub.desired.iter().cloned().collect();
-        if let Err(e) = send_subscribe(&mut write, sub, &assets, index).await {
+        if let Err(e) = send_subscribe(&mut write, sub, &assets).await {
             return SessionOutcome::Error(e);
         }
         // Re-subscribing doesn't add new assets, but it does mean we've
@@ -505,7 +501,7 @@ async fn run_session(
                     if new_in_session.is_empty() {
                         continue;
                     }
-                    if let Err(e) = send_subscribe(&mut write, sub, &new_in_session, index).await {
+                    if let Err(e) = send_subscribe(&mut write, sub, &new_in_session).await {
                         warn!(conn = index, error = %e, "subscribe send failed; will retry on reconnect");
                     }
                 }
@@ -522,7 +518,7 @@ async fn run_session(
                     if removed.is_empty() {
                         continue;
                     }
-                    if let Err(e) = send_unsubscribe(&mut write, &removed, index).await {
+                    if let Err(e) = send_unsubscribe(&mut write, &removed).await {
                         warn!(conn = index, error = %e, "unsubscribe send failed");
                     }
                 }
@@ -638,12 +634,7 @@ fn handle_text(
     Ok(())
 }
 
-async fn send_subscribe<S>(
-    write: &mut S,
-    sub: &mut SubState,
-    assets: &[String],
-    index: usize,
-) -> Result<()>
+async fn send_subscribe<S>(write: &mut S, sub: &mut SubState, assets: &[String]) -> Result<()>
 where
     S: SinkExt<Message> + Unpin,
     <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
@@ -654,7 +645,6 @@ where
         .send(Message::Text(text.into()))
         .await
         .map_err(|e| anyhow::anyhow!("ws send: {e}"))?;
-    info!(conn = index, count = assets.len(), "subscribed assets");
     Ok(())
 }
 
@@ -675,7 +665,7 @@ fn subscribe_payload(sub: &mut SubState, assets: &[String]) -> serde_json::Value
     }
 }
 
-async fn send_unsubscribe<S>(write: &mut S, assets: &[String], index: usize) -> Result<()>
+async fn send_unsubscribe<S>(write: &mut S, assets: &[String]) -> Result<()>
 where
     S: SinkExt<Message> + Unpin,
     <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
@@ -686,7 +676,6 @@ where
         .send(Message::Text(text.into()))
         .await
         .map_err(|e| anyhow::anyhow!("ws send: {e}"))?;
-    info!(conn = index, count = assets.len(), "unsubscribed assets");
     Ok(())
 }
 

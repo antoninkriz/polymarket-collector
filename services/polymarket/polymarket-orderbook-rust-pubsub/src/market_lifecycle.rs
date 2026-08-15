@@ -418,11 +418,6 @@ impl LifecycleCoordinator {
             .await
             .context("subscribe bootstrap markets")?;
         self.state.commit_bootstrap(&planned);
-        info!(
-            added = planned.len(),
-            active_markets = self.state.active.len(),
-            "lifecycle bootstrap applied"
-        );
         Ok(())
     }
 
