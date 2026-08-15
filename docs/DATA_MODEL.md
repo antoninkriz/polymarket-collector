@@ -70,6 +70,8 @@ The same Rust publisher owns the reconciliation paths:
 - incremental new-market scans run every 10 seconds; and
 - resolved-market scans run every 30 seconds.
 
+The publisher never replaces a restart-cache snapshot until the current process has completed both a full active-market scan and the initial resolved-market catch-up. This preserves the previous cache and its honest `fetched_at` timestamp if either startup reconciliation is interrupted. After both complete, changed snapshots are saved periodically and during graceful shutdown.
+
 All Gamma work shares a 10 request/second limiter and bounded retry policy. WebSocket lifecycle events remain the low-latency source. Gamma adds missing subscriptions and may synthesize a missing lifecycle row only when a usable source creation or closure timestamp exists.
 
 ## Timestamp semantics

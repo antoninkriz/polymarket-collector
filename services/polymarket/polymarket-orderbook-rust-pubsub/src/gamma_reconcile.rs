@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use chrono::{DateTime, TimeDelta, Utc};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{info, warn};
@@ -25,9 +25,16 @@ const CACHE_INTERVAL: Duration = Duration::from_secs(60);
 const POLL_OVERLAP: TimeDelta = TimeDelta::minutes(2);
 const RESTART_PRIORITY_PAGES: usize = 20;
 
-#[derive(Debug, Clone, Copy)]
-pub enum CacheSaveTrigger {
-    Force,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheBaseline {
+    active_scan_complete: bool,
+    closed_catchup_complete: bool,
+}
+
+impl CacheBaseline {
+    pub fn is_complete(self) -> bool {
+        self.active_scan_complete && self.closed_catchup_complete
+    }
 }
 
 #[derive(Default)]
@@ -111,7 +118,8 @@ pub async fn run_full_scans(
     client: GammaClient,
     lifecycle_tx: mpsc::Sender<LifecycleRequest>,
     cold_start: bool,
-    cache_trigger: mpsc::Sender<CacheSaveTrigger>,
+    cache_progress: watch::Sender<CacheBaseline>,
+    force_cache_save: mpsc::Sender<()>,
     stats: Arc<ReconciliationStats>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -130,7 +138,8 @@ pub async fn run_full_scans(
                     stats
                         .full_scan_success_ms
                         .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
-                    let _ = cache_trigger.try_send(CacheSaveTrigger::Force);
+                    cache_progress.send_modify(|progress| progress.active_scan_complete = true);
+                    let _ = force_cache_save.try_send(());
                     true
                 }
             }
@@ -176,7 +185,7 @@ async fn run_full_scan(
     while let Some(markets) = client.next_keyset_page(&mut scan).await? {
         pages += 1;
         total_markets += markets.len();
-        let markets = markets.into_iter().filter_map(scanned_active).collect();
+        let markets: Vec<_> = markets.into_iter().filter_map(scanned_active).collect();
         send_confirmed(lifecycle_tx, |completion| LifecycleRequest::ScanPage {
             scan_id,
             markets,
@@ -187,6 +196,10 @@ async fn run_full_scan(
             info!(scan_id, pages, total_markets, "full Gamma scan progress");
         }
     }
+    ensure!(
+        total_markets > 0,
+        "full Gamma scan returned no active binary markets"
+    );
     send_confirmed(lifecycle_tx, |completion| LifecycleRequest::ScanFinish {
         scan_id,
         completion,
@@ -242,6 +255,7 @@ pub async fn run_closed_market_polls(
     client: GammaClient,
     lifecycle_tx: mpsc::Sender<LifecycleRequest>,
     initial_since: DateTime<Utc>,
+    cache_progress: watch::Sender<CacheBaseline>,
     stats: Arc<ReconciliationStats>,
 ) -> Result<()> {
     let mut watermark = initial_since.min(Utc::now());
@@ -260,6 +274,7 @@ pub async fn run_closed_market_polls(
                 stats
                     .closed_poll_success_ms
                     .store(watermark.timestamp_millis(), Ordering::Relaxed);
+                cache_progress.send_modify(|progress| progress.closed_catchup_complete = true);
             }
             Err(error) => warn!(%error, "Gamma closed-market poll failed"),
         }
@@ -287,19 +302,22 @@ pub async fn run_cache_saver(
     lifecycle_tx: mpsc::Sender<LifecycleRequest>,
     redis_url: String,
     key: String,
-    mut trigger_rx: mpsc::Receiver<CacheSaveTrigger>,
+    mut cache_progress: watch::Receiver<CacheBaseline>,
+    mut force_save_rx: mpsc::Receiver<()>,
     stats: Arc<ReconciliationStats>,
 ) -> Result<()> {
-    let mut interval = tokio::time::interval(CACHE_INTERVAL);
+    wait_for_cache_readiness(&mut cache_progress).await?;
+    let mut interval =
+        tokio::time::interval_at(tokio::time::Instant::now() + CACHE_INTERVAL, CACHE_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut saved_revision = None;
     loop {
         let mut force = false;
         tokio::select! {
             _ = interval.tick() => {}
-            trigger = trigger_rx.recv() => {
+            trigger = force_save_rx.recv() => {
                 match trigger {
-                    Some(CacheSaveTrigger::Force) => force = true,
+                    Some(()) => force = true,
                     None => {
                         // Periodic persistence remains useful if the force
                         // trigger sender stops during shutdown.
@@ -318,6 +336,18 @@ pub async fn run_cache_saver(
             Err(error) => warn!(%error, "save Rust market restart cache failed"),
         }
     }
+}
+
+async fn wait_for_cache_readiness(
+    cache_progress: &mut watch::Receiver<CacheBaseline>,
+) -> Result<()> {
+    while !cache_progress.borrow_and_update().is_complete() {
+        cache_progress
+            .changed()
+            .await
+            .context("cache readiness sender dropped before a complete baseline")?;
+    }
+    Ok(())
 }
 
 pub async fn persist_final_snapshot(
@@ -540,5 +570,30 @@ mod tests {
         market.uma_resolution_status = "RESOLVED".into();
         market.closed_time_ms = None;
         assert!(resolved_observation(&market).is_none());
+    }
+
+    #[tokio::test]
+    async fn cache_save_waits_for_active_and_closed_reconciliation() {
+        let (progress_tx, mut progress_rx) = watch::channel(CacheBaseline::default());
+        let waiter = tokio::spawn(async move { wait_for_cache_readiness(&mut progress_rx).await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        progress_tx.send_modify(|progress| progress.active_scan_complete = true);
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        progress_tx.send_modify(|progress| progress.closed_catchup_complete = true);
+        waiter.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_save_fails_closed_without_a_complete_baseline() {
+        let (progress_tx, mut progress_rx) = watch::channel(CacheBaseline::default());
+        drop(progress_tx);
+        let error = wait_for_cache_readiness(&mut progress_rx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("complete baseline"));
     }
 }

@@ -27,7 +27,7 @@ use polymarket_orderbook_rust::record::EventRecord;
 use polymarket_orderbook_rust::ws::pool::Pool;
 
 use polymarket_orderbook_rust_pubsub::config::Config;
-use polymarket_orderbook_rust_pubsub::gamma_reconcile::{self, ReconciliationStats};
+use polymarket_orderbook_rust_pubsub::gamma_reconcile::{self, CacheBaseline, ReconciliationStats};
 use polymarket_orderbook_rust_pubsub::lease::{PublisherLease, PublisherLeaseConfig};
 use polymarket_orderbook_rust_pubsub::market_lifecycle::LifecycleCoordinator;
 use polymarket_orderbook_rust_pubsub::pubsub_sink::{PubSubSink, PubSubSinkConfig};
@@ -138,14 +138,18 @@ async fn main() -> Result<()> {
     }
 
     let reconciliation_stats = Arc::new(ReconciliationStats::default());
-    let (cache_trigger_tx, cache_trigger_rx) = mpsc::channel(1);
+    let (force_cache_save_tx, force_cache_save_rx) = mpsc::channel(1);
+    // Preserve the existing cache and its honest fetched_at until this process
+    // has completed both active-market and closed-market reconciliation.
+    let (cache_progress_tx, cache_progress_rx) = watch::channel(CacheBaseline::default());
     let (gamma_shutdown_tx, gamma_shutdown_rx) = watch::channel(false);
     let mut full_scan_handle: JoinHandle<Result<()>> =
         tokio::spawn(gamma_reconcile::run_full_scans(
             gamma_client.clone(),
             reconciliation_tx.clone(),
             cold_start,
-            cache_trigger_tx,
+            cache_progress_tx.clone(),
+            force_cache_save_tx,
             Arc::clone(&reconciliation_stats),
             gamma_shutdown_rx,
         ));
@@ -160,13 +164,15 @@ async fn main() -> Result<()> {
         gamma_client,
         reconciliation_tx.clone(),
         cache_fetched_at.unwrap_or(startup_poll_time),
+        cache_progress_tx,
         Arc::clone(&reconciliation_stats),
     ));
     let mut cache_saver_handle = tokio::spawn(gamma_reconcile::run_cache_saver(
         reconciliation_tx.clone(),
         cfg.redis_url.clone(),
         cfg.redis_key_active_markets.clone(),
-        cache_trigger_rx,
+        cache_progress_rx.clone(),
+        force_cache_save_rx,
         Arc::clone(&reconciliation_stats),
     ));
 
@@ -240,7 +246,8 @@ async fn main() -> Result<()> {
         let _ = cache_saver_handle.await;
     }
 
-    if !coordinator_stopped {
+    let cache_ready = cache_progress_rx.borrow().is_complete();
+    if !coordinator_stopped && cache_ready {
         if let Err(error) = gamma_reconcile::persist_final_snapshot(
             &reconciliation_tx,
             &cfg.redis_url,
@@ -250,6 +257,8 @@ async fn main() -> Result<()> {
         {
             warn!(%error, "final market restart-cache save failed");
         }
+    } else if !coordinator_stopped {
+        info!("skipping incomplete market restart-cache save");
     }
 
     if !coordinator_stopped {
