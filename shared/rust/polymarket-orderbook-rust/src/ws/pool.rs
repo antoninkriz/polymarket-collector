@@ -67,7 +67,6 @@ pub struct Pool {
     event_tx: mpsc::Sender<EventRecord>,
     collector: Arc<CollectorContext>,
     connections: Vec<ConnHandle>,
-    markets: HashMap<String, Market>,
     /// Stable connection IDs, not vector positions.
     market_to_conn: HashMap<String, usize>,
     asset_to_conn: HashMap<String, usize>,
@@ -133,7 +132,6 @@ impl Pool {
             event_tx,
             collector,
             connections: Vec::new(),
-            markets: HashMap::new(),
             market_to_conn: HashMap::new(),
             asset_to_conn: HashMap::new(),
             next_conn_id: 0,
@@ -144,10 +142,6 @@ impl Pool {
             status_event_tx,
             route_update_tx,
         }
-    }
-
-    pub fn subscribed_market_count(&self) -> usize {
-        self.markets.len()
     }
 
     /// Ensure the lifecycle anchor exists. This is required even with no
@@ -165,7 +159,7 @@ impl Pool {
 
     pub fn pool_stats(&self) -> PoolStats {
         PoolStats {
-            market_count: self.markets.len(),
+            market_count: self.market_to_conn.len(),
             connection_count: self.connections.len(),
             lifecycle_listener_count: self
                 .connections
@@ -217,52 +211,26 @@ impl Pool {
         }
     }
 
-    /// Subscribe new markets without splitting a market across connections.
-    pub async fn subscribe_markets(&mut self, markets: Vec<Market>) -> Result<()> {
+    /// Subscribe validated markets without splitting a market across connections.
+    ///
+    /// The caller owns condition identity and asset-ownership validation. This
+    /// method validates only the routing invariants represented by the pool.
+    pub async fn subscribe_markets(&mut self, markets: &[Market]) -> Result<()> {
         ensure!(
             self.max_assets_per_conn >= 2,
             "MAX_ASSETS_PER_CONN must be at least 2 so a market stays atomic"
         );
 
-        // Validate and deduplicate the whole input before mutating pool state.
-        // Checking only `self.markets` is insufficient: the same hash can
-        // occur twice in one preload batch and, at a capacity boundary, end
-        // up subscribed on two different sockets.
+        // LifecycleState has already validated market identity. The pool only
+        // defends its routing invariants before mutating any route.
         let mut new_markets = Vec::new();
-        let mut batch_markets: HashMap<String, [String; 2]> = HashMap::new();
-        let mut batch_assets: HashMap<String, String> = HashMap::new();
+        let mut batch_markets = HashSet::new();
+        let mut batch_assets = HashSet::new();
         for market in markets {
-            ensure!(!market.hash.is_empty(), "market hash must not be empty");
-            ensure!(
-                market.assets.iter().all(|asset| !asset.is_empty()),
-                "market {} has an empty asset id",
-                market.hash,
-            );
-            ensure!(
-                market.assets[0] != market.assets[1],
-                "market {} assigns both outcomes to asset {}",
-                market.hash,
-                market.assets[0],
-            );
-
-            if let Some(existing) = self.markets.get(&market.hash) {
-                ensure!(
-                    existing.assets == market.assets,
-                    "market {} changed assets from {:?} to {:?}",
-                    market.hash,
-                    existing.assets,
-                    market.assets,
-                );
+            if self.market_to_conn.contains_key(&market.hash) {
                 continue;
             }
-            if let Some(existing_assets) = batch_markets.get(&market.hash) {
-                ensure!(
-                    existing_assets == &market.assets,
-                    "market {} has conflicting assets {:?} and {:?} in one batch",
-                    market.hash,
-                    existing_assets,
-                    market.assets,
-                );
+            if !batch_markets.insert(market.hash.as_str()) {
                 continue;
             }
 
@@ -272,19 +240,12 @@ impl Pool {
                     "asset {} is already assigned to another subscribed market",
                     asset,
                 );
-                if let Some(owner) = batch_assets.get(asset) {
-                    ensure!(
-                        owner == &market.hash,
-                        "asset {} is shared by markets {} and {} in one batch",
-                        asset,
-                        owner,
-                        market.hash,
-                    );
-                } else {
-                    batch_assets.insert(asset.clone(), market.hash.clone());
-                }
+                ensure!(
+                    batch_assets.insert(asset.as_str()),
+                    "asset {} is assigned more than once in one routing batch",
+                    asset,
+                );
             }
-            batch_markets.insert(market.hash.clone(), market.assets.clone());
             new_markets.push(market);
         }
         if new_markets.is_empty() {
@@ -306,18 +267,17 @@ impl Pool {
                 }
             };
             let conn_id = self.connections[conn_index].conn_id;
-            let assets = market.assets.clone();
+            let assets = &market.assets;
 
             pending
                 .entry(conn_id)
                 .or_default()
                 .extend(assets.iter().cloned());
             self.market_to_conn.insert(market.hash.clone(), conn_id);
-            for asset in &assets {
+            for asset in assets {
                 self.asset_to_conn.insert(asset.clone(), conn_id);
                 assigned_routes.push((asset.clone(), conn_id));
             }
-            self.markets.insert(market.hash.clone(), market);
         }
 
         self.send_route_update(RouteUpdate::Assigned(assigned_routes))
@@ -338,35 +298,38 @@ impl Pool {
         Ok(())
     }
 
-    pub async fn unsubscribe_markets(&mut self, market_hashes: Vec<String>) -> Result<()> {
-        let mut conn_unsubs: HashMap<usize, Vec<String>> = HashMap::new();
-        let mut removed_routes = Vec::new();
-        for hash in market_hashes {
-            let Some(market) = self.markets.remove(&hash) else {
-                continue;
-            };
-            if let Some(conn_id) = self.market_to_conn.remove(&hash) {
-                for asset in market.assets {
-                    self.asset_to_conn.remove(&asset);
-                    removed_routes.push(asset.clone());
-                    conn_unsubs.entry(conn_id).or_default().push(asset);
-                }
+    pub async fn unsubscribe_market(
+        &mut self,
+        market_hash: &str,
+        assets: &[String; 2],
+    ) -> Result<()> {
+        let Some(&conn_id) = self.market_to_conn.get(market_hash) else {
+            return Ok(());
+        };
+        for asset in assets {
+            ensure!(
+                self.asset_to_conn.get(asset) == Some(&conn_id),
+                "market {market_hash} asset {asset} is not routed to connection {conn_id}",
+            );
+        }
+
+        self.market_to_conn.remove(market_hash);
+        for asset in assets {
+            self.asset_to_conn.remove(asset);
+        }
+        self.send_route_update(RouteUpdate::Removed(assets.to_vec()))
+            .await;
+
+        if let Some(handle) = self.connections.iter_mut().find(|h| h.conn_id == conn_id) {
+            for asset in assets {
+                handle.assets.remove(asset);
             }
-        }
-
-        if !removed_routes.is_empty() {
-            self.send_route_update(RouteUpdate::Removed(removed_routes))
-                .await;
-        }
-
-        for (conn_id, assets) in conn_unsubs {
-            if let Some(handle) = self.connections.iter_mut().find(|h| h.conn_id == conn_id) {
-                for asset in &assets {
-                    handle.assets.remove(asset);
-                }
-                if let Err(error) = handle.cmd_tx.send(Command::Unsubscribe(assets)).await {
-                    warn!(conn = conn_id, %error, "unsubscribe send failed");
-                }
+            if let Err(error) = handle
+                .cmd_tx
+                .send(Command::Unsubscribe(assets.to_vec()))
+                .await
+            {
+                warn!(conn = conn_id, %error, "unsubscribe send failed");
             }
         }
 
@@ -796,7 +759,7 @@ mod tests {
     #[tokio::test]
     async fn both_assets_of_market_share_one_connection() {
         let mut pool = pool(200);
-        pool.subscribe_markets(vec![market("m1", "yes", "no")])
+        pool.subscribe_markets(&[market("m1", "yes", "no")])
             .await
             .unwrap();
         assert_eq!(pool.asset_to_conn["yes"], pool.asset_to_conn["no"]);
@@ -805,19 +768,18 @@ mod tests {
     #[tokio::test]
     async fn connections_do_not_exceed_capacity_or_split_markets() {
         let mut pool = pool(4);
-        pool.subscribe_markets(vec![
+        let markets = [
             market("m1", "a1y", "a1n"),
             market("m2", "a2y", "a2n"),
             market("m3", "a3y", "a3n"),
-        ])
-        .await
-        .unwrap();
+        ];
+        pool.subscribe_markets(&markets).await.unwrap();
 
         assert_eq!(pool.connection_count(), 2);
         for handle in &pool.connections {
             assert!(handle.assets.len() <= 4);
         }
-        for market in pool.markets.values() {
+        for market in &markets {
             assert_eq!(
                 pool.asset_to_conn[&market.assets[0]],
                 pool.asset_to_conn[&market.assets[1]],
@@ -828,7 +790,7 @@ mod tests {
     #[tokio::test]
     async fn preload_partition_preserves_subscription_priority() {
         let mut pool = pool(4);
-        pool.subscribe_markets(vec![
+        pool.subscribe_markets(&[
             market("z", "zy", "zn"),
             market("a", "ay", "an"),
             market("y", "yy", "yn"),
@@ -846,7 +808,7 @@ mod tests {
     async fn rejects_capacity_that_cannot_hold_a_whole_market() {
         let mut pool = pool(1);
         assert!(pool
-            .subscribe_markets(vec![market("m1", "yes", "no")])
+            .subscribe_markets(&[market("m1", "yes", "no")])
             .await
             .is_err());
     }
@@ -854,67 +816,75 @@ mod tests {
     #[tokio::test]
     async fn duplicate_market_is_skipped() {
         let mut pool = pool(200);
-        pool.subscribe_markets(vec![market("m1", "a1y", "a1n")])
+        pool.subscribe_markets(&[market("m1", "a1y", "a1n")])
             .await
             .unwrap();
         let before = pool.connection_count();
-        pool.subscribe_markets(vec![market("m1", "a1y", "a1n")])
+        pool.subscribe_markets(&[market("m1", "a1y", "a1n")])
             .await
             .unwrap();
         assert_eq!(pool.connection_count(), before);
-        assert_eq!(pool.subscribed_market_count(), 1);
+        assert_eq!(pool.market_to_conn.len(), 1);
     }
 
     #[tokio::test]
     async fn duplicate_market_in_one_capacity_sized_batch_has_one_route() {
         let mut pool = pool(2);
         let duplicate = market("m1", "a1y", "a1n");
-        pool.subscribe_markets(vec![duplicate.clone(), duplicate])
+        pool.subscribe_markets(&[duplicate.clone(), duplicate])
             .await
             .unwrap();
 
         assert_eq!(pool.connection_count(), 1);
-        assert_eq!(pool.subscribed_market_count(), 1);
+        assert_eq!(pool.market_to_conn.len(), 1);
         assert_eq!(pool.connections[0].assets.len(), 2);
     }
 
     #[tokio::test]
-    async fn conflicting_market_or_asset_identity_is_rejected_before_mutation() {
+    async fn asset_collision_is_rejected_before_routing() {
         let mut pool = pool(4);
         let result = pool
-            .subscribe_markets(vec![
-                market("m1", "shared", "a1n"),
-                market("m2", "shared", "a2n"),
-            ])
+            .subscribe_markets(&[market("m1", "shared", "a1n"), market("m2", "shared", "a2n")])
             .await;
 
         assert!(result.is_err());
         assert_eq!(pool.connection_count(), 0);
-        assert_eq!(pool.subscribed_market_count(), 0);
-
-        pool.subscribe_markets(vec![market("m1", "a1y", "a1n")])
-            .await
-            .unwrap();
-        let result = pool
-            .subscribe_markets(vec![market("m1", "different-y", "different-n")])
-            .await;
-        assert!(result.is_err());
-        assert_eq!(pool.connection_count(), 1);
-        assert_eq!(pool.subscribed_market_count(), 1);
+        assert_eq!(pool.market_to_conn.len(), 0);
     }
 
     #[tokio::test]
     async fn unsubscribe_keeps_empty_lifecycle_anchor() {
         let mut pool = pool(200);
-        pool.subscribe_markets(vec![market("m1", "a1y", "a1n")])
+        let subscribed = market("m1", "a1y", "a1n");
+        pool.subscribe_markets(std::slice::from_ref(&subscribed))
             .await
             .unwrap();
-        pool.unsubscribe_markets(vec!["m1".into()]).await.unwrap();
-        assert_eq!(pool.subscribed_market_count(), 0);
+        pool.unsubscribe_market(&subscribed.hash, &subscribed.assets)
+            .await
+            .unwrap();
+        assert_eq!(pool.market_to_conn.len(), 0);
         assert!(pool.asset_to_conn.is_empty());
         assert_eq!(pool.connection_count(), 1);
         assert!(pool.connections[0].assets.is_empty());
         assert_eq!(pool.lifecycle_conn_id, Some(pool.connections[0].conn_id));
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_rejects_mismatched_assets_before_mutation() {
+        let mut pool = pool(200);
+        let subscribed = market("m1", "a1y", "a1n");
+        pool.subscribe_markets(std::slice::from_ref(&subscribed))
+            .await
+            .unwrap();
+
+        let mismatched = ["a1y".into(), "other".into()];
+        assert!(pool
+            .unsubscribe_market(&subscribed.hash, &mismatched)
+            .await
+            .is_err());
+        assert_eq!(pool.market_to_conn.len(), 1);
+        assert_eq!(pool.asset_to_conn.len(), 2);
+        assert_eq!(pool.connections[0].assets.len(), 2);
     }
 
     #[tokio::test]
@@ -934,14 +904,13 @@ mod tests {
         let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
         let mut pool = Pool::new_with_lifecycle(2, event_tx, 0, lifecycle_tx);
 
-        pool.subscribe_markets(vec![
+        let markets = [
             market("m1", "a1y", "a1n"),
             market("m2", "a2y", "a2n"),
             market("m3", "a3y", "a3n"),
             market("m4", "a4y", "a4n"),
-        ])
-        .await
-        .unwrap();
+        ];
+        pool.subscribe_markets(&markets).await.unwrap();
 
         assert_eq!(pool.connection_count(), 4);
         assert!(pool.connections[0].lifecycle_listener);
@@ -949,13 +918,17 @@ mod tests {
         assert!(pool.connections[2].lifecycle_listener);
         assert!(!pool.connections[3].lifecycle_listener);
 
-        pool.unsubscribe_markets(vec!["m1".into(), "m2".into(), "m3".into()])
-            .await
-            .unwrap();
+        for market in &markets[..3] {
+            pool.unsubscribe_market(&market.hash, &market.assets)
+                .await
+                .unwrap();
+        }
         assert_eq!(pool.connection_count(), 4);
         assert_eq!(pool.pool_stats().lifecycle_listener_count, 3);
 
-        pool.unsubscribe_markets(vec!["m4".into()]).await.unwrap();
+        pool.unsubscribe_market(&markets[3].hash, &markets[3].assets)
+            .await
+            .unwrap();
         assert_eq!(pool.connection_count(), 3);
         assert!(pool
             .connections

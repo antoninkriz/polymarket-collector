@@ -24,10 +24,21 @@ enum LifecycleKey {
 enum PlannedObservation {
     Drop,
     Duplicate,
-    SuppressTerminal { key: LifecycleKey },
-    AdmitExisting { key: LifecycleKey },
-    Subscribe { key: LifecycleKey, market: Market },
-    Resolve { key: LifecycleKey, market: String },
+    SuppressTerminal {
+        key: LifecycleKey,
+    },
+    AdmitExisting {
+        key: LifecycleKey,
+    },
+    Subscribe {
+        key: LifecycleKey,
+        market: Market,
+    },
+    Resolve {
+        key: LifecycleKey,
+        market: String,
+        active_assets: Option<[String; 2]>,
+    },
 }
 
 struct PlannedGammaPage {
@@ -180,7 +191,12 @@ impl LifecycleState {
                 if self.first_source.contains_key(&key) {
                     return Ok(PlannedObservation::Duplicate);
                 }
-                Ok(PlannedObservation::Resolve { key, market })
+                let active_assets = self.active.get(&market).map(|active| active.assets.clone());
+                Ok(PlannedObservation::Resolve {
+                    key,
+                    market,
+                    active_assets,
+                })
             }
         }
     }
@@ -276,7 +292,7 @@ impl LifecycleState {
                 self.bump_revision();
                 self.first_source.insert(key.clone(), source);
             }
-            PlannedObservation::Resolve { key, market } => {
+            PlannedObservation::Resolve { key, market, .. } => {
                 if let Some(active_market) = self.active.remove(market) {
                     for asset in active_market.assets {
                         self.asset_owner.remove(&asset);
@@ -437,7 +453,7 @@ impl LifecycleCoordinator {
         if !plan.bootstrap.is_empty() {
             let planned = self.state.plan_bootstrap(plan.bootstrap)?;
             self.pool
-                .subscribe_markets(planned.clone())
+                .subscribe_markets(&planned)
                 .await
                 .context("subscribe Gamma page")?;
             self.state.commit_bootstrap(&planned);
@@ -451,7 +467,7 @@ impl LifecycleCoordinator {
             return Ok(());
         }
         self.pool
-            .subscribe_markets(planned.clone())
+            .subscribe_markets(&planned)
             .await
             .context("subscribe bootstrap markets")?;
         self.state.commit_bootstrap(&planned);
@@ -501,7 +517,7 @@ impl LifecycleCoordinator {
                 self.pool
                     .admit_lifecycle(observation.event, observation.timestamp_received_ns);
                 self.pool
-                    .subscribe_markets(vec![market.clone()])
+                    .subscribe_markets(std::slice::from_ref(market))
                     .await
                     .context("subscribe lifecycle market")?;
                 info!(
@@ -510,13 +526,19 @@ impl LifecycleCoordinator {
                     "[MARKET_EVENT] new_market"
                 );
             }
-            PlannedObservation::Resolve { market, .. } => {
+            PlannedObservation::Resolve {
+                market,
+                active_assets,
+                ..
+            } => {
                 self.pool
                     .admit_lifecycle(observation.event, observation.timestamp_received_ns);
-                self.pool
-                    .unsubscribe_markets(vec![market.clone()])
-                    .await
-                    .context("unsubscribe resolved market")?;
+                if let Some(assets) = active_assets {
+                    self.pool
+                        .unsubscribe_market(market, assets)
+                        .await
+                        .context("unsubscribe resolved market")?;
+                }
                 info!(source = ?source, market, "[MARKET_EVENT] market_resolved");
             }
         }
@@ -754,7 +776,13 @@ mod tests {
 
         let observation = resolved("m");
         let resolution = state.plan_observation(&observation).unwrap();
-        assert!(matches!(resolution, PlannedObservation::Resolve { .. }));
+        assert!(matches!(
+            &resolution,
+            PlannedObservation::Resolve {
+                active_assets: Some(assets),
+                ..
+            } if assets == &["a", "b"]
+        ));
         state.commit_observation(&resolution, LifecycleSource::WebSocket);
         assert!(state.active.is_empty());
         assert!(state.asset_owner.is_empty());
