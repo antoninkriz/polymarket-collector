@@ -377,9 +377,7 @@ impl Pool {
             {
                 let handle = self.connections.swap_remove(index);
                 drop(handle.cmd_tx);
-                tokio::spawn(async move {
-                    let _ = handle.join.await;
-                });
+                handle.join.abort();
             } else {
                 index += 1;
             }
@@ -390,6 +388,13 @@ impl Pool {
 
     pub async fn shutdown(mut self) -> Result<()> {
         info!(connections = self.connections.len(), "shutting down pool");
+        // Connections may be sleeping in a reconnect backoff or waiting for a
+        // bounded handshake. They own no buffered records, so cancel every
+        // producer before awaiting any of them.
+        for handle in &self.connections {
+            handle.join.abort();
+        }
+
         if let Some(join) = self.monitor_join.take() {
             join.abort();
             let _ = join.await;
@@ -401,6 +406,9 @@ impl Pool {
             match handle.join.await {
                 Ok(Ok(())) => debug!(conn = conn_id, "connection joined"),
                 Ok(Err(error)) => warn!(conn = conn_id, %error, "connection ended with error"),
+                Err(error) if error.is_cancelled() => {
+                    debug!(conn = conn_id, "connection cancelled")
+                }
                 Err(error) => warn!(conn = conn_id, %error, "connection panicked"),
             }
         }
@@ -941,5 +949,24 @@ mod tests {
             .connections
             .iter()
             .all(|connection| connection.lifecycle_listener));
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_connections_before_waiting_for_them() {
+        let mut pool = pool(2);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(COMMAND_CHANNEL_SIZE);
+        let join = tokio::spawn(std::future::pending::<Result<()>>());
+        pool.connections.push(ConnHandle {
+            conn_id: 0,
+            assets: HashSet::new(),
+            lifecycle_listener: true,
+            cmd_tx,
+            join,
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), pool.shutdown())
+            .await
+            .expect("pool shutdown should not wait for a connection task")
+            .unwrap();
     }
 }
