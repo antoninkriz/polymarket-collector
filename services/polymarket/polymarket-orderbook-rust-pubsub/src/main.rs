@@ -119,13 +119,22 @@ async fn main() -> Result<()> {
         .context("build Gamma HTTP client")?;
     let gamma_client = markets::gamma::GammaClient::new(gamma_http);
 
+    let startup_poll_time = Utc::now();
     let (mut cached_markets, cache_fetched_at) = load_restart_cache(&cfg).await;
     let cold_start = cached_markets.is_empty();
     if !cached_markets.is_empty() {
-        match gamma_reconcile::prioritize_restart_markets(&gamma_client, &mut cached_markets).await
-        {
-            Ok(prioritized) => info!(prioritized, "prioritized recent restart-cache markets"),
-            Err(error) => warn!(%error, "could not prioritize restart-cache markets"),
+        match gamma_reconcile::prepare_restart_markets(&gamma_client, &mut cached_markets).await {
+            Ok(plan) => {
+                let missing = plan.missing.len();
+                gamma_reconcile::admit_restart_markets(&reconciliation_tx, plan.missing)
+                    .await
+                    .context("subscribe recent markets missing from restart cache")?;
+                info!(
+                    prioritized = plan.prioritized,
+                    missing, "reconciled recent restart-cache markets"
+                );
+            }
+            Err(error) => warn!(%error, "could not reconcile recent restart-cache markets"),
         }
         let market_count = cached_markets.len();
         apply_bootstrap_batched(&reconciliation_tx, cached_markets).await?;
@@ -153,11 +162,10 @@ async fn main() -> Result<()> {
             Arc::clone(&reconciliation_stats),
             gamma_shutdown_rx,
         ));
-    let startup_poll_time = Utc::now();
     let mut new_poll_handle = tokio::spawn(gamma_reconcile::run_new_market_polls(
         gamma_client.clone(),
         reconciliation_tx.clone(),
-        startup_poll_time,
+        cache_fetched_at.unwrap_or(startup_poll_time),
         Arc::clone(&reconciliation_stats),
     ));
     let mut closed_poll_handle = tokio::spawn(gamma_reconcile::run_closed_market_polls(

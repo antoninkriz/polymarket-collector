@@ -71,33 +71,127 @@ impl ReconciliationStats {
     }
 }
 
-/// Move recently created active markets to the front of a restart cache.
+pub struct RestartMarketPlan {
+    pub prioritized: usize,
+    pub missing: Vec<ScannedActiveMarket>,
+}
+
+/// Prioritize cached markets and recover recent active markets missing from it.
 ///
-/// The cache remains authoritative for the complete universe; Gamma is used
-/// only to assign subscription priority. The scan is deliberately bounded so
-/// a valid cache always begins subscribing within a few seconds. Failure never
-/// discards a cached market or blocks the later full reconciliation scan.
-pub async fn prioritize_restart_markets(
+/// The scan is deliberately bounded so a valid cache begins subscribing within
+/// a few seconds. A later full scan remains authoritative for the complete
+/// active universe.
+pub async fn prepare_restart_markets(
     client: &GammaClient,
     markets: &mut [Market],
-) -> Result<usize> {
+) -> Result<RestartMarketPlan> {
     let mut scan = client.full_active_scan();
-    let mut priorities = Vec::new();
+    let mut recent = Vec::new();
     for _ in 0..RESTART_PRIORITY_PAGES {
         let Some(page) = client.next_keyset_page(&mut scan).await? else {
             break;
         };
-        priorities.extend(page.into_iter().map(|market| market.condition_id));
+        recent.extend(page);
     }
-    Ok(reorder_cached_markets(markets, &priorities))
+    build_restart_market_plan(markets, recent)
+}
+
+fn build_restart_market_plan(
+    markets: &mut [Market],
+    recent: Vec<GammaMarket>,
+) -> Result<RestartMarketPlan> {
+    let mut cached_conditions = HashMap::with_capacity(markets.len());
+    let mut cached_asset_owners = HashMap::with_capacity(markets.len().saturating_mul(2));
+    for market in markets.iter() {
+        cached_conditions.insert(market.hash.as_str(), canonical_asset_refs(&market.assets));
+        for asset in &market.assets {
+            cached_asset_owners.insert(asset.as_str(), market.hash.as_str());
+        }
+    }
+    let mut missing_conditions = HashMap::<String, [String; 2]>::new();
+    let mut missing_asset_owners = HashMap::<String, String>::new();
+    let mut priorities = Vec::with_capacity(recent.len());
+    let mut missing = Vec::new();
+    for market in recent {
+        let Some(scanned) = scanned_active(market) else {
+            continue;
+        };
+        priorities.push(scanned.market.hash.clone());
+        let condition = scanned.market.hash.as_str();
+        let assets = canonical_asset_refs(&scanned.market.assets);
+        if let Some(cached_assets) = cached_conditions.get(condition) {
+            ensure!(
+                cached_assets == &assets,
+                "recent Gamma market {condition} conflicts with cached asset pair"
+            );
+            continue;
+        }
+        if let Some(existing) = missing_conditions.get(condition) {
+            ensure!(
+                canonical_asset_refs(existing) == assets,
+                "recent Gamma market {condition} has conflicting asset pairs"
+            );
+            continue;
+        }
+        for asset in assets {
+            if let Some(owner) = cached_asset_owners.get(asset) {
+                anyhow::bail!(
+                    "recent Gamma market {condition} reuses cached asset {asset} owned by {owner}"
+                );
+            }
+            if let Some(owner) = missing_asset_owners.get(asset) {
+                anyhow::bail!(
+                    "recent Gamma market {condition} reuses asset {asset} owned by {owner}"
+                );
+            }
+            missing_asset_owners.insert(asset.to_string(), condition.to_string());
+        }
+        missing_conditions.insert(condition.to_string(), scanned.market.assets.clone());
+        missing.push(scanned);
+    }
+    drop(cached_conditions);
+    drop(cached_asset_owners);
+    Ok(RestartMarketPlan {
+        prioritized: reorder_cached_markets(markets, &priorities),
+        missing,
+    })
+}
+
+fn canonical_asset_refs(assets: &[String; 2]) -> [&str; 2] {
+    if assets[0] <= assets[1] {
+        [&assets[0], &assets[1]]
+    } else {
+        [&assets[1], &assets[0]]
+    }
+}
+
+pub async fn admit_restart_markets(
+    lifecycle_tx: &mpsc::Sender<LifecycleRequest>,
+    markets: Vec<ScannedActiveMarket>,
+) -> Result<()> {
+    let mut silent = Vec::new();
+    for market in markets {
+        if let Some(observation) = market.observation {
+            send_observation(lifecycle_tx, observation).await?;
+        } else {
+            silent.push(market.market);
+        }
+    }
+    if !silent.is_empty() {
+        send_confirmed(lifecycle_tx, |completion| LifecycleRequest::Bootstrap {
+            markets: silent,
+            completion,
+        })
+        .await?;
+    }
+    Ok(())
 }
 
 fn reorder_cached_markets(markets: &mut [Market], priorities: &[String]) -> usize {
-    let ranks: HashMap<&str, usize> = priorities
-        .iter()
-        .enumerate()
-        .map(|(rank, condition)| (condition.as_str(), rank))
-        .collect();
+    let mut ranks = HashMap::with_capacity(priorities.len());
+    for (rank, condition) in priorities.iter().enumerate() {
+        ranks.entry(condition.as_str()).or_insert(rank);
+    }
     let prioritized = markets
         .iter()
         .filter(|market| ranks.contains_key(market.hash.as_str()))
@@ -229,6 +323,7 @@ pub async fn run_new_market_polls(
     let mut watermark = initial_since.min(Utc::now());
     let mut first_poll = true;
     loop {
+        let poll_started_at = Utc::now();
         let cutoff = new_poll_cutoff(watermark, first_poll);
         match stream_scan_observations(
             &client,
@@ -239,11 +334,11 @@ pub async fn run_new_market_polls(
         .await
         {
             Ok(()) => {
-                watermark = Utc::now();
+                watermark = poll_started_at;
                 first_poll = false;
                 stats
                     .new_poll_success_ms
-                    .store(watermark.timestamp_millis(), Ordering::Relaxed);
+                    .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
             }
             Err(error) => warn!(%error, "incremental Gamma new-market poll failed"),
         }
@@ -260,6 +355,7 @@ pub async fn run_closed_market_polls(
 ) -> Result<()> {
     let mut watermark = initial_since.min(Utc::now());
     loop {
+        let poll_started_at = Utc::now();
         let cutoff = (watermark - POLL_OVERLAP).timestamp_millis();
         match stream_scan_observations(
             &client,
@@ -270,10 +366,10 @@ pub async fn run_closed_market_polls(
         .await
         {
             Ok(()) => {
-                watermark = Utc::now();
+                watermark = poll_started_at;
                 stats
                     .closed_poll_success_ms
-                    .store(watermark.timestamp_millis(), Ordering::Relaxed);
+                    .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
                 cache_progress.send_modify(|progress| progress.closed_catchup_complete = true);
             }
             Err(error) => warn!(%error, "Gamma closed-market poll failed"),
@@ -504,6 +600,13 @@ mod tests {
         Market::new(hash.into(), format!("{hash}-a"), format!("{hash}-b"))
     }
 
+    fn gamma_market_for(hash: &str) -> GammaMarket {
+        let mut market = gamma_market();
+        market.condition_id = hash.into();
+        market.assets_ids = vec![format!("{hash}-a"), format!("{hash}-b")];
+        market
+    }
+
     #[test]
     fn restart_cache_places_recent_conditions_first() {
         let mut markets = vec![
@@ -525,6 +628,92 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["recent-a", "recent-b", "old-a", "old-z"]
         );
+    }
+
+    #[test]
+    fn restart_plan_recovers_recent_markets_missing_from_cache() {
+        let mut cached = vec![market("old"), market("cached-recent")];
+        let plan = build_restart_market_plan(
+            &mut cached,
+            vec![
+                gamma_market_for("missing"),
+                gamma_market_for("cached-recent"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(plan.prioritized, 1);
+        assert_eq!(cached[0].hash, "cached-recent");
+        assert_eq!(plan.missing.len(), 1);
+        assert_eq!(plan.missing[0].market.hash, "missing");
+        assert!(plan.missing[0].observation.is_some());
+    }
+
+    #[test]
+    fn restart_plan_rejects_asset_conflicts_before_admission() {
+        let mut cached = vec![market("cached")];
+        let mut conflicting = gamma_market_for("missing");
+        conflicting.assets_ids[0] = "cached-a".into();
+
+        let error = build_restart_market_plan(&mut cached, vec![conflicting])
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("reuses cached asset"));
+    }
+
+    #[test]
+    fn restart_plan_deduplicates_repeated_gamma_conditions() {
+        let mut cached = vec![market("cached")];
+        let plan = build_restart_market_plan(
+            &mut cached,
+            vec![gamma_market_for("missing"), gamma_market_for("missing")],
+        )
+        .unwrap();
+        assert_eq!(plan.missing.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restart_admission_emits_only_timestamped_discoveries() {
+        let timestamped = scanned_active(gamma_market_for("timestamped")).unwrap();
+        let mut without_timestamp = gamma_market_for("silent");
+        without_timestamp.created_at_ms = None;
+        without_timestamp.start_date_ms = None;
+        let silent = scanned_active(without_timestamp).unwrap();
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(2);
+
+        let admission = tokio::spawn(async move {
+            admit_restart_markets(&lifecycle_tx, vec![timestamped, silent]).await
+        });
+
+        let LifecycleRequest::Observation {
+            source,
+            observation,
+            completion,
+        } = lifecycle_rx.recv().await.unwrap()
+        else {
+            panic!("expected timestamped lifecycle observation")
+        };
+        assert_eq!(source, LifecycleSource::Gamma);
+        assert_eq!(observation.timestamp_received_ns, 300);
+        assert!(matches!(
+            observation.event,
+            Event::NewMarket { ref market, .. } if market == "timestamped"
+        ));
+        completion.send(Ok(())).unwrap();
+
+        let LifecycleRequest::Bootstrap {
+            markets,
+            completion,
+        } = lifecycle_rx.recv().await.unwrap()
+        else {
+            panic!("expected silent bootstrap")
+        };
+        assert_eq!(markets.len(), 1);
+        assert_eq!(markets[0].hash, "silent");
+        completion.send(Ok(())).unwrap();
+
+        admission.await.unwrap().unwrap();
+        assert!(lifecycle_rx.try_recv().is_err());
     }
 
     #[test]
