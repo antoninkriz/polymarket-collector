@@ -16,7 +16,11 @@ use crate::parquet_file::{StagedArtifact, write_arrow_batches};
 
 const MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
 const MAX_METADATA_BODY_BYTES: u64 = 2 * 1024 * 1024;
+const QUERY_MAX_ATTEMPTS: usize = 10;
+const QUERY_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+const METADATA_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
+const EVENT_QUERY_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActivePartition {
@@ -67,11 +71,11 @@ impl ClickHouseSource {
 
     fn query_text_with_retry(&self, query: &str, operation: &str) -> Result<String> {
         retry(
-            self.cfg.query_max_retries,
-            self.cfg.query_retry_delay,
+            QUERY_MAX_ATTEMPTS,
+            QUERY_INITIAL_RETRY_DELAY,
             operation,
             || {
-                let response = self.send(query, self.cfg.metadata_query_timeout)?;
+                let response = self.send(query, METADATA_QUERY_TIMEOUT)?;
                 read_response_text(response)
             },
         )
@@ -85,7 +89,7 @@ impl ClickHouseSource {
         event: EventType,
     ) -> Result<StagedArtifact> {
         let query = build_event_query(hour, event, &self.cfg.clickhouse_table)?;
-        let response = self.send(&query, self.cfg.event_query_timeout)?;
+        let response = self.send(&query, EVENT_QUERY_TIMEOUT)?;
         let reader = StreamReader::try_new_buffered(response, None)
             .with_context(|| format!("open {event} ClickHouse Arrow stream"))?;
         let staged = archive.stage(key)?;
@@ -147,8 +151,8 @@ impl EventSource for ClickHouseSource {
         event: EventType,
     ) -> Result<StagedArtifact> {
         retry(
-            self.cfg.query_max_retries,
-            self.cfg.query_retry_delay,
+            QUERY_MAX_ATTEMPTS,
+            QUERY_INITIAL_RETRY_DELAY,
             &format!("ClickHouse {event} export"),
             || self.export_event_once(archive, key, hour, event),
         )
@@ -283,17 +287,10 @@ mod tests {
             clickhouse_database: "default".to_owned(),
             clickhouse_table: "polymarket_orderbook_v3".to_owned(),
             export_backend: ExportBackend::Local {
-                root: "/tmp/archive".into(),
+                root: "/var/lib/archive".into(),
             },
             export_once: true,
-            export_delay_minutes: 5,
-            export_lag_hours: 1,
             clickhouse_retention_hours: 3,
-            loop_check_interval: Duration::from_secs(60),
-            query_max_retries: 1,
-            query_retry_delay: Duration::from_secs(1),
-            metadata_query_timeout: Duration::from_secs(1),
-            event_query_timeout: Duration::from_secs(1),
         })
         .unwrap();
         tokio::task::yield_now().await;

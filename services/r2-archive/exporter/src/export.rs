@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
@@ -14,6 +15,9 @@ use crate::event::{EventType, ensure_utc_hour};
 use crate::parquet_file::FileStats;
 
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+const EXPORT_DELAY_MINUTES: u32 = 5;
+const EXPORT_LAG_HOURS: i64 = 1;
+const LOOP_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct Exporter {
@@ -170,7 +174,7 @@ impl Exporter {
         now: DateTime<Utc>,
         next_hour: Option<DateTime<Utc>>,
     ) -> Result<Option<DateTime<Utc>>> {
-        if now.minute() < self.cfg.export_delay_minutes {
+        if now.minute() < EXPORT_DELAY_MINUTES {
             return Ok(next_hour);
         }
         let Some(latest) = self.latest_exportable_hour(now)? else {
@@ -307,7 +311,7 @@ impl Exporter {
         let Some(latest_received) = self.source.latest_received_hour()? else {
             return Ok(None);
         };
-        latest_exportable_hour(now, latest_received, self.cfg.export_lag_hours).map(Some)
+        latest_exportable_hour(now, latest_received, EXPORT_LAG_HOURS).map(Some)
     }
 }
 
@@ -538,14 +542,14 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
 
     info!(
-        check_interval_seconds = cfg.loop_check_interval.as_secs(),
+        check_interval_seconds = LOOP_CHECK_INTERVAL.as_secs(),
         "entering steady-state export loop",
     );
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
-            () = tokio::time::sleep(cfg.loop_check_interval) => {
+            () = tokio::time::sleep(LOOP_CHECK_INTERVAL) => {
                 let step = exporter.clone();
                 let attempted = next_hour;
                 match task::spawn_blocking(move || step.steady_state_step(Utc::now(), attempted)).await {
@@ -611,14 +615,7 @@ mod tests {
                 root: root.to_path_buf(),
             },
             export_once: true,
-            export_delay_minutes: 5,
-            export_lag_hours: 1,
             clickhouse_retention_hours: 3,
-            loop_check_interval: std::time::Duration::from_secs(60),
-            query_max_retries: 1,
-            query_retry_delay: std::time::Duration::from_secs(1),
-            metadata_query_timeout: std::time::Duration::from_secs(1),
-            event_query_timeout: std::time::Duration::from_secs(1),
         }
     }
 
