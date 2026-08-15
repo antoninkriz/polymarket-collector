@@ -86,8 +86,6 @@ services:
     logging: *default-logging
     networks:
       - obdata
-    depends_on:
-      - obdata-polymarket-orderbook-rust-pubsub
     ulimits:
       nofile:
         soft: ${CONTAINER_NOFILE_LIMIT:-65536}
