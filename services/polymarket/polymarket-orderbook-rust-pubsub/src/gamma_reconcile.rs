@@ -1,5 +1,6 @@
 //! Background Gamma reconciliation and Rust-owned restart-cache persistence.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,7 +10,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{info, warn};
 
-use polymarket_orderbook_rust::events::{Event, MarketLifecycleObservation};
+use polymarket_orderbook_rust::events::{Event, Market, MarketLifecycleObservation};
 use polymarket_orderbook_rust::markets::gamma::{GammaClient, GammaMarket};
 use polymarket_orderbook_rust::markets::lifecycle::{
     ActiveMarketSnapshot, LifecycleRequest, LifecycleSource, ScannedActiveMarket,
@@ -22,6 +23,7 @@ const NEW_MARKET_INTERVAL: Duration = Duration::from_secs(10);
 const CLOSED_MARKET_INTERVAL: Duration = Duration::from_secs(30);
 const CACHE_INTERVAL: Duration = Duration::from_secs(60);
 const POLL_OVERLAP: TimeDelta = TimeDelta::minutes(2);
+const RESTART_PRIORITY_WINDOW: TimeDelta = TimeDelta::hours(24);
 
 #[derive(Debug, Clone, Copy)]
 pub enum CacheSaveTrigger {
@@ -60,6 +62,47 @@ impl ReconciliationStats {
             ),
         }
     }
+}
+
+/// Move recently started active markets to the front of a restart cache.
+///
+/// The cache remains authoritative for the complete universe; Gamma is used
+/// only to assign subscription priority. Failure therefore never discards a
+/// cached market or blocks the later full reconciliation scan.
+pub async fn prioritize_restart_markets(
+    client: &GammaClient,
+    markets: &mut [Market],
+    now: DateTime<Utc>,
+) -> Result<usize> {
+    let cutoff = (now - RESTART_PRIORITY_WINDOW).timestamp_millis();
+    let mut scan = client.active_since_scan(cutoff);
+    let mut priorities = Vec::new();
+    while let Some(page) = client.next_keyset_page(&mut scan).await? {
+        priorities.extend(page.into_iter().map(|market| market.condition_id));
+    }
+    Ok(reorder_cached_markets(markets, &priorities))
+}
+
+fn reorder_cached_markets(markets: &mut [Market], priorities: &[String]) -> usize {
+    let ranks: HashMap<&str, usize> = priorities
+        .iter()
+        .enumerate()
+        .map(|(rank, condition)| (condition.as_str(), rank))
+        .collect();
+    let prioritized = markets
+        .iter()
+        .filter(|market| ranks.contains_key(market.hash.as_str()))
+        .count();
+    markets.sort_unstable_by(|left, right| {
+        let left_rank = ranks.get(left.hash.as_str()).copied();
+        let right_rank = ranks.get(right.hash.as_str()).copied();
+        left_rank
+            .is_none()
+            .cmp(&right_rank.is_none())
+            .then_with(|| left_rank.cmp(&right_rank))
+            .then_with(|| left.hash.cmp(&right.hash))
+    });
+    prioritized
 }
 
 pub async fn run_full_scans(
@@ -423,6 +466,33 @@ mod tests {
             closed_time_ms: None,
             received_at_ns: 300,
         }
+    }
+
+    fn market(hash: &str) -> Market {
+        Market::new(hash.into(), format!("{hash}-a"), format!("{hash}-b"))
+    }
+
+    #[test]
+    fn restart_cache_places_recent_conditions_first() {
+        let mut markets = vec![
+            market("old-z"),
+            market("recent-b"),
+            market("old-a"),
+            market("recent-a"),
+        ];
+        let prioritized = reorder_cached_markets(
+            &mut markets,
+            &["recent-a".into(), "missing".into(), "recent-b".into()],
+        );
+
+        assert_eq!(prioritized, 2);
+        assert_eq!(
+            markets
+                .iter()
+                .map(|market| market.hash.as_str())
+                .collect::<Vec<_>>(),
+            ["recent-a", "recent-b", "old-a", "old-z"]
+        );
     }
 
     #[test]

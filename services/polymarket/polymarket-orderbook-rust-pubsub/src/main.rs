@@ -107,9 +107,25 @@ async fn main() -> Result<()> {
         LifecycleCoordinator::new(Arc::clone(&pool), websocket_lifecycle_rx, reconciliation_rx);
     let mut coordinator_handle = tokio::spawn(coordinator.run());
 
-    let (cached_markets, cache_fetched_at) = load_restart_cache(&cfg).await;
+    let gamma_http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build Gamma HTTP client")?;
+    let gamma_client = markets::gamma::GammaClient::new(gamma_http);
+
+    let (mut cached_markets, cache_fetched_at) = load_restart_cache(&cfg).await;
     let cold_start = cached_markets.is_empty();
     if !cached_markets.is_empty() {
+        match gamma_reconcile::prioritize_restart_markets(
+            &gamma_client,
+            &mut cached_markets,
+            Utc::now(),
+        )
+        .await
+        {
+            Ok(prioritized) => info!(prioritized, "prioritized recent restart-cache markets"),
+            Err(error) => warn!(%error, "could not prioritize restart-cache markets"),
+        }
         let market_count = cached_markets.len();
         apply_bootstrap(&reconciliation_tx, cached_markets).await?;
         if market_count > 0 {
@@ -120,11 +136,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    let gamma_http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("build Gamma HTTP client")?;
-    let gamma_client = markets::gamma::GammaClient::new(gamma_http);
     let reconciliation_stats = Arc::new(ReconciliationStats::default());
     let (cache_trigger_tx, cache_trigger_rx) = mpsc::channel(1);
     let (gamma_shutdown_tx, gamma_shutdown_rx) = watch::channel(false);

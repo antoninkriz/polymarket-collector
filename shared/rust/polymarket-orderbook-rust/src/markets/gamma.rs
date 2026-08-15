@@ -329,6 +329,11 @@ fn scan_params(kind: KeysetScanKind, cursor: Option<&str>) -> Vec<(&'static str,
         KeysetScanKind::FullActive => {
             params.push(("active", "true".to_string()));
             params.push(("closed", "false".to_string()));
+            // Cold scans feed pages directly into the WebSocket pool. Newest
+            // markets first makes short-lived contracts available before the
+            // long tail of the active universe finishes subscribing.
+            params.push(("order", "startDate".to_string()));
+            params.push(("ascending", "false".to_string()));
         }
         KeysetScanKind::ActiveSince(_) => {
             // start_date_min is the only documented keyset lower bound for
@@ -659,6 +664,8 @@ mod tests {
                 ("limit", "100".into()),
                 ("active", "true".into()),
                 ("closed", "false".into()),
+                ("order", "startDate".into()),
+                ("ascending", "false".into()),
             ]
         );
         assert_eq!(
@@ -667,6 +674,8 @@ mod tests {
                 ("limit", "100".into()),
                 ("active", "true".into()),
                 ("closed", "false".into()),
+                ("order", "startDate".into()),
+                ("ascending", "false".into()),
                 ("after_cursor", "opaque".into()),
             ]
         );
