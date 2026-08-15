@@ -2,7 +2,7 @@
 
 This project collects live data from Polymarket across all prediction markets with periodic hourly Parquet exports. Compared to its predecessors, it should correctly handle short-lived markets such as 5-minute BTC up/down markets, preserve the original event order for correct order book reconstruction, and stores different types of market event data separately in an optimized Parquet layout.
 
-## The archive at a glance
+## The archive structure TLDR
 
 Every completed UTC receive-time hour is a self-contained directory:
 
@@ -17,7 +17,6 @@ YYYY-MM-DD/HH/
 ├── tick_size_change.parquet
 └── manifest.json
 ```
-
 
 | File                       | What one row represents                                                          |
 | -------------------------- | -------------------------------------------------------------------------------- |
