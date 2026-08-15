@@ -144,8 +144,7 @@ async fn main() -> Result<()> {
         let market_count = cached_markets.len();
         apply_bootstrap_batched(&reconciliation_tx, cached_markets).await?;
         if market_count > 0 {
-            let pool_stats = request_pool_stats(&reconciliation_tx).await?;
-            info!(markets = pool_stats.market_count, "pre-loaded markets",);
+            info!(markets = market_count, "pre-loaded markets");
         }
     }
 
@@ -443,8 +442,6 @@ async fn stats_loop(
     let mut queue_high_water = 0_usize;
     let mut websocket_lifecycle_high_water = 0_usize;
     let mut reconciliation_high_water = 0_usize;
-    let mut previous_asset_recovery_events = 0_u64;
-    let mut previous_asset_recovery_latency_us = 0_u64;
     loop {
         tick.tick().await;
 
@@ -472,20 +469,14 @@ async fn stats_loop(
             }
         };
         let reconciliation_ages = reconciliation_stats.ages();
-        let asset_recoveries = stats
-            .asset_recovery_events
-            .saturating_sub(previous_asset_recovery_events);
-        let asset_recovery_latency_us = stats
-            .asset_recovery_latency_us
-            .saturating_sub(previous_asset_recovery_latency_us);
+        let asset_recoveries = stats.asset_recoveries;
+        let asset_recovery_latency_us = stats.asset_recovery_latency_us;
         let asset_recovery_avg_ms = if asset_recoveries > 0 {
             asset_recovery_latency_us as f64 / asset_recoveries as f64 / 1_000.0
         } else {
             0.0
         };
         let asset_recovery_max_ms = stats.asset_recovery_latency_us_max as f64 / 1_000.0;
-        previous_asset_recovery_events = stats.asset_recovery_events;
-        previous_asset_recovery_latency_us = stats.asset_recovery_latency_us;
 
         let queue_pct = if queue_max > 0 {
             (queue_used as f64 / queue_max as f64) * 100.0
