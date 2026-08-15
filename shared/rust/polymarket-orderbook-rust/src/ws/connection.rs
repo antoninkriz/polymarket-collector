@@ -13,6 +13,8 @@
 //! busy market-data stream delays the textual PONG behind data frames. If no
 //! frame arrives before the heartbeat deadline, the socket is closed and the
 //! run loop reconnects after a short per-connection jitter (no base backoff).
+//! Connection handshakes are bounded so an upstream half-open attempt cannot
+//! hold an authoritative route until the operating system times it out.
 //! Other failures use exponential backoff (1 → 60 s) plus the same jitter so
 //! an upstream batch close does not become a synchronized reconnect storm.
 //!
@@ -55,6 +57,9 @@ use crate::events::{explode, Event, MarketLifecycleObservation, WireMessage};
 use crate::record::{now_ns, CollectorContext, EventRecord};
 use crate::ws::WS_MARKET_URL;
 
+type MarketWebSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
 /// Liveness state of a single WebSocket connection. Published by the
 /// connection task on every transition and observed by the pool's health
 /// monitor to track asset-level up/down status.
@@ -79,6 +84,7 @@ pub enum HealthEvent {
 /// every 10 seconds; see the module-level heartbeat documentation.
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 const PONG_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
 const RECONNECT_JITTER_MAX_MS: u64 = 750;
 
@@ -90,6 +96,14 @@ fn reconnect_jitter(index: usize, reconnect_round: u64) -> Duration {
         .wrapping_mul(6_364_136_223_846_793_005)
         .wrapping_add(reconnect_round.wrapping_mul(1_442_695_040_888_963_407));
     Duration::from_millis(mixed % (RECONNECT_JITTER_MAX_MS + 1))
+}
+
+async fn connect_websocket(url: &str, timeout: Duration) -> Result<MarketWebSocket> {
+    let result = tokio::time::timeout(timeout, tokio_tungstenite::connect_async(url))
+        .await
+        .context("WebSocket connection timed out")?;
+    let (stream, _response) = result.context("WebSocket connection failed")?;
+    Ok(stream)
 }
 
 /// Commands sent from the pool into a connection task. Shutdown is signalled
@@ -195,13 +209,13 @@ impl Connection {
             }
 
             // Connect.
-            let ws_stream = match tokio_tungstenite::connect_async(WS_MARKET_URL).await {
-                Ok((stream, _resp)) => {
+            let ws_stream = match connect_websocket(WS_MARKET_URL, CONNECT_TIMEOUT).await {
+                Ok(stream) => {
                     backoff = Duration::from_secs(1);
                     stream
                 }
-                Err(e) => {
-                    error!(conn = index, error = %e, "ws connect failed");
+                Err(error) => {
+                    error!(conn = index, %error, "ws connect failed");
                     // Stay in Disconnected; loop and retry with backoff.
                     let _ = status_tx.send(HealthEvent::Connection {
                         conn_id: index,
@@ -329,9 +343,7 @@ struct SessionContext<'a> {
 /// then multiplex reads, ping ticker, and pool commands until something
 /// breaks. Updates `last_message_time` whenever a frame is received.
 async fn run_session(
-    ws_stream: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    ws_stream: MarketWebSocket,
     context: SessionContext<'_>,
     sub: &mut SubState,
     commands: &mut mpsc::Receiver<Command>,
@@ -705,6 +717,28 @@ mod tests {
             s.initialized.insert((*a).into());
         }
         s
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_is_bounded() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let stalled_server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let error =
+            match connect_websocket(&format!("ws://{address}"), Duration::from_millis(25)).await {
+                Ok(_) => panic!("stalled WebSocket handshake unexpectedly succeeded"),
+                Err(error) => error,
+            };
+        assert!(error.to_string().contains("connection timed out"));
+
+        stalled_server.abort();
+        let _ = stalled_server.await;
     }
 
     #[test]
