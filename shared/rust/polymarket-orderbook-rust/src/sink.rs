@@ -11,12 +11,12 @@ use reqwest::Client;
 use serde::Serialize;
 use tracing::{error, info};
 
-use crate::record::EventRecord;
-
-/// One durable Redis Stream delivery awaiting a ClickHouse commit.
+/// One Redis Stream delivery normalized to the ClickHouse raw-row contract.
 #[derive(Debug)]
 pub struct SinkItem {
-    pub record: EventRecord,
+    pub timestamp_received: i64,
+    pub sequence: u64,
+    pub data: String,
     pub delivery_id: String,
 }
 
@@ -102,13 +102,12 @@ impl Sink {
     fn serialize_batch(batch: &[SinkItem]) -> Result<Vec<u8>> {
         let mut body = Vec::with_capacity(batch.len() * 256);
         for item in batch {
-            let data = serde_json::to_string(&item.record.event).context("serialize v3 event")?;
             serde_json::to_writer(
                 &mut body,
                 &RawRow {
-                    timestamp_received: item.record.timestamp_received_ns,
-                    sequence: item.record.sequence,
-                    data: &data,
+                    timestamp_received: item.timestamp_received,
+                    sequence: item.sequence,
+                    data: &item.data,
                 },
             )
             .context("serialize v3 row")?;
@@ -227,7 +226,9 @@ mod tests {
         let mut record = collector.record(event, 1_757_908_892_351_123_456);
         record.sequence += sequence;
         SinkItem {
-            record,
+            timestamp_received: record.timestamp_received_ns,
+            sequence: record.sequence,
+            data: serde_json::to_string(&record.event).unwrap(),
             delivery_id: format!("{sequence}-0"),
         }
     }

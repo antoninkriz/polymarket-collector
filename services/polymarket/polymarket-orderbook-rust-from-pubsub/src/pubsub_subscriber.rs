@@ -8,8 +8,9 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use redis::streams::{StreamReadOptions, StreamReadReply};
-use redis::{AsyncCommands, AsyncConnectionConfig};
+use redis::streams::{StreamId, StreamReadOptions, StreamReadReply};
+use redis::{AsyncCommands, AsyncConnectionConfig, Value};
+use serde_json::value::RawValue;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -151,19 +152,7 @@ impl Writer {
                     if draining_pending {
                         last_pending_id.clone_from(&entry.id);
                     }
-                    let payload: String = entry.get("payload").ok_or_else(|| {
-                        anyhow::anyhow!("stream entry {} has no payload", entry.id)
-                    })?;
-                    let record =
-                        serde_json::from_str::<EventRecord>(&payload).map_err(|error| {
-                            self.stats.parse_failures += 1;
-                            anyhow::anyhow!(
-                                "parse v3 stream entry {}: {}; payload={}",
-                                entry.id,
-                                error,
-                                preview(&payload),
-                            )
-                        })?;
+                    let item = parse_stream_entry(&entry, &mut self.stats)?;
                     if self.batch.is_empty() {
                         self.batch_deadline = Some(
                             Instant::now()
@@ -171,10 +160,7 @@ impl Writer {
                                 .context("ClickHouse flush deadline overflow")?,
                         );
                     }
-                    self.batch.push(SinkItem {
-                        record,
-                        delivery_id: entry.id,
-                    });
+                    self.batch.push(item);
                     self.batch_high_water = self.batch_high_water.max(self.batch.len());
                     self.stats.events_read += 1;
                 }
@@ -425,6 +411,125 @@ fn ack_delete_counts(statuses: &[i64], expected: usize) -> Result<(u64, u64)> {
     Ok((acknowledged, deleted))
 }
 
+fn parse_stream_entry(entry: &StreamId, stats: &mut WriterStats) -> Result<SinkItem> {
+    let result = parse_stream_entry_fields(entry).with_context(|| {
+        format!(
+            "parse v3 stream entry {}; fields={}",
+            entry.id,
+            stream_entry_preview(entry),
+        )
+    });
+    if result.is_err() {
+        stats.parse_failures += 1;
+    }
+    result
+}
+
+fn parse_stream_entry_fields(entry: &StreamId) -> Result<SinkItem> {
+    // Transitional compatibility for entries published before the three-field
+    // stream contract. Remove it after the old stream and PEL have drained.
+    let legacy = entry.map.len() == 1 && entry.map.contains_key("payload");
+    let raw = entry.map.len() == 3
+        && entry.map.contains_key("timestamp_received")
+        && entry.map.contains_key("sequence")
+        && entry.map.contains_key("data");
+    anyhow::ensure!(
+        legacy || raw,
+        "expected exactly legacy field `payload` or raw fields `timestamp_received`, `sequence`, `data`"
+    );
+
+    if legacy {
+        let payload = stream_field(entry, "payload")?;
+        let record =
+            serde_json::from_str::<EventRecord>(payload).context("parse legacy payload")?;
+        anyhow::ensure!(
+            record.timestamp_received_ns >= 0,
+            "timestamp_received must be a non-negative i64 epoch nanosecond value"
+        );
+        return Ok(SinkItem {
+            timestamp_received: record.timestamp_received_ns,
+            sequence: record.sequence,
+            data: serde_json::to_string(&record.event).context("serialize legacy event")?,
+            delivery_id: entry.id.clone(),
+        });
+    }
+
+    let timestamp_received = stream_field(entry, "timestamp_received")?
+        .parse::<i64>()
+        .context("parse timestamp_received as i64 epoch nanoseconds")?;
+    anyhow::ensure!(
+        timestamp_received >= 0,
+        "timestamp_received must be a non-negative i64 epoch nanosecond value"
+    );
+    let sequence = stream_field(entry, "sequence")?
+        .parse::<u64>()
+        .context("parse sequence as u64")?;
+    let data = stream_field(entry, "data")?;
+    let raw = serde_json::from_str::<&RawValue>(data).context("parse data as JSON")?;
+    anyhow::ensure!(
+        raw.get().trim_start().starts_with('{'),
+        "data must be a JSON object"
+    );
+    Ok(SinkItem {
+        timestamp_received,
+        sequence,
+        data: data.to_owned(),
+        delivery_id: entry.id.clone(),
+    })
+}
+
+fn stream_field<'a>(entry: &'a StreamId, name: &str) -> Result<&'a str> {
+    let value = entry
+        .map
+        .get(name)
+        .with_context(|| format!("missing field {name:?}"))?;
+    let Value::BulkString(bytes) = value else {
+        anyhow::bail!(
+            "field {name:?} must be a bulk string, got {}",
+            redis_value_kind(value)
+        );
+    };
+    std::str::from_utf8(bytes).with_context(|| format!("field {name:?} is not valid UTF-8"))
+}
+
+fn redis_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Nil => "nil",
+        Value::Int(_) => "integer",
+        Value::BulkString(_) => "bulk string",
+        Value::Array(_) => "array",
+        Value::SimpleString(_) => "simple string",
+        Value::Okay => "okay",
+        Value::Map(_) => "map",
+        Value::Attribute { .. } => "attribute",
+        Value::Set(_) => "set",
+        Value::Double(_) => "double",
+        Value::Boolean(_) => "boolean",
+        Value::VerbatimString { .. } => "verbatim string",
+        Value::Push { .. } => "push",
+        Value::ServerError(_) => "server error",
+        _ => "unknown Redis value",
+    }
+}
+
+fn stream_entry_preview(entry: &StreamId) -> String {
+    let mut names = entry.map.keys().map(String::as_str).collect::<Vec<_>>();
+    names.sort_unstable();
+    let fields = names
+        .into_iter()
+        .map(|name| match entry.map.get(name) {
+            Some(Value::BulkString(bytes)) => match std::str::from_utf8(bytes) {
+                Ok(value) => format!("{name}={:?}", preview(value)),
+                Err(_) => format!("{name}=<invalid UTF-8 bulk string>"),
+            },
+            Some(value) => format!("{name}=<{}>", redis_value_kind(value)),
+            None => unreachable!("field name came from the same map"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    preview(&fields)
+}
+
 fn preview(payload: &str) -> String {
     const MAX: usize = 200;
     if payload.len() <= MAX {
@@ -443,12 +548,265 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use anyhow::Result;
+    use polymarket_orderbook_rust::record::EventRecord;
+    use redis::streams::StreamId;
+    use redis::Value;
 
     use super::{
-        ack_delete_counts, ensure_consumer_group, flush_acks, preview, WriterConfig, WriterStats,
+        ack_delete_counts, ensure_consumer_group, flush_acks, parse_stream_entry, preview,
+        WriterConfig, WriterStats,
     };
 
     const TEST_REDIS_URL: &str = "redis://localhost:16380";
+
+    fn stream_entry(fields: &[(&str, &str)]) -> StreamId {
+        StreamId {
+            id: "1-0".into(),
+            map: fields
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        (*name).to_owned(),
+                        Value::BulkString(value.as_bytes().to_vec()),
+                    )
+                })
+                .collect(),
+            ..StreamId::default()
+        }
+    }
+
+    fn legacy_payload_fields(timestamp_received: &str, sequence: &str) -> String {
+        format!(
+            r#"{{"timestamp_received_ns":{timestamp_received},"sequence":{sequence},"event_type":"tick_size_change","market":"0xmarket","asset_id":"asset","timestamp":"1757908892351","old_tick_size":"0.01","new_tick_size":"0.001"}}"#
+        )
+    }
+
+    fn legacy_payload(timestamp_received: i64, sequence: u64) -> String {
+        legacy_payload_fields(&timestamp_received.to_string(), &sequence.to_string())
+    }
+
+    #[test]
+    fn legacy_and_raw_entries_produce_the_same_committed_row() {
+        let timestamp_received = 1_757_908_892_351_123_456_i64;
+        let sequence = 42_u64;
+        let payload = legacy_payload(timestamp_received, sequence);
+        let record = serde_json::from_str::<EventRecord>(&payload).unwrap();
+        let data = serde_json::to_string(&record.event).unwrap();
+        let timestamp_received_text = timestamp_received.to_string();
+        let sequence_text = sequence.to_string();
+        let legacy = stream_entry(&[("payload", &payload)]);
+        let raw = stream_entry(&[
+            ("timestamp_received", &timestamp_received_text),
+            ("sequence", &sequence_text),
+            ("data", &data),
+        ]);
+        let mut stats = WriterStats::default();
+
+        let legacy = parse_stream_entry(&legacy, &mut stats).unwrap();
+        let raw = parse_stream_entry(&raw, &mut stats).unwrap();
+
+        assert_eq!(legacy.timestamp_received, raw.timestamp_received);
+        assert_eq!(legacy.sequence, raw.sequence);
+        assert_eq!(legacy.data, raw.data);
+        assert_eq!(stats.parse_failures, 0);
+    }
+
+    #[test]
+    fn raw_entry_accepts_any_json_object_and_preserves_its_text() {
+        let data = "  {\"future_event\":[1,true],\"unknown\":null} \n";
+        let entry = stream_entry(&[
+            ("timestamp_received", "1757908892351123456"),
+            ("sequence", "42"),
+            ("data", data),
+        ]);
+        let mut stats = WriterStats::default();
+
+        let item = parse_stream_entry(&entry, &mut stats).unwrap();
+
+        assert_eq!(item.timestamp_received, 1_757_908_892_351_123_456);
+        assert_eq!(item.sequence, 42);
+        assert_eq!(item.data, data);
+        assert_eq!(stats.parse_failures, 0);
+    }
+
+    #[test]
+    fn stream_fields_must_be_utf8_bulk_strings_without_numeric_coercion() {
+        let mut integer = stream_entry(&[
+            ("timestamp_received", "1"),
+            ("sequence", "2"),
+            ("data", "{}"),
+        ]);
+        integer
+            .map
+            .insert("timestamp_received".into(), Value::Int(1));
+        let mut invalid_utf8 = stream_entry(&[
+            ("timestamp_received", "1"),
+            ("sequence", "2"),
+            ("data", "{}"),
+        ]);
+        invalid_utf8
+            .map
+            .insert("data".into(), Value::BulkString(vec![0xff]));
+        let mut stats = WriterStats::default();
+
+        let integer_error = parse_stream_entry(&integer, &mut stats).unwrap_err();
+        let integer_message = format!("{integer_error:#}");
+        assert!(
+            integer_message.contains("must be a bulk string, got integer"),
+            "{integer_message}"
+        );
+        assert!(
+            integer_message.contains("timestamp_received=<integer>"),
+            "{integer_message}"
+        );
+
+        let utf8_error = parse_stream_entry(&invalid_utf8, &mut stats).unwrap_err();
+        let utf8_message = format!("{utf8_error:#}");
+        assert!(utf8_message.contains("not valid UTF-8"), "{utf8_message}");
+        assert!(
+            utf8_message.contains("data=<invalid UTF-8 bulk string>"),
+            "{utf8_message}"
+        );
+        assert_eq!(stats.parse_failures, 2);
+    }
+
+    #[test]
+    fn negative_received_timestamp_is_rejected_for_legacy_and_raw_entries() {
+        let legacy_payload = legacy_payload(-1, 2);
+        let entries = [
+            stream_entry(&[("payload", &legacy_payload)]),
+            stream_entry(&[
+                ("timestamp_received", "-1"),
+                ("sequence", "2"),
+                ("data", "{}"),
+            ]),
+        ];
+        let mut stats = WriterStats::default();
+
+        for entry in &entries {
+            let error = parse_stream_entry(entry, &mut stats).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("must be a non-negative i64"), "{message}");
+        }
+        assert_eq!(stats.parse_failures, entries.len() as u64);
+    }
+
+    #[test]
+    fn overflowing_i64_timestamp_and_u64_sequence_are_rejected() {
+        let legacy_timestamp = legacy_payload_fields("9223372036854775808", "2");
+        let legacy_sequence = legacy_payload_fields("1", "18446744073709551616");
+        let entries = [
+            (
+                stream_entry(&[("payload", &legacy_timestamp)]),
+                "expected i64",
+            ),
+            (
+                stream_entry(&[("payload", &legacy_sequence)]),
+                "expected u64",
+            ),
+            (
+                stream_entry(&[
+                    ("timestamp_received", "9223372036854775808"),
+                    ("sequence", "2"),
+                    ("data", "{}"),
+                ]),
+                "number too large",
+            ),
+            (
+                stream_entry(&[
+                    ("timestamp_received", "1"),
+                    ("sequence", "18446744073709551616"),
+                    ("data", "{}"),
+                ]),
+                "number too large",
+            ),
+        ];
+        let mut stats = WriterStats::default();
+
+        for (entry, expected) in &entries {
+            let error = parse_stream_entry(entry, &mut stats).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains(expected), "{message}");
+        }
+        assert_eq!(stats.parse_failures, entries.len() as u64);
+    }
+
+    #[test]
+    fn incomplete_ambiguous_and_extra_field_sets_are_rejected() {
+        let payload = legacy_payload(1, 2);
+        let entries = [
+            stream_entry(&[("timestamp_received", "1"), ("sequence", "2")]),
+            stream_entry(&[
+                ("payload", &payload),
+                ("timestamp_received", "1"),
+                ("sequence", "2"),
+                ("data", "{}"),
+            ]),
+            stream_entry(&[
+                ("timestamp_received", "1"),
+                ("sequence", "2"),
+                ("data", "{}"),
+                ("extra", "value"),
+            ]),
+        ];
+        let mut stats = WriterStats::default();
+
+        for entry in &entries {
+            let error = parse_stream_entry(entry, &mut stats).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("expected exactly"), "{message}");
+            assert!(message.contains("fields="), "{message}");
+        }
+        assert_eq!(stats.parse_failures, entries.len() as u64);
+    }
+
+    #[test]
+    fn malformed_legacy_numeric_and_json_fields_are_rejected() {
+        let entries = [
+            (stream_entry(&[("payload", "not-json")]), "not-json"),
+            (
+                stream_entry(&[
+                    ("timestamp_received", "later"),
+                    ("sequence", "2"),
+                    ("data", "{}"),
+                ]),
+                "later",
+            ),
+            (
+                stream_entry(&[
+                    ("timestamp_received", "1"),
+                    ("sequence", "-2"),
+                    ("data", "{}"),
+                ]),
+                "-2",
+            ),
+            (
+                stream_entry(&[
+                    ("timestamp_received", "1"),
+                    ("sequence", "2"),
+                    ("data", "{\"broken\":"),
+                ]),
+                "broken",
+            ),
+            (
+                stream_entry(&[
+                    ("timestamp_received", "1"),
+                    ("sequence", "2"),
+                    ("data", "[]"),
+                ]),
+                "[]",
+            ),
+        ];
+        let mut stats = WriterStats::default();
+
+        for (entry, expected_preview) in &entries {
+            let error = parse_stream_entry(entry, &mut stats).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("fields="), "{message}");
+            assert!(message.contains(expected_preview), "{message}");
+        }
+        assert_eq!(stats.parse_failures, entries.len() as u64);
+    }
 
     #[test]
     fn preview_does_not_split_a_utf8_character() {

@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use polymarket_orderbook_rust::events::Event;
-use polymarket_orderbook_rust::record::CollectorContext;
+use polymarket_orderbook_rust::record::{CollectorContext, EventRecord};
 use polymarket_orderbook_rust::sink::{Sink, SinkConfig, SinkItem};
 use reqwest::Client;
 use rust_decimal::Decimal;
@@ -24,6 +24,15 @@ fn ch_password() -> String {
 
 fn dec(value: &str) -> Decimal {
     value.parse().unwrap()
+}
+
+fn item(record: EventRecord, delivery_id: &str) -> SinkItem {
+    SinkItem {
+        timestamp_received: record.timestamp_received_ns,
+        sequence: record.sequence,
+        data: serde_json::to_string(&record.event).unwrap(),
+        delivery_id: delivery_id.into(),
+    }
 }
 
 async fn query(http: &Client, sql: &str) -> Result<String> {
@@ -72,18 +81,9 @@ async fn sink_collapses_only_same_sequence_retry() -> Result<()> {
     let second = collector.record(trade, 1_757_908_892_351_123_457);
 
     let batch = [
-        SinkItem {
-            record: first.clone(),
-            delivery_id: "1-0".into(),
-        },
-        SinkItem {
-            record: first,
-            delivery_id: "1-1".into(),
-        },
-        SinkItem {
-            record: second,
-            delivery_id: "1-2".into(),
-        },
+        item(first.clone(), "1-0"),
+        item(first, "1-1"),
+        item(second, "1-2"),
     ];
     sink.insert(&batch).await?;
     assert_eq!(sink.total_flushed(), 3);

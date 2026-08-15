@@ -6,9 +6,11 @@
 //! cargo test --test writer_integration -- --ignored --nocapture
 //! ```
 
+use std::fmt::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use polymarket_orderbook_rust::record::EventRecord;
 use polymarket_orderbook_rust::sink::{Sink, SinkConfig};
 use polymarket_orderbook_rust_from_pubsub::pubsub_subscriber::{Writer, WriterConfig};
 use reqwest::Client;
@@ -22,9 +24,25 @@ fn clickhouse_password() -> String {
     std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default()
 }
 
+fn timestamp_received(sequence: u64) -> i64 {
+    1_757_908_892_351_123_456_i64 + sequence as i64
+}
+
+fn data() -> String {
+    serde_json::json!({
+        "event_type": "tick_size_change",
+        "market": "0xmarket",
+        "asset_id": "asset",
+        "timestamp": "1757908892351",
+        "old_tick_size": "0.01",
+        "new_tick_size": "0.001",
+    })
+    .to_string()
+}
+
 fn payload(sequence: u64) -> String {
     serde_json::json!({
-        "timestamp_received_ns": 1_757_908_892_351_123_456_i64 + sequence as i64,
+        "timestamp_received_ns": timestamp_received(sequence),
         "sequence": sequence,
         "event_type": "tick_size_change",
         "market": "0xmarket",
@@ -34,6 +52,19 @@ fn payload(sequence: u64) -> String {
         "new_tick_size": "0.001",
     })
     .to_string()
+}
+
+fn committed_legacy_data(sequence: u64) -> String {
+    let record = serde_json::from_str::<EventRecord>(&payload(sequence)).unwrap();
+    serde_json::to_string(&record.event).unwrap()
+}
+
+fn hex(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        write!(encoded, "{byte:02X}").unwrap();
+    }
+    encoded
 }
 
 async fn clickhouse_query(http: &Client, sql: &str) -> Result<String> {
@@ -94,15 +125,24 @@ async fn writer_drains_pending_and_flushes_before_shutdown_ack() -> Result<()> {
         .arg("MKSTREAM")
         .query_async(&mut conn)
         .await?;
-    for sequence in 100..102 {
-        let _: String = redis::cmd("XADD")
-            .arg(&stream)
-            .arg("*")
-            .arg("payload")
-            .arg(payload(sequence))
-            .query_async(&mut conn)
-            .await?;
-    }
+    let _: String = redis::cmd("XADD")
+        .arg(&stream)
+        .arg("*")
+        .arg("payload")
+        .arg(payload(100))
+        .query_async(&mut conn)
+        .await?;
+    let _: String = redis::cmd("XADD")
+        .arg(&stream)
+        .arg("*")
+        .arg("timestamp_received")
+        .arg(timestamp_received(101))
+        .arg("sequence")
+        .arg(101_u64)
+        .arg("data")
+        .arg(data())
+        .query_async(&mut conn)
+        .await?;
     let _: redis::Value = redis::cmd("XREADGROUP")
         .arg("GROUP")
         .arg(group)
@@ -119,8 +159,12 @@ async fn writer_drains_pending_and_flushes_before_shutdown_ack() -> Result<()> {
     let _: String = redis::cmd("XADD")
         .arg(&stream)
         .arg("*")
-        .arg("payload")
-        .arg(payload(102))
+        .arg("timestamp_received")
+        .arg(timestamp_received(102))
+        .arg("sequence")
+        .arg(102_u64)
+        .arg("data")
+        .arg(data())
         .query_async(&mut conn)
         .await?;
 
@@ -180,6 +224,27 @@ async fn writer_drains_pending_and_flushes_before_shutdown_ack() -> Result<()> {
     )
     .await?;
     assert_eq!(counts.trim(), "3\t3\t100\t102");
+
+    let rows = clickhouse_query(
+        &http,
+        &format!(
+            "SELECT sequence, toUnixTimestamp64Nano(timestamp_received), hex(data) \
+             FROM {CLICKHOUSE_DATABASE}.{table} FINAL \
+             ORDER BY sequence FORMAT TabSeparated"
+        ),
+    )
+    .await?;
+    let raw_data = data();
+    let expected = format!(
+        "100\t{}\t{}\n101\t{}\t{}\n102\t{}\t{}",
+        timestamp_received(100),
+        hex(&committed_legacy_data(100)),
+        timestamp_received(101),
+        hex(&raw_data),
+        timestamp_received(102),
+        hex(&raw_data),
+    );
+    assert_eq!(rows.trim(), expected);
 
     clickhouse_query(&http, &format!("DROP TABLE {CLICKHOUSE_DATABASE}.{table}")).await?;
     let _: i64 = redis::cmd("DEL")
