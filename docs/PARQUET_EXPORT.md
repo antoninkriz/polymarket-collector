@@ -1,13 +1,10 @@
 # Parquet archive format
 
-This document is the file-level contract for the event-specific archive. For
-collection guarantees, deduplication, restart ordering, and replay rules, see
-[`DATA_MODEL.md`](DATA_MODEL.md).
+This document is the file-level contract for the event-specific archive. For collection guarantees, deduplication, restart ordering, and replay rules, see [`DATA_MODEL.md`](DATA_MODEL.md).
 
 ## Directory layout
 
-Each completed UTC receive-time hour contains seven Parquet files and one JSON
-manifest:
+Each completed UTC receive-time hour contains seven Parquet files and one JSON manifest:
 
 ```text
 2026-08-13/14/
@@ -21,32 +18,17 @@ manifest:
 └── manifest.json
 ```
 
-Dates use `YYYY-MM-DD`; hours are zero-padded from `00` through `23`. The
-filename is the event type, so Parquet files do not contain an `event_type`
-column. Every file is present even when it has zero rows. Treat the hour as
-complete only when `manifest.json` exists.
+Dates use `YYYY-MM-DD`; hours are zero-padded from `00` through `23`. The filename is the event type, so Parquet files do not contain an `event_type` column. Every file is present even when it has zero rows. Treat the hour as complete only when `manifest.json` exists.
 
-`sequence` is the authoritative collector observation order. The physical file
-order clusters rows by market and asset for compression and selective reads.
-To replay across assets, markets, or event files, combine the relevant rows and
-order them by `sequence`.
+`sequence` is the authoritative collector observation order. The physical file order clusters rows by market and asset for compression and selective reads. To replay across assets, markets, or event files, combine the relevant rows and order them by `sequence`.
 
 ## Schema conventions
 
-Each event section below is self-contained. Its table lists every exported
-column, including the four columns shared by all event types.
+Each event section below is self-contained. Its table lists every exported column, including the four columns shared by all event types.
 
-All binary identifiers are validated before export. `market` and
-`transaction_hash` contain the raw 32 bytes decoded from their source `0x`
-hexadecimal strings. `asset_id`, `assets_ids`, and `winning_asset_id` contain
-unsigned decimal token IDs encoded as exactly 32 big-endian bytes. Render a
-hash-like identifier with `"0x" + value.hex()`; recover a token ID with an
-unsigned big-endian integer conversion. Malformed or out-of-range identifiers
-abort the hour export instead of being truncated or wrapped.
+All binary identifiers are validated before export. `market` and `transaction_hash` contain the raw 32 bytes decoded from their source `0x` hexadecimal strings. `asset_id`, `assets_ids`, and `winning_asset_id` contain unsigned decimal token IDs encoded as exactly 32 big-endian bytes. Render a hash-like identifier with `"0x" + value.hex()`; recover a token ID with an unsigned big-endian integer conversion. Malformed or out-of-range identifiers abort the hour export instead of being truncated or wrapped.
 
-All decimal columns are exact decimal values, not binary floating-point
-numbers. `decimal32(9, 4)` is physically stored as Parquet `INT32`, and
-`decimal64(18, 6)` is physically stored as Parquet `INT64`.
+All decimal columns are exact decimal values, not binary floating-point numbers. `decimal32(9, 4)` is physically stored as Parquet `INT32`, and `decimal64(18, 6)` is physically stored as Parquet `INT64`.
 
 Every file uses the same writer settings:
 
@@ -59,15 +41,11 @@ Every file uses the same writer settings:
 | Dictionary-page limit | 8 MiB |
 | Default value encoding | `PLAIN` |
 
-The only dictionary-encoded values are `price_change.side` and
-`last_trade_price.price`, `last_trade_price.side`, and
-`last_trade_price.fee_rate_bps`. Every other scalar and nested leaf is
-`PLAIN`, as listed explicitly in the event tables below.
+The only dictionary-encoded values are `price_change.side` and `last_trade_price.price`, `last_trade_price.side`, and `last_trade_price.fee_rate_bps`. Every other scalar and nested leaf is `PLAIN`, as listed explicitly in the event tables below.
 
 ## `book.parquet`
 
-A row is a complete aggregated depth snapshot for one outcome asset. It
-replaces the reconstructed book state for that asset.
+A row is a complete aggregated depth snapshot for one outcome asset. It replaces the reconstructed book state for that asset.
 
 | File setting | Value |
 |---|---|
@@ -85,23 +63,17 @@ replaces the reconstructed book state for that asset.
 | `bids` | `list<struct<price: decimal32(9, 4), size: decimal64(18, 6)>>` | `LIST`; `price` is `INT32` + `DECIMAL(9, 4)`; `size` is `INT64` + `DECIMAL(18, 6)` | no | `PLAIN` for both leaves | Aggregated bid levels in source order. The list, elements, and member values are non-null. |
 | `asks` | `list<struct<price: decimal32(9, 4), size: decimal64(18, 6)>>` | `LIST`; `price` is `INT32` + `DECIMAL(9, 4)`; `size` is `INT64` + `DECIMAL(18, 6)` | no | `PLAIN` for both leaves | Aggregated ask levels in source order. The list, elements, and member values are non-null. |
 
-An orderbook level is a typed `(price, size)` tuple. Arrow names its members
-`price` and `size`, so readers commonly expose a level as:
+An orderbook level is a typed `(price, size)` tuple. Arrow names its members `price` and `size`, so readers commonly expose a level as:
 
 ```json
 {"price":0.4800,"size":30.000000}
 ```
 
-Empty book sides are empty lists. The upstream book-content `hash` is not
-exported because it is neither a unique event identity nor required for
-reconstruction.
+Empty book sides are empty lists. The upstream book-content `hash` is not exported because it is neither a unique event identity nor required for reconstruction.
 
 ## `price_change.parquet`
 
-A row assigns the new aggregate size at one `(asset_id, side, price)` level.
-Set that level to `size`; remove it when `size == 0`. One upstream message can
-contain multiple changes. The collector assigns them consecutive sequence
-values in their original array order.
+A row assigns the new aggregate size at one `(asset_id, side, price)` level. Set that level to `size`; remove it when `size == 0`. One upstream message can contain multiple changes. The collector assigns them consecutive sequence values in their original array order.
 
 | File setting | Value |
 |---|---|
@@ -122,15 +94,11 @@ values in their original array order.
 | `best_bid` | `decimal32(9, 4)` | `INT32` + `DECIMAL(9, 4)` | yes | `PLAIN` | Source-provided best bid after the change, when present. |
 | `best_ask` | `decimal32(9, 4)` | `INT32` + `DECIMAL(9, 4)` | yes | `PLAIN` | Source-provided best ask after the change, when present. |
 
-The upstream per-change `hash` is omitted because it is unsafe for
-deduplication. Reconstruction uses `price`, `size`, and `side`; the optional
-best prices are accompanying observations, not additional deltas.
+The upstream per-change `hash` is omitted because it is unsafe for deduplication. Reconstruction uses `price`, `size`, and `side`; the optional best prices are accompanying observations, not additional deltas.
 
 ## `last_trade_price.parquet`
 
-A row is one trade-execution notification observed on the public market
-channel. Preserve every row, including rows with identical payload values or
-the same transaction hash.
+A row is one trade-execution notification observed on the public market channel. Preserve every row, including rows with identical payload values or the same transaction hash.
 
 | File setting | Value |
 |---|---|
@@ -151,15 +119,11 @@ the same transaction hash.
 | `fee_rate_bps` | `uint16` | `INT32` + `UINT(16)` | no | `RLE_DICTIONARY` | Fee rate in basis points. |
 | `transaction_hash` | `fixed_size_binary[32]` | `FIXED_LEN_BYTE_ARRAY(32)` | no | `PLAIN` | Polygon transaction containing the fill; metadata, not a unique fill identity. |
 
-One Polygon transaction can settle multiple fills. Never deduplicate on
-`transaction_hash`, or on any combination of the public payload columns. Only
-the collector-assigned `sequence` identifies a stored observation and
-collapses an at-least-once transport retry.
+One Polygon transaction can settle multiple fills. Never deduplicate on `transaction_hash`, or on any combination of the public payload columns. Only the collector-assigned `sequence` identifies a stored observation and collapses an at-least-once transport retry.
 
 ## `tick_size_change.parquet`
 
-A row announces a change to the accepted order-price increment for one outcome
-asset. It does not change depth by itself.
+A row announces a change to the accepted order-price increment for one outcome asset. It does not change depth by itself.
 
 | File setting | Value |
 |---|---|
@@ -179,10 +143,7 @@ asset. It does not change depth by itself.
 
 ## `best_bid_ask.parquet`
 
-A row is an independently observed top-of-book notification enabled by
-Polymarket's `custom_feature_enabled` subscription option. It is useful for BBO
-analysis, but it is not a depth delta and must not be applied to reconstruct the
-book.
+A row is an independently observed top-of-book notification enabled by Polymarket's `custom_feature_enabled` subscription option. It is useful for BBO analysis, but it is not a depth delta and must not be applied to reconstruct the book.
 
 | File setting | Value |
 |---|---|
@@ -203,8 +164,7 @@ book.
 
 ## `new_market.parquet`
 
-A row announces a newly available binary market. This event is market-scoped,
-so it has no synthetic `asset_id` column.
+A row announces a newly available binary market. This event is market-scoped, so it has no synthetic `asset_id` column.
 
 | File setting | Value |
 |---|---|
@@ -224,14 +184,11 @@ so it has no synthetic `asset_id` column.
 | `question` | `string` | `BYTE_ARRAY` + `STRING` | yes | `PLAIN` | Human-readable market question, when supplied. |
 | `slug` | `string` | `BYTE_ARRAY` + `STRING` | yes | `PLAIN` | Human-readable market URL slug, when supplied. |
 
-`assets_ids[i]` corresponds to `outcomes[i]`. The event contains the identity
-and outcome-routing fields used by the collector. Descriptive payload fields
-such as `description`, `tags`, and `event_message` are not exported.
+`assets_ids[i]` corresponds to `outcomes[i]`. The event contains the identity and outcome-routing fields used by the collector. Descriptive payload fields such as `description`, `tags`, and `event_message` are not exported.
 
 ## `market_resolved.parquet`
 
-A row announces resolution of a binary market. This event is market-scoped, so
-it has no synthetic `asset_id` column.
+A row announces resolution of a binary market. This event is market-scoped, so it has no synthetic `asset_id` column.
 
 | File setting | Value |
 |---|---|
@@ -250,14 +207,11 @@ it has no synthetic `asset_id` column.
 | `winning_asset_id` | `fixed_size_binary[32]` | `FIXED_LEN_BYTE_ARRAY(32)` | yes | `PLAIN` | Winning outcome token, or null when the source cannot supply one. |
 | `winning_outcome` | `string` | `BYTE_ARRAY` + `STRING` | yes | `PLAIN` | Winning outcome label, or null when the source cannot supply one. |
 
-The winning fields describe the resolution and do not mutate an orderbook.
-Parent-event metadata and tags from the upstream lifecycle payload are not
-exported.
+The winning fields describe the resolution and do not mutate an orderbook. Parent-event metadata and tags from the upstream lifecycle payload are not exported.
 
 ## `manifest.json`
 
-The manifest is written only after all seven Parquet files. Its presence is
-the sole completion marker for the hour.
+The manifest is written only after all seven Parquet files. Its presence is the sole completion marker for the hour.
 
 | Field | JSON type | Nullable | Description |
 |---|---|---:|---|
@@ -269,39 +223,21 @@ the sole completion marker for the hour.
 | `source_table` | string | no | ClickHouse table used for the export. |
 | `created_at` | string | no | UTC time when the manifest was produced. |
 
-Each `files` entry has its own `order_by` list because lifecycle files do not
-have an `asset_id` column. Consumers should verify the listed byte size and
-SHA-256 digest when downloading an archive. Objects from an interrupted export
-may exist without a manifest; do not treat those objects as a completed hour.
+Each `files` entry has its own `order_by` list because lifecycle files do not have an `asset_id` column. Consumers should verify the listed byte size and SHA-256 digest when downloading an archive. Objects from an interrupted export may exist without a manifest; do not treat those objects as a completed hour.
 
 ## Archive destinations and retention
 
-`EXPORT_BACKEND=r2` uploads objects to the S3-compatible endpoint configured by
-the `R2_*` variables. `EXPORT_BACKEND=local` stores the same keys below
-`LOCAL_EXPORT_DIR` and requires no R2 credentials. Local files are written to a
-temporary sibling and atomically replaced. In both modes, `manifest.json` is
-written last.
+`EXPORT_BACKEND=r2` uploads objects to the S3-compatible endpoint configured by the `R2_*` variables. `EXPORT_BACKEND=local` stores the same keys below `LOCAL_EXPORT_DIR` and requires no R2 credentials. Local files are written to a temporary sibling and atomically replaced. In both modes, `manifest.json` is written last.
 
-The R2 bucket must already exist. Large files use sequential 64 MiB multipart
-parts with bounded memory, SDK retries, and multipart abort on failure. The
-exporter never creates buckets.
+The R2 bucket must already exist. Large files use sequential 64 MiB multipart parts with bounded memory, SDK retries, and multipart abort on failure. The exporter never creates buckets.
 
-`CLICKHOUSE_RETENTION_HOURS` defaults to `3`; set it to `0` to disable cleanup.
-For an eligible old partition, the exporter reads and validates the manifest
-and confirms all seven referenced Parquet objects before issuing the exact
-hourly `DROP PARTITION`. A missing object, malformed manifest, archive error,
-or ClickHouse error retains the partition and is retried later. The newest
-active ClickHouse partition is always retained for sequence recovery.
+`CLICKHOUSE_RETENTION_HOURS` defaults to `3`; set it to `0` to disable cleanup. For an eligible old partition, the exporter reads and validates the manifest and confirms all seven referenced Parquet objects before issuing the exact hourly `DROP PARTITION`. A missing object, malformed manifest, archive error, or ClickHouse error retains the partition and is retried later. The newest active ClickHouse partition is always retained for sequence recovery.
 
-The repository's `run_local.sh` selects the local backend and maps the
-container's `/exports` directory to `.data/parquet` on the host. Set
-`EXPORT_ONCE=true` when invoking the exporter directly to backfill every
-currently eligible missing hour and exit.
+The repository's `run_local.sh` selects the local backend and maps the container's `/exports` directory to `.data/parquet` on the host. Set `EXPORT_ONCE=true` when invoking the exporter directly to backfill every currently eligible missing hour and exit.
 
 ## Python interoperability
 
-PyArrow reads the files directly with the documented narrow decimal and
-fixed-size binary types:
+PyArrow reads the files directly with the documented narrow decimal and fixed-size binary types:
 
 ```python
 import pyarrow.compute as pc
@@ -313,11 +249,6 @@ ordered = table.select(["market", "asset_id", "sequence"])
 buys = table.filter(pc.equal(table["side"], "BUY"))
 ```
 
-Columnar reads, filtering, and conversion to Pandas or Polars do not require
-calling `.as_py()`. That method is needed only when deliberately converting an
-individual Arrow scalar to a native Python object.
+Columnar reads, filtering, and conversion to Pandas or Polars do not require calling `.as_py()`. That method is needed only when deliberately converting an individual Arrow scalar to a native Python object.
 
-The upstream event definitions are documented by Polymarket's
-[real-time market data reference](https://docs.polymarket.com/market-data/realtime-data).
-This document describes the normalized representation written by this
-repository.
+The upstream event definitions are documented by Polymarket's [real-time market data reference](https://docs.polymarket.com/market-data/realtime-data). This document describes the normalized representation written by this repository.
