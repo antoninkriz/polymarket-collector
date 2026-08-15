@@ -215,7 +215,7 @@ impl Connection {
                     stream
                 }
                 Err(error) => {
-                    error!(conn = index, %error, "ws connect failed");
+                    warn!(conn = index, %error, "ws connect failed; will retry");
                     // Stay in Disconnected; loop and retry with backoff.
                     let _ = status_tx.send(HealthEvent::Connection {
                         conn_id: index,
@@ -286,7 +286,7 @@ impl Connection {
                     return Ok(());
                 }
                 SessionOutcome::Error(e) => {
-                    error!(conn = index, error = %e, "session error, will reconnect");
+                    warn!(conn = index, error = %e, "session error, will reconnect");
                 }
             }
         }
