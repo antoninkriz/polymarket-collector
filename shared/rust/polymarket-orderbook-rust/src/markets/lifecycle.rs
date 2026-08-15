@@ -4,6 +4,7 @@ use tokio::sync::oneshot;
 
 use crate::events::{Market, MarketLifecycleObservation};
 use crate::markets::gamma::GammaMarket;
+use crate::ws::pool::PoolStats;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleSource {
@@ -20,6 +21,7 @@ pub struct ActiveMarketSnapshot {
 }
 
 pub type LifecycleSnapshotCompletion = oneshot::Sender<ActiveMarketSnapshot>;
+pub type PoolStatsCompletion = oneshot::Sender<PoolStats>;
 
 /// Lower-priority lifecycle work. WebSocket observations use their own
 /// bounded, high-priority channel so reconciliation cannot delay an immediate
@@ -36,6 +38,9 @@ pub enum LifecycleRequest {
     },
     Snapshot {
         completion: LifecycleSnapshotCompletion,
+    },
+    PoolStats {
+        completion: PoolStatsCompletion,
     },
     GammaPage {
         cold_start: bool,

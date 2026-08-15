@@ -1,10 +1,9 @@
 //! Authoritative lifecycle state and pool mutation coordinator.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use polymarket_orderbook_rust::events::{Market, MarketLifecycle, MarketLifecycleObservation};
@@ -304,32 +303,68 @@ impl LifecycleState {
 }
 
 pub struct LifecycleCoordinator {
-    pool: Arc<Mutex<Pool>>,
+    pool: Pool,
     state: LifecycleState,
     websocket_rx: mpsc::Receiver<MarketLifecycleObservation>,
     reconciliation_rx: mpsc::Receiver<LifecycleRequest>,
+    shutdown_rx:
+        oneshot::Receiver<polymarket_orderbook_rust::markets::lifecycle::LifecycleCompletion>,
 }
 
 impl LifecycleCoordinator {
     pub fn new(
-        pool: Arc<Mutex<Pool>>,
+        pool: Pool,
         websocket_rx: mpsc::Receiver<MarketLifecycleObservation>,
         reconciliation_rx: mpsc::Receiver<LifecycleRequest>,
+        shutdown_rx: oneshot::Receiver<
+            polymarket_orderbook_rust::markets::lifecycle::LifecycleCompletion,
+        >,
     ) -> Self {
         Self {
             pool,
             state: LifecycleState::default(),
             websocket_rx,
             reconciliation_rx,
+            shutdown_rx,
         }
     }
 
     pub async fn run(mut self) -> Result<()> {
+        let work_result = self.run_until_shutdown().await;
+        let shutdown_result = self.pool.shutdown().await.context("pool shutdown");
+
+        match work_result {
+            Ok(Some(completion)) => {
+                let completion_result = match &shutdown_result {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                };
+                if completion.send(completion_result).is_err() {
+                    warn!("lifecycle shutdown requester stopped before receiving completion");
+                }
+                shutdown_result
+            }
+            Ok(None) => shutdown_result,
+            Err(error) => {
+                if let Err(shutdown_error) = shutdown_result {
+                    warn!(%shutdown_error, "pool shutdown failed after lifecycle coordinator error");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn run_until_shutdown(
+        &mut self,
+    ) -> Result<Option<polymarket_orderbook_rust::markets::lifecycle::LifecycleCompletion>> {
         let mut websocket_open = true;
         let mut reconciliation_open = true;
         while websocket_open || reconciliation_open {
             tokio::select! {
                 biased;
+                shutdown = &mut self.shutdown_rx => {
+                    return Ok(shutdown.ok());
+                }
                 observation = self.websocket_rx.recv(), if websocket_open => {
                     match observation {
                         Some(observation) => {
@@ -346,7 +381,7 @@ impl LifecycleCoordinator {
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     async fn apply_request(&mut self, request: LifecycleRequest) -> Result<()> {
@@ -369,6 +404,12 @@ impl LifecycleCoordinator {
             LifecycleRequest::Snapshot { completion } => {
                 if completion.send(self.state.snapshot()).is_err() {
                     warn!("lifecycle snapshot requester stopped before receiving snapshot");
+                }
+                Ok(())
+            }
+            LifecycleRequest::PoolStats { completion } => {
+                if completion.send(self.pool.pool_stats()).is_err() {
+                    warn!("pool stats requester stopped before receiving snapshot");
                 }
                 Ok(())
             }
@@ -396,8 +437,6 @@ impl LifecycleCoordinator {
         if !plan.bootstrap.is_empty() {
             let planned = self.state.plan_bootstrap(plan.bootstrap)?;
             self.pool
-                .lock()
-                .await
                 .subscribe_markets(planned.clone())
                 .await
                 .context("subscribe Gamma page")?;
@@ -412,8 +451,6 @@ impl LifecycleCoordinator {
             return Ok(());
         }
         self.pool
-            .lock()
-            .await
             .subscribe_markets(planned.clone())
             .await
             .context("subscribe bootstrap markets")?;
@@ -458,14 +495,13 @@ impl LifecycleCoordinator {
             }
             PlannedObservation::AdmitExisting { .. } => {
                 self.pool
-                    .lock()
-                    .await
                     .admit_lifecycle(observation.event, observation.timestamp_received_ns);
             }
             PlannedObservation::Subscribe { market, .. } => {
-                let mut pool = self.pool.lock().await;
-                pool.admit_lifecycle(observation.event, observation.timestamp_received_ns);
-                pool.subscribe_markets(vec![market.clone()])
+                self.pool
+                    .admit_lifecycle(observation.event, observation.timestamp_received_ns);
+                self.pool
+                    .subscribe_markets(vec![market.clone()])
                     .await
                     .context("subscribe lifecycle market")?;
                 info!(
@@ -475,9 +511,10 @@ impl LifecycleCoordinator {
                 );
             }
             PlannedObservation::Resolve { market, .. } => {
-                let mut pool = self.pool.lock().await;
-                pool.admit_lifecycle(observation.event, observation.timestamp_received_ns);
-                pool.unsubscribe_markets(vec![market.clone()])
+                self.pool
+                    .admit_lifecycle(observation.event, observation.timestamp_received_ns);
+                self.pool
+                    .unsubscribe_markets(vec![market.clone()])
                     .await
                     .context("unsubscribe resolved market")?;
                 info!(source = ?source, market, "[MARKET_EVENT] market_resolved");
@@ -764,10 +801,12 @@ mod tests {
     #[tokio::test]
     async fn coordinator_snapshot_request_is_sorted_and_cloned() {
         let (event_tx, _event_rx) = mpsc::channel(8);
-        let pool = Arc::new(Mutex::new(Pool::new(2, event_tx)));
+        let pool = Pool::new(2, event_tx);
         let (_websocket_tx, websocket_rx) = mpsc::channel(8);
         let (_reconciliation_tx, reconciliation_rx) = mpsc::channel(8);
-        let mut coordinator = LifecycleCoordinator::new(pool, websocket_rx, reconciliation_rx);
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mut coordinator =
+            LifecycleCoordinator::new(pool, websocket_rx, reconciliation_rx, shutdown_rx);
         let planned = coordinator
             .state
             .plan_bootstrap(vec![
@@ -801,6 +840,47 @@ mod tests {
             .commit_observation(&plan, LifecycleSource::WebSocket);
         assert_eq!(coordinator.state.active.len(), 1);
         assert_eq!(snapshot.markets.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn coordinator_reports_pool_stats() {
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let pool = Pool::new(2, event_tx);
+        let (_websocket_tx, websocket_rx) = mpsc::channel(8);
+        let (_reconciliation_tx, reconciliation_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mut coordinator =
+            LifecycleCoordinator::new(pool, websocket_rx, reconciliation_rx, shutdown_rx);
+
+        let (completion, completed) = oneshot::channel();
+        coordinator
+            .apply_request(LifecycleRequest::PoolStats { completion })
+            .await
+            .unwrap();
+
+        let stats = completed.await.unwrap();
+        assert_eq!(stats.market_count, 0);
+        assert_eq!(stats.connection_count, 0);
+    }
+
+    #[tokio::test]
+    async fn coordinator_acknowledges_shutdown_after_stopping_pool() {
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let pool = Pool::new(2, event_tx);
+        let (websocket_tx, websocket_rx) = mpsc::channel(8);
+        let (reconciliation_tx, reconciliation_rx) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let coordinator =
+            LifecycleCoordinator::new(pool, websocket_rx, reconciliation_rx, shutdown_rx);
+        let handle = tokio::spawn(coordinator.run());
+
+        let (completion, completed) = oneshot::channel();
+        shutdown_tx.send(completion).unwrap();
+
+        assert!(completed.await.unwrap().is_ok());
+        handle.await.unwrap().unwrap();
+        drop(websocket_tx);
+        drop(reconciliation_tx);
     }
 
     #[test]
@@ -896,10 +976,12 @@ mod tests {
     #[tokio::test]
     async fn unknown_gamma_resolution_is_dropped_without_dedup_state() {
         let (event_tx, mut event_rx) = mpsc::channel(8);
-        let pool = Arc::new(Mutex::new(Pool::new(2, event_tx)));
+        let pool = Pool::new(2, event_tx);
         let (_websocket_tx, websocket_rx) = mpsc::channel(8);
         let (_reconciliation_tx, reconciliation_rx) = mpsc::channel(8);
-        let mut coordinator = LifecycleCoordinator::new(pool, websocket_rx, reconciliation_rx);
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mut coordinator =
+            LifecycleCoordinator::new(pool, websocket_rx, reconciliation_rx, shutdown_rx);
 
         coordinator
             .apply_observation(LifecycleSource::Gamma, resolved("unknown"))
@@ -913,10 +995,12 @@ mod tests {
     #[tokio::test]
     async fn gamma_new_market_does_not_replay_bootstrapped_condition() {
         let (event_tx, mut event_rx) = mpsc::channel(8);
-        let pool = Arc::new(Mutex::new(Pool::new(2, event_tx)));
+        let pool = Pool::new(2, event_tx);
         let (_websocket_tx, websocket_rx) = mpsc::channel(8);
         let (_reconciliation_tx, reconciliation_rx) = mpsc::channel(8);
-        let mut coordinator = LifecycleCoordinator::new(pool, websocket_rx, reconciliation_rx);
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mut coordinator =
+            LifecycleCoordinator::new(pool, websocket_rx, reconciliation_rx, shutdown_rx);
         let planned = coordinator
             .state
             .plan_bootstrap(vec![market("m", "a", "b")])

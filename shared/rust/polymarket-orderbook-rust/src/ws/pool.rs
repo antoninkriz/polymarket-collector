@@ -391,12 +391,9 @@ impl Pool {
         // Connections may be sleeping in a reconnect backoff or waiting for a
         // bounded handshake. They own no buffered records, so cancel every
         // producer before awaiting any of them.
-        for handle in &self.connections {
-            handle.join.abort();
-        }
+        self.abort_tasks();
 
         if let Some(join) = self.monitor_join.take() {
-            join.abort();
             let _ = join.await;
         }
 
@@ -413,6 +410,15 @@ impl Pool {
             }
         }
         Ok(())
+    }
+
+    fn abort_tasks(&mut self) {
+        if let Some(join) = &self.monitor_join {
+            join.abort();
+        }
+        for handle in &self.connections {
+            handle.join.abort();
+        }
     }
 
     fn find_conn_with_capacity(
@@ -463,6 +469,12 @@ impl Pool {
         if self.route_update_tx.send(update).await.is_err() {
             warn!("pool health monitor route channel closed");
         }
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.abort_tasks();
     }
 }
 
@@ -968,5 +980,58 @@ mod tests {
             .await
             .expect("pool shutdown should not wait for a connection task")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn drop_cancels_monitor_and_connection_tasks() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(signal) = self.0.take() {
+                    let _ = signal.send(());
+                }
+            }
+        }
+
+        let mut pool = pool(2);
+        let original_monitor = pool.monitor_join.take().unwrap();
+        original_monitor.abort();
+        let _ = original_monitor.await;
+
+        let (monitor_started_tx, monitor_started_rx) = tokio::sync::oneshot::channel();
+        let (monitor_dropped_tx, monitor_dropped_rx) = tokio::sync::oneshot::channel();
+        pool.monitor_join = Some(tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(monitor_dropped_tx));
+            let _ = monitor_started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+
+        let (connection_started_tx, connection_started_rx) = tokio::sync::oneshot::channel();
+        let (connection_dropped_tx, connection_dropped_rx) = tokio::sync::oneshot::channel();
+        let connection_join = tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(connection_dropped_tx));
+            let _ = connection_started_tx.send(());
+            std::future::pending::<Result<()>>().await
+        });
+        let (cmd_tx, _cmd_rx) = mpsc::channel(COMMAND_CHANNEL_SIZE);
+        pool.connections.push(ConnHandle {
+            conn_id: 0,
+            assets: HashSet::new(),
+            lifecycle_listener: true,
+            cmd_tx,
+            join: connection_join,
+        });
+
+        monitor_started_rx.await.unwrap();
+        connection_started_rx.await.unwrap();
+        drop(pool);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            monitor_dropped_rx.await.unwrap();
+            connection_dropped_rx.await.unwrap();
+        })
+        .await
+        .expect("dropping the pool should cancel all owned tasks");
     }
 }

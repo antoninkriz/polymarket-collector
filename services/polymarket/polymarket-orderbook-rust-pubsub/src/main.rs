@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -24,7 +24,7 @@ use polymarket_orderbook_rust::events::{Market, MarketLifecycleObservation};
 use polymarket_orderbook_rust::markets;
 use polymarket_orderbook_rust::markets::lifecycle::LifecycleRequest;
 use polymarket_orderbook_rust::record::EventRecord;
-use polymarket_orderbook_rust::ws::pool::Pool;
+use polymarket_orderbook_rust::ws::pool::{Pool, PoolStats};
 
 use polymarket_orderbook_rust_pubsub::config::Config;
 use polymarket_orderbook_rust_pubsub::gamma_reconcile::{self, CacheBaseline, ReconciliationStats};
@@ -101,16 +101,21 @@ async fn main() -> Result<()> {
 
     let (websocket_lifecycle_tx, websocket_lifecycle_rx) = mpsc::channel(cfg.lifecycle_queue_size);
     let (reconciliation_tx, reconciliation_rx) = mpsc::channel(cfg.lifecycle_queue_size);
-    let pool = Arc::new(Mutex::new(Pool::new_with_lifecycle(
+    let (coordinator_shutdown_tx, coordinator_shutdown_rx) = oneshot::channel();
+    let mut pool = Pool::new_with_lifecycle(
         cfg.max_assets_per_conn,
         event_tx.clone(),
         publisher_fence,
         websocket_lifecycle_tx.clone(),
-    )));
-    pool.lock().await.start().await;
+    );
+    pool.start().await;
 
-    let coordinator =
-        LifecycleCoordinator::new(Arc::clone(&pool), websocket_lifecycle_rx, reconciliation_rx);
+    let coordinator = LifecycleCoordinator::new(
+        pool,
+        websocket_lifecycle_rx,
+        reconciliation_rx,
+        coordinator_shutdown_rx,
+    );
     let mut coordinator_handle = tokio::spawn(coordinator.run());
 
     let gamma_http = reqwest::Client::builder()
@@ -139,10 +144,8 @@ async fn main() -> Result<()> {
         let market_count = cached_markets.len();
         apply_bootstrap_batched(&reconciliation_tx, cached_markets).await?;
         if market_count > 0 {
-            info!(
-                markets = pool.lock().await.subscribed_market_count(),
-                "pre-loaded markets",
-            );
+            let pool_stats = request_pool_stats(&reconciliation_tx).await?;
+            info!(markets = pool_stats.market_count, "pre-loaded markets",);
         }
     }
 
@@ -184,14 +187,12 @@ async fn main() -> Result<()> {
         Arc::clone(&reconciliation_stats),
     ));
 
-    let stats_pool = Arc::clone(&pool);
     let stats_event_tx = event_tx.clone();
     let stats_websocket_lifecycle_tx = websocket_lifecycle_tx.clone();
     let stats_reconciliation_tx = reconciliation_tx.clone();
     let stats_reconciliation = Arc::clone(&reconciliation_stats);
     let stats_handle = tokio::spawn(async move {
         stats_loop(
-            stats_pool,
             stats_event_tx,
             stats_websocket_lifecycle_tx,
             stats_reconciliation_tx,
@@ -269,30 +270,26 @@ async fn main() -> Result<()> {
         info!("skipping incomplete market restart-cache save");
     }
 
-    if !coordinator_stopped {
-        coordinator_handle.abort();
-        let _ = coordinator_handle.await;
-    }
-    info!("market lifecycle coordinator stopped");
-
+    // Stop telemetry requests before asking the coordinator to close its
+    // request receivers. The coordinator keeps the WebSocket lifecycle
+    // receiver alive until it has cancelled every connection producer.
     stats_handle.abort();
     let _ = stats_handle.await;
+    drop(websocket_lifecycle_tx);
+
+    if !coordinator_stopped {
+        if let Err(error) = request_coordinator_shutdown(coordinator_shutdown_tx).await {
+            warn!(%error, "market lifecycle coordinator shutdown request failed");
+        }
+        match coordinator_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(%error, "market lifecycle coordinator ended with error"),
+            Err(error) => warn!(%error, "market lifecycle coordinator task failed"),
+        }
+    }
+    info!("market lifecycle coordinator and pool stopped");
 
     drop(event_tx);
-
-    let pool = match Arc::try_unwrap(pool) {
-        Ok(mutex) => mutex.into_inner(),
-        Err(arc) => {
-            warn!(
-                strong_count = Arc::strong_count(&arc),
-                "pool still has other strong refs at shutdown; leaking",
-            );
-            return Ok(());
-        }
-    };
-
-    pool.shutdown().await.context("pool shutdown")?;
-    info!("pool shut down");
 
     let sink_outcome = match sink_outcome {
         Some(outcome) => outcome,
@@ -338,6 +335,32 @@ async fn apply_bootstrap(
     completed
         .await
         .context("lifecycle coordinator dropped bootstrap completion")?
+        .map_err(anyhow::Error::msg)
+}
+
+async fn request_pool_stats(lifecycle_tx: &mpsc::Sender<LifecycleRequest>) -> Result<PoolStats> {
+    let (completion, completed) = oneshot::channel();
+    lifecycle_tx
+        .send(LifecycleRequest::PoolStats { completion })
+        .await
+        .context("lifecycle coordinator stopped before pool stats request")?;
+    completed
+        .await
+        .context("lifecycle coordinator dropped pool stats response")
+}
+
+async fn request_coordinator_shutdown(
+    shutdown_tx: oneshot::Sender<
+        polymarket_orderbook_rust::markets::lifecycle::LifecycleCompletion,
+    >,
+) -> Result<()> {
+    let (completion, completed) = oneshot::channel();
+    shutdown_tx
+        .send(completion)
+        .map_err(|_| anyhow::anyhow!("lifecycle coordinator stopped before shutdown request"))?;
+    completed
+        .await
+        .context("lifecycle coordinator dropped shutdown completion")?
         .map_err(anyhow::Error::msg)
 }
 
@@ -404,7 +427,6 @@ async fn wait_for_shutdown() {
 }
 
 async fn stats_loop(
-    pool: Arc<Mutex<Pool>>,
     event_tx: mpsc::Sender<EventRecord>,
     websocket_lifecycle_tx: mpsc::Sender<MarketLifecycleObservation>,
     reconciliation_tx: mpsc::Sender<LifecycleRequest>,
@@ -442,9 +464,12 @@ async fn stats_loop(
             continue;
         }
         samples = 0;
-        let stats = {
-            let p = pool.lock().await;
-            p.pool_stats()
+        let stats = match request_pool_stats(&reconciliation_tx).await {
+            Ok(stats) => stats,
+            Err(error) => {
+                warn!(%error, "stopping stats loop after lifecycle coordinator stopped");
+                return;
+            }
         };
         let reconciliation_ages = reconciliation_stats.ages();
         let asset_recoveries = stats
