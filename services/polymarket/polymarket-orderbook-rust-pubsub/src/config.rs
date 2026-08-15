@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-pub const DEFAULT_QUEUE_SIZE: usize = 250_000;
+pub const DEFAULT_QUEUE_SIZE: usize = 1_000_000;
 pub const DEFAULT_LIFECYCLE_QUEUE_SIZE: usize = 8_192;
 
 #[derive(Debug, Clone)]
