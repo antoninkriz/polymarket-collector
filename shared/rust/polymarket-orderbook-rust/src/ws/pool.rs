@@ -7,7 +7,7 @@
 //! merged correctly. V3 chooses correctness over seamless failover. After a
 //! reconnect, fresh `book` snapshots replace the full local state.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -283,23 +283,27 @@ impl Pool {
         // recent markets first so their lower-numbered connections establish
         // subscriptions before the long tail of the active universe.
 
-        let mut pending: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+        let mut pending_assets = vec![Vec::new(); self.connections.len()];
+        let mut conn_index = 0;
         let mut assigned_routes = Vec::with_capacity(new_markets.len() * 2);
         for market in new_markets {
-            let conn_index = match self.find_conn_with_capacity(2, &pending) {
-                Some(index) => index,
-                None => {
-                    self.spawn_connection().await;
-                    self.connections.len() - 1
-                }
-            };
+            // Every market consumes two slots. Once a connection has fewer
+            // than two free slots, no later market in this batch can use it.
+            while conn_index < self.connections.len()
+                && self.connections[conn_index].assets.len() + pending_assets[conn_index].len() + 2
+                    > self.max_assets_per_conn
+            {
+                conn_index += 1;
+            }
+            if conn_index == self.connections.len() {
+                self.spawn_connection().await;
+                pending_assets.push(Vec::new());
+            }
+
             let conn_id = self.connections[conn_index].conn_id;
             let assets = &market.assets;
 
-            pending
-                .entry(conn_id)
-                .or_default()
-                .extend(assets.iter().cloned());
+            pending_assets[conn_index].extend(assets.iter().cloned());
             self.market_to_conn.insert(market.hash.clone(), conn_id);
             for asset in assets {
                 self.asset_to_conn.insert(asset.clone(), conn_id);
@@ -310,12 +314,11 @@ impl Pool {
         self.send_route_update(RouteUpdate::Assigned(assigned_routes))
             .await;
 
-        for (conn_id, assets) in pending {
-            let handle = self
-                .connections
-                .iter_mut()
-                .find(|handle| handle.conn_id == conn_id)
-                .expect("newly assigned connection must exist");
+        for (handle, assets) in self.connections.iter_mut().zip(pending_assets) {
+            if assets.is_empty() {
+                continue;
+            }
+            let conn_id = handle.conn_id;
             handle.assets.extend(assets.iter().cloned());
             if let Err(error) = handle.cmd_tx.send(Command::Subscribe(assets)).await {
                 warn!(conn = conn_id, %error, "subscribe send failed");
@@ -412,21 +415,6 @@ impl Pool {
         for handle in &self.connections {
             handle.join.abort();
         }
-    }
-
-    fn find_conn_with_capacity(
-        &self,
-        required: usize,
-        pending: &BTreeMap<usize, Vec<String>>,
-    ) -> Option<usize> {
-        self.connections
-            .iter()
-            .enumerate()
-            .find_map(|(index, handle)| {
-                let pending_count = pending.get(&handle.conn_id).map(Vec::len).unwrap_or(0);
-                (handle.assets.len() + pending_count + required <= self.max_assets_per_conn)
-                    .then_some(index)
-            })
     }
 
     async fn spawn_connection(&mut self) {
@@ -1030,6 +1018,59 @@ mod tests {
         assert_eq!(pool.market_to_conn["z"], pool.market_to_conn["a"]);
         assert_eq!(pool.market_to_conn["y"], pool.market_to_conn["b"]);
         assert!(pool.market_to_conn["z"] < pool.market_to_conn["y"]);
+    }
+
+    #[tokio::test]
+    async fn later_batch_fills_existing_capacity_before_spawning() {
+        let mut pool = pool(6);
+        pool.subscribe_markets(&[market("m1", "a1y", "a1n"), market("m2", "a2y", "a2n")])
+            .await
+            .unwrap();
+        let first_conn = pool.market_to_conn["m1"];
+
+        pool.subscribe_markets(&[
+            market("m3", "a3y", "a3n"),
+            market("m4", "a4y", "a4n"),
+            market("m5", "a5y", "a5n"),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(pool.connection_count(), 2);
+        assert_eq!(pool.market_to_conn["m3"], first_conn);
+        assert_ne!(pool.market_to_conn["m4"], first_conn);
+        assert_eq!(pool.market_to_conn["m4"], pool.market_to_conn["m5"]);
+    }
+
+    #[tokio::test]
+    async fn allocation_after_swap_remove_keeps_stable_connection_id() {
+        let mut pool = pool(4);
+        let markets = [
+            market("m1", "a1y", "a1n"),
+            market("m2", "a2y", "a2n"),
+            market("m3", "a3y", "a3n"),
+            market("m4", "a4y", "a4n"),
+            market("m5", "a5y", "a5n"),
+        ];
+        pool.subscribe_markets(&markets).await.unwrap();
+        let last_conn = pool.market_to_conn["m5"];
+
+        for market in &markets[2..4] {
+            pool.unsubscribe_market(&market.hash, &market.assets)
+                .await
+                .unwrap();
+        }
+        pool.subscribe_markets(&[market("m6", "a6y", "a6n")])
+            .await
+            .unwrap();
+
+        assert_eq!(pool.connection_count(), 2);
+        assert_eq!(pool.market_to_conn["m6"], last_conn);
+        assert!(pool.connections.iter().any(|handle| {
+            handle.conn_id == last_conn
+                && handle.assets.contains("a5y")
+                && handle.assets.contains("a6y")
+        }));
     }
 
     #[tokio::test]
