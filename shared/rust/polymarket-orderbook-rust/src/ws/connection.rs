@@ -266,6 +266,9 @@ impl Connection {
             .await;
 
             // Session ended for any reason → we're no longer Connected.
+            // Clear every session-local claim immediately; durable intent in
+            // `desired` survives and will be reconstructed after reconnect.
+            sub.reset_session();
             // Always publish before deciding what to do next.
             let _ = status_tx.send(HealthEvent::Connection {
                 conn_id: index,
@@ -493,45 +496,10 @@ async fn run_session(
 
             // -- Pool commands ------------------------------------------
             cmd = commands.recv() => match cmd {
-                Some(Command::Subscribe(assets)) => {
-                    if assets.is_empty() { continue; }
-                    // Update desired (durable) and compute the diff against
-                    // the per-session subscribed set.
-                    let mut new_in_session: Vec<String> = Vec::new();
-                    for a in &assets {
-                        if sub.desired.insert(a.clone()) {
-                            // newly desired
-                        }
-                        if sub.subscribed.insert(a.clone()) {
-                            // A new subscription needs its own fresh snapshot,
-                            // even if this asset was subscribed earlier in the
-                            // same socket session and then removed.
-                            sub.initialized.remove(a);
-                            new_in_session.push(a.clone());
-                        }
-                    }
-                    if new_in_session.is_empty() {
-                        continue;
-                    }
-                    if let Err(e) = send_subscribe(&mut write, sub, &new_in_session).await {
-                        warn!(conn = index, error = %e, "subscribe send failed; will retry on reconnect");
-                    }
-                }
-                Some(Command::Unsubscribe(assets)) => {
-                    if assets.is_empty() { continue; }
-                    let mut removed: Vec<String> = Vec::new();
-                    for a in &assets {
-                        if sub.desired.remove(a) {
-                            sub.subscribed.remove(a);
-                            sub.initialized.remove(a);
-                            removed.push(a.clone());
-                        }
-                    }
-                    if removed.is_empty() {
-                        continue;
-                    }
-                    if let Err(e) = send_unsubscribe(&mut write, &removed).await {
-                        warn!(conn = index, error = %e, "unsubscribe send failed");
+                Some(command) => {
+                    if let Err(error) = apply_command(&mut write, sub, command).await {
+                        warn!(conn = index, %error, "WebSocket command write failed; reconnecting");
+                        return SessionOutcome::Closed;
                     }
                 }
                 None => {
@@ -539,6 +507,58 @@ async fn run_session(
                     return SessionOutcome::Shutdown;
                 }
             }
+        }
+    }
+}
+
+async fn apply_command<S>(write: &mut S, sub: &mut SubState, command: Command) -> Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
+{
+    match command {
+        Command::Subscribe(assets) => {
+            if assets.is_empty() {
+                return Ok(());
+            }
+            // Update desired (durable) and compute the diff against the
+            // per-session subscribed set.
+            let mut new_in_session = Vec::new();
+            for asset in &assets {
+                sub.desired.insert(asset.clone());
+                if sub.subscribed.insert(asset.clone()) {
+                    // A new subscription needs its own fresh snapshot, even if
+                    // this asset was subscribed earlier in the same socket
+                    // session and then removed.
+                    sub.initialized.remove(asset);
+                    new_in_session.push(asset.clone());
+                }
+            }
+            if new_in_session.is_empty() {
+                return Ok(());
+            }
+            send_subscribe(write, sub, &new_in_session)
+                .await
+                .context("subscribe command write failed")
+        }
+        Command::Unsubscribe(assets) => {
+            if assets.is_empty() {
+                return Ok(());
+            }
+            let mut removed = Vec::new();
+            for asset in &assets {
+                if sub.desired.remove(asset) {
+                    sub.subscribed.remove(asset);
+                    sub.initialized.remove(asset);
+                    removed.push(asset.clone());
+                }
+            }
+            if removed.is_empty() {
+                return Ok(());
+            }
+            send_unsubscribe(write, &removed)
+                .await
+                .context("unsubscribe command write failed")
         }
     }
 }
@@ -694,6 +714,44 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FailingSink;
+
+    impl futures_util::Sink<Message> for FailingSink {
+        type Error = &'static str;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            let _ = self;
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _item: Message,
+        ) -> std::result::Result<(), Self::Error> {
+            let _ = self;
+            Err("simulated write failure")
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            let _ = self;
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            let _ = self;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
 
     fn handle(text: &str, sub: &mut SubState, events: &mut Vec<EventRecord>) -> Result<()> {
         let (event_tx, _event_rx) = mpsc::channel(1);
@@ -1030,6 +1088,51 @@ mod tests {
         assert_eq!(initial["assets_ids"], serde_json::json!([]));
         assert_eq!(initial["type"], "market");
         assert_eq!(initial["custom_feature_enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn failed_live_subscribe_preserves_desired_for_reconnect() {
+        let mut write = FailingSink;
+        let mut sub = SubState::default();
+        sub.initialized.insert("a".into());
+
+        let error = apply_command(&mut write, &mut sub, Command::Subscribe(vec!["a".into()]))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("subscribe command write failed"));
+        assert!(sub.desired.contains("a"));
+        assert!(sub.subscribed.contains("a"));
+        assert!(!sub.initialized.contains("a"));
+        sub.reset_session();
+        assert!(sub.desired.contains("a"));
+        assert!(sub.subscribed.is_empty());
+        assert!(sub.initialized.is_empty());
+        assert!(!sub.initial_sent);
+    }
+
+    #[tokio::test]
+    async fn failed_live_unsubscribe_reconstructs_remaining_desired_assets() {
+        let mut write = FailingSink;
+        let mut sub = SubState::default();
+        sub.desired.extend(["a".into(), "b".into()]);
+        sub.subscribed.extend(["a".into(), "b".into()]);
+        sub.initialized.extend(["a".into(), "b".into()]);
+        sub.initial_sent = true;
+
+        let error = apply_command(&mut write, &mut sub, Command::Unsubscribe(vec!["a".into()]))
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unsubscribe command write failed"));
+        assert_eq!(sub.desired, HashSet::from(["b".into()]));
+        sub.reset_session();
+        assert_eq!(sub.desired, HashSet::from(["b".into()]));
+        assert!(sub.subscribed.is_empty());
+        assert!(sub.initialized.is_empty());
+        assert!(!sub.initial_sent);
     }
 
     #[tokio::test]
