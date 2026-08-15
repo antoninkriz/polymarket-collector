@@ -1,11 +1,17 @@
 name: obdata-infra
 
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: ${CONTAINER_LOG_MAX_SIZE:-100m}
+
 services:
 
   obdata-clickhouse:
     image: docker.io/clickhouse/clickhouse-server:26.7.3.19
     container_name: obdata-clickhouse
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - obdata
     environment:
@@ -26,6 +32,7 @@ services:
     image: docker.io/library/redis:8.10.0-trixie
     container_name: obdata-redis
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - obdata
     volumes:

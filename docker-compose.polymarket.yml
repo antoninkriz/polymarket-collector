@@ -1,5 +1,10 @@
 name: obdata-polymarket
 
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: ${CONTAINER_LOG_MAX_SIZE:-100m}
+
 # Polymarket orderbook stack — obdata-side, full pipeline.
 #
 #   obdata-polymarket-orderbook-rust-pubsub
@@ -30,6 +35,7 @@ services:
       - path: .env
         required: false
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - obdata
     ulimits:
@@ -76,6 +82,7 @@ services:
       - path: .env
         required: false
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - obdata
     depends_on:
@@ -117,6 +124,7 @@ services:
       - path: .env
         required: false
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - obdata
     environment:
