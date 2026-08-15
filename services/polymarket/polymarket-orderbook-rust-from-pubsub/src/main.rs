@@ -55,14 +55,14 @@ async fn main() -> Result<()> {
     };
     let writer = Writer::new(&cfg.redis_url, writer_cfg, sink).context("build stream writer")?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut writer_handle = tokio::spawn(writer.run(shutdown_rx));
+    let writer_future = writer.run(shutdown_rx);
+    tokio::pin!(writer_future);
 
     tokio::select! {
-        result = &mut writer_handle => {
+        result = &mut writer_future => {
             match result {
-                Ok(Ok(())) => anyhow::bail!("Redis to ClickHouse writer exited unexpectedly"),
-                Ok(Err(error)) => return Err(error).context("Redis to ClickHouse writer failed"),
-                Err(error) => return Err(error).context("Redis to ClickHouse writer task failed"),
+                Ok(()) => anyhow::bail!("Redis to ClickHouse writer exited unexpectedly"),
+                Err(error) => return Err(error).context("Redis to ClickHouse writer failed"),
             }
         }
         _ = wait_for_shutdown() => {}
@@ -70,16 +70,13 @@ async fn main() -> Result<()> {
     info!("shutdown signal received");
 
     let _ = shutdown_tx.send(true);
-    match tokio::time::timeout(Duration::from_secs(10), &mut writer_handle).await {
-        Ok(Ok(Ok(()))) => info!("Redis to ClickHouse writer shut down cleanly"),
-        Ok(Ok(Err(error))) => {
+    match tokio::time::timeout(Duration::from_secs(10), &mut writer_future).await {
+        Ok(Ok(())) => info!("Redis to ClickHouse writer shut down cleanly"),
+        Ok(Err(error)) => {
             return Err(error).context("Redis to ClickHouse writer shutdown failed");
         }
-        Ok(Err(error)) => return Err(error).context("Redis to ClickHouse writer task failed"),
         Err(_) => {
             warn!("Redis to ClickHouse writer did not drain before shutdown timeout");
-            writer_handle.abort();
-            let _ = writer_handle.await;
         }
     }
     info!("shutdown complete");
