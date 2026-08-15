@@ -57,7 +57,50 @@ Redis restart cache ─────┘                        │              �
                                                   └──────────────┴─▶ Rust exporter ─▶ R2/local
 ```
 
+### Timestamps
 
+There are two kinds of timestamps in the data.
+
+First, there is the `timestamp` field, which represents Polymarket's internal timestamp. This one has only milliseconds precision and its actual source inside Polymarket's infrastructure is not discosed.
+
+Then, there is the `timestamp_received`, marking the nanosecond timestamp of the arrival of the published message into the Rust code of the collector. Somewhat accurate schema is below.
+
+```text
+Polymarket infrastructure
+│
+├─ Event is published
+│  └─ timestamp = Polymarket internal timestamp
+│     (millisecond precision; exact source unknown)
+│
+└─ Network / TLS
+   │
+   ▼
+Collector machine
+│
+├─ NIC
+├─ Kernel / TCP stack
+├─ WebSocket processing
+│
+└─ Complete WebSocket text frame becomes available to Rust
+   │
+   ├─ timestamp_received = Utc::now()
+   │  (nanosecond-resolution timestamp)
+   │
+   ▼
+JSON parsing / event expansion
+   │
+   ▼
+Sequence allocation
+   │
+   ▼
+Redis
+   │
+   ▼
+ClickHouse
+   │
+   ▼
+Parquet
+```
 
 ### Publisher — discovery, collection, and order
 
