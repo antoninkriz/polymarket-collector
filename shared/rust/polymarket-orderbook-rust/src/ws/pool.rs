@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{ensure, Result};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -22,7 +22,13 @@ use crate::record::{CollectorContext, EventRecord};
 use crate::ws::connection::{Command, ConnStatus, Connection, HealthEvent};
 
 const COMMAND_CHANNEL_SIZE: usize = 64;
+const ROUTE_UPDATE_CHANNEL_SIZE: usize = 8_192;
 const LIFECYCLE_LISTENER_CONNECTIONS: usize = 3;
+
+enum RouteUpdate {
+    Assigned(Vec<(String, usize)>),
+    Removed(Vec<String>),
+}
 
 struct ConnHandle {
     conn_id: usize,
@@ -73,7 +79,7 @@ pub struct Pool {
     health_counters: Arc<HealthCounters>,
     monitor_join: Option<JoinHandle<()>>,
     status_event_tx: mpsc::UnboundedSender<HealthEvent>,
-    asset_conns_tx: watch::Sender<HashMap<String, usize>>,
+    route_update_tx: mpsc::Sender<RouteUpdate>,
 }
 
 impl Pool {
@@ -114,11 +120,11 @@ impl Pool {
         ));
         let health_counters = Arc::new(HealthCounters::default());
         let (status_event_tx, status_event_rx) = mpsc::unbounded_channel();
-        let (asset_conns_tx, asset_conns_rx) = watch::channel(HashMap::new());
+        let (route_update_tx, route_update_rx) = mpsc::channel(ROUTE_UPDATE_CHANNEL_SIZE);
 
         let monitor_join = Some(tokio::spawn(run_health_monitor(
             status_event_rx,
-            asset_conns_rx,
+            route_update_rx,
             Arc::clone(&health_counters),
         )));
 
@@ -136,7 +142,7 @@ impl Pool {
             health_counters,
             monitor_join,
             status_event_tx,
-            asset_conns_tx,
+            route_update_tx,
         }
     }
 
@@ -296,6 +302,7 @@ impl Pool {
         );
 
         let mut pending: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut assigned_routes = Vec::with_capacity(new_markets.len() * 2);
         for market in new_markets {
             let conn_index = match self.find_conn_with_capacity(2, &pending) {
                 Some(index) => index,
@@ -314,9 +321,13 @@ impl Pool {
             self.market_to_conn.insert(market.hash.clone(), conn_id);
             for asset in &assets {
                 self.asset_to_conn.insert(asset.clone(), conn_id);
+                assigned_routes.push((asset.clone(), conn_id));
             }
             self.markets.insert(market.hash.clone(), market);
         }
+
+        self.send_route_update(RouteUpdate::Assigned(assigned_routes))
+            .await;
 
         for (conn_id, assets) in pending {
             let handle = self
@@ -330,7 +341,6 @@ impl Pool {
             }
         }
 
-        self.update_monitor_mappings();
         info!(
             total_markets = self.markets.len(),
             total_connections = self.connections.len(),
@@ -342,6 +352,7 @@ impl Pool {
 
     pub async fn unsubscribe_markets(&mut self, market_hashes: Vec<String>) -> Result<()> {
         let mut conn_unsubs: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut removed_routes = Vec::new();
         let mut removed_count = 0_usize;
 
         for hash in market_hashes {
@@ -352,9 +363,15 @@ impl Pool {
             if let Some(conn_id) = self.market_to_conn.remove(&hash) {
                 for asset in market.assets {
                     self.asset_to_conn.remove(&asset);
+                    removed_routes.push(asset.clone());
                     conn_unsubs.entry(conn_id).or_default().push(asset);
                 }
             }
+        }
+
+        if !removed_routes.is_empty() {
+            self.send_route_update(RouteUpdate::Removed(removed_routes))
+                .await;
         }
 
         for (conn_id, assets) in conn_unsubs {
@@ -389,9 +406,6 @@ impl Pool {
             }
         }
 
-        if removed_count > 0 {
-            self.update_monitor_mappings();
-        }
         info!(
             unsubscribed = removed_count,
             remaining_markets = self.markets.len(),
@@ -470,29 +484,30 @@ impl Pool {
         );
     }
 
-    fn update_monitor_mappings(&self) {
-        let _ = self.asset_conns_tx.send(self.asset_to_conn.clone());
+    async fn send_route_update(&self, update: RouteUpdate) {
+        if self.route_update_tx.send(update).await.is_err() {
+            warn!("pool health monitor route channel closed");
+        }
     }
 }
 
 async fn run_health_monitor(
     mut status_rx: mpsc::UnboundedReceiver<HealthEvent>,
-    mut asset_conns_rx: watch::Receiver<HashMap<String, usize>>,
+    mut route_update_rx: mpsc::Receiver<RouteUpdate>,
     counters: Arc<HealthCounters>,
 ) {
     let mut state = HealthState::default();
 
     loop {
         tokio::select! {
+            biased;
+            update = route_update_rx.recv() => {
+                let Some(update) = update else { break };
+                state.apply_route_update(update, &counters);
+            }
             event = status_rx.recv() => {
                 let Some(event) = event else { break };
                 state.apply_event(event, &counters);
-            }
-            changed = asset_conns_rx.changed() => {
-                if changed.is_err() {
-                    break;
-                }
-                state.update_mappings(asset_conns_rx.borrow_and_update().clone(), &counters);
             }
         }
     }
@@ -501,7 +516,7 @@ async fn run_health_monitor(
 #[derive(Default)]
 struct HealthState {
     asset_conns: HashMap<String, usize>,
-    conn_assets: HashMap<usize, Vec<String>>,
+    conn_assets: HashMap<usize, HashSet<String>>,
     conn_status: HashMap<usize, ConnStatus>,
     conn_generation: HashMap<usize, u64>,
     asset_ready_generation: HashMap<String, u64>,
@@ -565,16 +580,17 @@ impl HealthState {
                 self.publish_gauges(counters);
             }
             HealthEvent::BookSnapshot { conn_id, asset_id } => {
-                if let Some(assigned_conn) = self.asset_conns.get(&asset_id) {
-                    if *assigned_conn != conn_id {
-                        warn!(
-                            asset = asset_id,
-                            conn = conn_id,
-                            expected_conn = assigned_conn,
-                            "ignoring book readiness from non-authoritative connection"
-                        );
-                        return;
-                    }
+                let Some(assigned_conn) = self.asset_conns.get(&asset_id) else {
+                    return;
+                };
+                if *assigned_conn != conn_id {
+                    warn!(
+                        asset = asset_id,
+                        conn = conn_id,
+                        expected_conn = assigned_conn,
+                        "ignoring book readiness from non-authoritative connection"
+                    );
+                    return;
                 }
                 let was_ready = self.asset_is_ready(&asset_id, conn_id);
                 let generation = self.conn_generation.get(&conn_id).copied().unwrap_or(0);
@@ -606,29 +622,66 @@ impl HealthState {
         }
     }
 
-    fn update_mappings(&mut self, asset_conns: HashMap<String, usize>, counters: &HealthCounters) {
-        self.asset_conns = asset_conns;
-        self.conn_assets.clear();
-        for (asset, conn_id) in &self.asset_conns {
-            self.conn_assets
-                .entry(*conn_id)
-                .or_default()
-                .push(asset.clone());
+    fn apply_route_update(&mut self, update: RouteUpdate, counters: &HealthCounters) {
+        match update {
+            RouteUpdate::Assigned(routes) => {
+                for (asset, conn_id) in routes {
+                    if let Some(existing_conn) = self.asset_conns.get(&asset) {
+                        if *existing_conn != conn_id {
+                            warn!(
+                                asset,
+                                existing_conn,
+                                conn = conn_id,
+                                "ignoring conflicting health-monitor route assignment"
+                            );
+                        }
+                        continue;
+                    }
+
+                    let conn_was_empty = !self.conn_assets.contains_key(&conn_id);
+                    self.asset_conns.insert(asset.clone(), conn_id);
+                    self.conn_assets
+                        .entry(conn_id)
+                        .or_default()
+                        .insert(asset.clone());
+                    if !self.asset_is_ready(&asset, conn_id) {
+                        self.assets_down_count = self.assets_down_count.saturating_add(1);
+                    }
+                    if conn_was_empty
+                        && !matches!(self.conn_status.get(&conn_id), Some(ConnStatus::Connected))
+                    {
+                        self.conns_down_count = self.conns_down_count.saturating_add(1);
+                    }
+                }
+            }
+            RouteUpdate::Removed(assets) => {
+                for asset in assets {
+                    let Some(conn_id) = self.asset_conns.get(&asset).copied() else {
+                        continue;
+                    };
+                    if !self.asset_is_ready(&asset, conn_id) {
+                        self.assets_down_count = self.assets_down_count.saturating_sub(1);
+                    }
+                    self.asset_conns.remove(&asset);
+                    self.asset_ready_generation.remove(&asset);
+                    self.down_since.remove(&asset);
+
+                    let conn_is_empty =
+                        self.conn_assets
+                            .get_mut(&conn_id)
+                            .is_some_and(|conn_assets| {
+                                conn_assets.remove(&asset);
+                                conn_assets.is_empty()
+                            });
+                    if conn_is_empty {
+                        self.conn_assets.remove(&conn_id);
+                        if !matches!(self.conn_status.get(&conn_id), Some(ConnStatus::Connected)) {
+                            self.conns_down_count = self.conns_down_count.saturating_sub(1);
+                        }
+                    }
+                }
+            }
         }
-        self.asset_ready_generation
-            .retain(|asset, _| self.asset_conns.contains_key(asset));
-        self.down_since
-            .retain(|asset, _| self.asset_conns.contains_key(asset));
-        self.assets_down_count = self
-            .asset_conns
-            .iter()
-            .filter(|(asset, conn_id)| !self.asset_is_ready(asset, **conn_id))
-            .count();
-        self.conns_down_count = self
-            .conn_assets
-            .keys()
-            .filter(|conn_id| !matches!(self.conn_status.get(conn_id), Some(ConnStatus::Connected)))
-            .count();
         self.publish_gauges(counters);
     }
 
@@ -680,7 +733,7 @@ mod tests {
     fn asset_recovers_only_after_a_fresh_book_snapshot() {
         let counters = HealthCounters::default();
         let mut state = HealthState::default();
-        state.update_mappings(HashMap::from([("asset".into(), 7)]), &counters);
+        state.apply_route_update(RouteUpdate::Assigned(vec![("asset".into(), 7)]), &counters);
 
         state.apply_event(
             HealthEvent::Connection {
@@ -734,6 +787,23 @@ mod tests {
         assert_eq!(counters.assets_down.load(Ordering::Relaxed), 0);
         assert_eq!(counters.asset_recovery_events.load(Ordering::Relaxed), 1);
         assert!(state.down_since.is_empty());
+    }
+
+    #[test]
+    fn removing_an_unready_route_updates_health_gauges() {
+        let counters = HealthCounters::default();
+        let mut state = HealthState::default();
+        state.apply_route_update(RouteUpdate::Assigned(vec![("asset".into(), 7)]), &counters);
+
+        assert_eq!(counters.conns_down.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.assets_down.load(Ordering::Relaxed), 1);
+
+        state.apply_route_update(RouteUpdate::Removed(vec!["asset".into()]), &counters);
+
+        assert_eq!(counters.conns_down.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.assets_down.load(Ordering::Relaxed), 0);
+        assert!(state.asset_conns.is_empty());
+        assert!(state.conn_assets.is_empty());
     }
 
     #[tokio::test]
