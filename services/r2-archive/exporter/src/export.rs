@@ -54,9 +54,9 @@ impl Exporter {
                 .source
                 .export_event(self.archive.as_ref(), &key, hour, event)
                 .with_context(|| format!("export {key}"))?;
-            let stats = artifact.stats.clone();
+            let (file, stats) = artifact.into_parts();
             self.archive
-                .commit(&key, artifact.into_file())
+                .commit(&key, file)
                 .with_context(|| format!("publish {key}"))?;
             update_hour_stats(
                 &stats,
@@ -73,7 +73,12 @@ impl Exporter {
                     sha256: stats.sha256,
                     min_sequence: stats.min_sequence,
                     max_sequence: stats.max_sequence,
-                    columns: stats.columns,
+                    columns: event
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().to_owned())
+                        .collect(),
                     order_by: event
                         .sort_columns()
                         .iter()
@@ -773,12 +778,6 @@ mod tests {
                     sha256: format!("{:x}", Sha256::digest(data)),
                     min_sequence: (self.rows_per_event > 0).then_some(minimum),
                     max_sequence: (self.rows_per_event > 0).then_some(minimum + 1),
-                    columns: event
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|field| field.name().to_owned())
-                        .collect(),
                 },
             ))
         }

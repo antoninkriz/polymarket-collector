@@ -18,14 +18,13 @@ pub const PARQUET_COMPRESSION_LEVEL: i32 = 9;
 pub const PARQUET_DICTIONARY_PAGE_SIZE_LIMIT: usize = 8 * 1024 * 1024;
 pub const PARQUET_MAX_ROW_GROUP_ROWS: usize = 1_048_576;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct FileStats {
     pub row_count: u64,
     pub byte_size: u64,
     pub sha256: String,
     pub min_sequence: Option<u64>,
     pub max_sequence: Option<u64>,
-    pub columns: Vec<String>,
 }
 
 pub struct StagedArtifact {
@@ -34,8 +33,8 @@ pub struct StagedArtifact {
 }
 
 impl StagedArtifact {
-    pub fn into_file(self) -> NamedTempFile {
-        self.file
+    pub fn into_parts(self) -> (NamedTempFile, FileStats) {
+        (self.file, self.stats)
     }
 
     #[cfg(test)]
@@ -179,11 +178,6 @@ where
             sha256,
             min_sequence,
             max_sequence,
-            columns: schema
-                .fields()
-                .iter()
-                .map(|field| field.name().to_owned())
-                .collect(),
         },
     })
 }
