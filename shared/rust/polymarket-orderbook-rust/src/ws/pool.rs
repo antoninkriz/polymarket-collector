@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use anyhow::{ensure, Result};
+use anyhow::{anyhow, ensure, Result};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -314,6 +314,7 @@ impl Pool {
         self.send_route_update(RouteUpdate::Assigned(assigned_routes))
             .await;
 
+        let mut command_error = None;
         for (handle, assets) in self.connections.iter_mut().zip(pending_assets) {
             if assets.is_empty() {
                 continue;
@@ -321,8 +322,14 @@ impl Pool {
             let conn_id = handle.conn_id;
             handle.assets.extend(assets.iter().cloned());
             if let Err(error) = handle.cmd_tx.send(Command::Subscribe(assets)).await {
-                warn!(conn = conn_id, %error, "subscribe send failed");
+                command_error.get_or_insert_with(|| {
+                    anyhow!("send subscribe command to connection {conn_id}: {error}")
+                });
             }
+        }
+
+        if let Some(error) = command_error {
+            return Err(error);
         }
 
         Ok(())
@@ -353,6 +360,7 @@ impl Pool {
         })
         .await;
 
+        let mut command_error = None;
         if let Some(handle) = self.connections.iter_mut().find(|h| h.conn_id == conn_id) {
             for asset in assets {
                 handle.assets.remove(asset);
@@ -362,7 +370,9 @@ impl Pool {
                 .send(Command::Unsubscribe(assets.to_vec()))
                 .await
             {
-                warn!(conn = conn_id, %error, "unsubscribe send failed");
+                command_error = Some(anyhow!(
+                    "send unsubscribe command to connection {conn_id}: {error}"
+                ));
             }
         }
 
@@ -377,6 +387,10 @@ impl Pool {
             } else {
                 index += 1;
             }
+        }
+
+        if let Some(error) = command_error {
+            return Err(error);
         }
 
         Ok(())
@@ -709,6 +723,21 @@ mod tests {
         Pool::new(max_assets, tx)
     }
 
+    fn add_test_connection(pool: &mut Pool, conn_id: usize) -> mpsc::Receiver<Command> {
+        let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_SIZE);
+        let join = tokio::spawn(std::future::pending::<Result<()>>());
+        pool.connections.push(ConnHandle {
+            conn_id,
+            assets: HashSet::new(),
+            lifecycle_listener: true,
+            cmd_tx,
+            join,
+        });
+        pool.next_conn_id = conn_id.saturating_add(1);
+        pool.lifecycle_conn_id = Some(conn_id);
+        cmd_rx
+    }
+
     #[test]
     fn asset_recovers_only_after_a_fresh_book_snapshot() {
         let counters = HealthCounters::default();
@@ -982,6 +1011,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscribe_fails_when_connection_command_channel_is_closed() {
+        let mut pool = pool(2);
+        let commands = add_test_connection(&mut pool, 41);
+        drop(commands);
+        let subscribed = market("m1", "yes", "no");
+
+        let error = pool
+            .subscribe_markets(std::slice::from_ref(&subscribed))
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("send subscribe command to connection 41"));
+        assert_eq!(pool.market_to_conn[&subscribed.hash], 41);
+        assert_eq!(pool.asset_to_conn[&subscribed.assets[0]], 41);
+        assert_eq!(pool.asset_to_conn[&subscribed.assets[1]], 41);
+        assert_eq!(pool.connections[0].assets.len(), 2);
+    }
+
+    #[tokio::test]
     async fn connections_do_not_exceed_capacity_or_split_markets() {
         let mut pool = pool(4);
         let markets = [
@@ -1136,6 +1186,31 @@ mod tests {
         assert_eq!(pool.connection_count(), 1);
         assert!(pool.connections[0].assets.is_empty());
         assert_eq!(pool.lifecycle_conn_id, Some(pool.connections[0].conn_id));
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_fails_when_connection_command_channel_is_closed() {
+        let mut pool = pool(2);
+        let mut commands = add_test_connection(&mut pool, 42);
+        let subscribed = market("m1", "a1y", "a1n");
+        pool.subscribe_markets(std::slice::from_ref(&subscribed))
+            .await
+            .unwrap();
+        assert!(matches!(commands.recv().await, Some(Command::Subscribe(_))));
+        drop(commands);
+
+        let error = pool
+            .unsubscribe_market(&subscribed.hash, &subscribed.assets)
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("send unsubscribe command to connection 42"));
+        assert!(!pool.market_to_conn.contains_key(&subscribed.hash));
+        assert!(!pool.asset_to_conn.contains_key(&subscribed.assets[0]));
+        assert!(!pool.asset_to_conn.contains_key(&subscribed.assets[1]));
+        assert!(pool.connections[0].assets.is_empty());
     }
 
     #[tokio::test]
