@@ -219,21 +219,19 @@ impl Pool {
     }
 
     /// Assign a sequence and enqueue one centrally accepted lifecycle event.
-    pub fn admit_lifecycle(&self, event: Event, timestamp_received_ns: i64) {
+    pub fn admit_lifecycle(&self, event: Event, timestamp_received_ns: i64) -> Result<()> {
         let record = self.collector.record(event, timestamp_received_ns);
         match self.event_tx.try_send(record) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::error!(
-                    capacity = self.event_tx.capacity(),
-                    max_capacity = self.event_tx.max_capacity(),
-                    "[QUEUE-OVERFLOW] lifecycle event channel full, exiting"
-                );
-                std::process::exit(1);
-            }
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(anyhow!(
+                "lifecycle event sink queue is full (available {}, maximum {}); stopping after rejected event",
+                self.event_tx.capacity(),
+                self.event_tx.max_capacity(),
+            )),
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::error!("lifecycle event sink closed; exiting before losing data");
-                std::process::exit(1);
+                Err(anyhow!(
+                    "lifecycle event sink is closed; stopping after rejected event"
+                ))
             }
         }
     }
@@ -718,6 +716,18 @@ mod tests {
         Market::new(hash.into(), yes.into(), no.into())
     }
 
+    fn lifecycle_event(market: &str) -> Event {
+        Event::NewMarket {
+            id: "1".into(),
+            market: market.into(),
+            timestamp: "1".into(),
+            assets_ids: vec![format!("{market}-yes"), format!("{market}-no")],
+            outcomes: vec!["Yes".into(), "No".into()],
+            question: None,
+            slug: None,
+        }
+    }
+
     fn pool(max_assets: usize) -> Pool {
         let (tx, _rx) = mpsc::channel::<EventRecord>(1024);
         Pool::new(max_assets, tx)
@@ -736,6 +746,33 @@ mod tests {
         pool.next_conn_id = conn_id.saturating_add(1);
         pool.lifecycle_conn_id = Some(conn_id);
         cmd_rx
+    }
+
+    #[tokio::test]
+    async fn lifecycle_admission_reports_a_full_sink_queue() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let pool = Pool::new(2, event_tx);
+
+        pool.admit_lifecycle(lifecycle_event("first"), 1).unwrap();
+        let error = pool
+            .admit_lifecycle(lifecycle_event("second"), 2)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("sink queue is full"));
+        assert_eq!(event_rx.recv().await.unwrap().timestamp_received_ns, 1);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_admission_reports_a_closed_sink_queue() {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        drop(event_rx);
+        let pool = Pool::new(2, event_tx);
+
+        let error = pool
+            .admit_lifecycle(lifecycle_event("closed"), 1)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("sink is closed"));
     }
 
     #[test]

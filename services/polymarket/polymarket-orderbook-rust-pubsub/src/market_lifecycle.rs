@@ -511,11 +511,13 @@ impl LifecycleCoordinator {
             }
             PlannedObservation::AdmitExisting { .. } => {
                 self.pool
-                    .admit_lifecycle(observation.event, observation.timestamp_received_ns);
+                    .admit_lifecycle(observation.event, observation.timestamp_received_ns)
+                    .context("enqueue lifecycle event")?;
             }
             PlannedObservation::Subscribe { market, .. } => {
                 self.pool
-                    .admit_lifecycle(observation.event, observation.timestamp_received_ns);
+                    .admit_lifecycle(observation.event, observation.timestamp_received_ns)
+                    .context("enqueue lifecycle event")?;
                 self.pool
                     .subscribe_markets(std::slice::from_ref(market))
                     .await
@@ -532,7 +534,8 @@ impl LifecycleCoordinator {
                 ..
             } => {
                 self.pool
-                    .admit_lifecycle(observation.event, observation.timestamp_received_ns);
+                    .admit_lifecycle(observation.event, observation.timestamp_received_ns)
+                    .context("enqueue lifecycle event")?;
                 if let Some(assets) = active_assets {
                     self.pool
                         .unsubscribe_market(market, assets)
