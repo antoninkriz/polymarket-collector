@@ -1,16 +1,13 @@
 # Polymarket Collector
 
-A production-oriented Rust pipeline for capturing Polymarket's public CLOB
-market-data feed in collector order, isolating live WebSocket ingestion from
-storage failures, and exporting reconstructible hourly archives as compact,
-typed Parquet files to Cloudflare R2 or the local filesystem.
+This project collects live data from Polymarket across all prediction markets with periodic hourly Parquet exports. Compared to its predecessors, it should correctly handle short-lived markets such as 5-minute BTC up/down markets, preserve the original event order for correct order book reconstruction, and stores different types of market event data separately in an optimized Parquet layout.
 
 ## The archive at a glance
 
 Every completed UTC receive-time hour is a self-contained directory:
 
 ```text
-2026-08-13/14/
+YYYY-MM-DD/HH/
 ├── best_bid_ask.parquet
 ├── book.parquet
 ├── last_trade_price.parquet
@@ -33,6 +30,7 @@ Every completed UTC receive-time hour is a self-contained directory:
 | `market_resolved.parquet`  | A resolved market and its winning asset/outcome when supplied.                   |
 | `manifest.json`            | The completion marker and integrity index for the entire hour.                   |
 
+Full format specification can be found in [`docs/PARQUET_EXPORT.md`](docs/PARQUET_EXPORT.md).
 
 Key format rules:
 
@@ -42,9 +40,8 @@ a 32-byte `market`; token files add a 32-byte `asset_id`.
 lists of `(price, size)` structs.
 - **Physical order:** `(market, asset_id, sequence)` for token events and
 `(market, sequence)` for lifecycle events.
-- **Replay order:** always `sequence`, even across different files.
+- **Replay order:** always `sequence` column as seqnum, even across different files.
 - **Completion:** trust an hour only when `manifest.json` exists.
-- **Full specification:** `[docs/PARQUET_EXPORT.md](docs/PARQUET_EXPORT.md)`.
 
 
 
@@ -127,16 +124,16 @@ its public fields are identical.
 multiple fills, so trade payload fields are never used for deduplication.
 - Polymarket exposes no replay cursor or source sequence. The archive faithfully
 records what this collector accepted, but it is not an exchange audit log and
-cannot recreate an event missed during an upstream outage.
+cannot recreate an event missed during an outage.
 
 The complete collection, restart, timestamp, reconnection, and replay contract
 is in `[docs/DATA_MODEL.md](docs/DATA_MODEL.md)`.
 
+
+
 ## Development and operations
 
-
-
-### Run the complete pipeline locally
+### Local development and execution
 
 Requires Linux plus Docker Compose or Podman Compose:
 
@@ -171,13 +168,11 @@ the first archive can take a little over one hour to appear.
 Redis and ClickHouse are reachable only inside the private `obdata` container
 network:
 
-
-| Service           | Internal address         | Host port |
-| ----------------- | ------------------------ | --------- |
-| Redis             | `obdata-redis:6379`      | None      |
-| ClickHouse HTTP   | `obdata-clickhouse:8123` | None      |
-| ClickHouse native | `obdata-clickhouse:9000` | None      |
-
+| Service           | Internal address         |
+| ----------------- | ------------------------ |
+| Redis             | `obdata-redis:6379`      |
+| ClickHouse HTTP   | `obdata-clickhouse:8123` |
+| ClickHouse native | `obdata-clickhouse:9000` |
 
 Use `docker exec` or `podman exec` for local inspection rather than exposing a
 database port.
@@ -202,8 +197,7 @@ Start infrastructure and applications with Docker Compose:
 
 ```sh
 docker compose -f docker-compose.infra.yml up -d --remove-orphans
-docker compose -f docker-compose.polymarket.yml \
-  up -d --build --remove-orphans
+docker compose -f docker-compose.polymarket.yml up -d --build --remove-orphans
 ```
 
 Start infrastructure first: it creates the private `obdata` bridge that the
@@ -240,7 +234,6 @@ docker compose -f docker-compose.polymarket.yml logs -f --tail=200
 
 The most useful signals are:
 
-
 | Area       | Healthy pattern                                                                                                 | Investigate when                                                                                             |
 | ---------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | Publisher  | `[QUEUE-STATS]` queues return to zero; `pool_stats` reports current Gamma poll ages.                            | Queue high-water repeatedly approaches capacity, Gamma ages keep growing, or `assets_down` remains elevated. |
@@ -248,7 +241,6 @@ The most useful signals are:
 | Writer     | `[POLYMARKET-FROM-PUBSUB-STATS]` shows low queue depth, zero parse failures, and small `forwarded_minus_acked`. | Pending work grows from minute to minute or ClickHouse retries persist.                                      |
 | Redis      | Stream consumer lag and `used_memory` remain bounded.                                                           | The writer is unavailable and the stream grows; current traffic can consume many GiB per hour.               |
 | Exporter   | One `completed receive-time hour` per hour, followed by safe partition cleanup.                                 | Export retries continue, no new manifest appears, or cleanup repeatedly retains a supposedly complete hour.  |
-
 
 Useful Redis checks:
 
@@ -263,45 +255,41 @@ the recorded SHA-256 digests before trusting the hour.
 
 ### System requirements
 
-
-|                              | Minimum                | Recommended                                             |
-| ---------------------------- | ---------------------- | ------------------------------------------------------- |
-| CPU                          | 4 modern vCPUs         | 8 modern vCPUs                                          |
-| RAM                          | 16 GiB                 | 32 GiB                                                  |
-| Open files (`RLIMIT_NOFILE`) | 65,536                 | 262,144                                                 |
-| Local disk with R2           | 50 GiB SSD             | 100 GiB NVMe                                            |
-| Network                      | 100 Mbit/s symmetric   | 200 Mbit/s symmetric; 1 Gbit/s for comfortable recovery |
-| Local archive                | Add 22 GB/day retained | Add 0.65 TB per 30 days plus headroom                   |
-
-
-> **Reference workload:** measured on 2026-08-14 with approximately 160,000
-> binary markets, 320,000 assets, 1,280 WebSocket connections, and 94.5 million
-> normalized events per hour (about 26,000/s). Polymarket traffic varies.
+|                              | Minimum                | Recommended                               |
+| ---------------------------- | ---------------------- | ----------------------------------------- |
+| CPU                          | 4 modern vCPUs         | 8 modern vCPUs                            |
+| RAM                          | 16 GiB                 | 32 GiB                                    |
+| Open files (`RLIMIT_NOFILE`) | `32768`                | `262144`                                  |
+| Local disk with R2           | 50 GiB SSD             | 100 GiB NVMe                              |
+| Network                      | 100 Mbit/s symmetric   | 200+ Mbit/s symmetric; 1 Gbit/s preferred |
+| Local archive                | Add 22 GB/day retained | Add 0.65 TB per 30 days plus headroom     |
 
 
-| Resource         | Measured reference                                                                                                        | Explanation                                                                                                                    |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| CPU              | Roughly one aggregate core in steady state.                                                                               | ClickHouse merges, cold subscription, and hourly export are bursty; 4 vCPUs is tight and 8 leaves useful headroom.             |
-| RAM              | About 6–7 GiB total; the publisher used roughly 3–4 GiB.                                                                  | 16 GiB supports a healthy full-universe pipeline; 32 GiB provides safer burst and backlog capacity.                            |
-| Open files       | The publisher maintains roughly 1,280 WebSocket connections, while Redis and ClickHouse also hold sockets and data files. | A high limit avoids failures during reconnect waves, merges, and export. The runtime cannot exceed the host user's hard limit. |
-| ClickHouse disk  | About 3.4–3.8 GiB per raw hour; the rolling window normally uses 15–20 GiB.                                               | SSD latency matters during simultaneous writes, merges, and export. Container images and temporary files also need room.       |
-| Parquet archive  | About 0.8–0.9 GB/hour, or 20–22 GB/day.                                                                                   | Local retention needs roughly 0.65 TB per 30 days before filesystem headroom; R2 avoids that persistent local cost.            |
-| Incoming network | Roughly 60–75 Mbit/s sustained, with snapshot and reconnect bursts.                                                       | 100 Mbit/s is a tight minimum. More bandwidth shortens full-universe and reconnect recovery.                                   |
-| Outgoing network | Control traffic stayed below 1 Mbit/s; R2 averages about 2 Mbit/s but uploads hourly in bursts.                           | Faster outbound completes R2 uploads well before the next hour becomes eligible.                                               |
+> **Reference workload:** measured with approximately 160,000 binary markets,
+> 320,000 assets, 1,280 WebSocket connections, and 94.5 million normalized
+> events per hour (about 26,000/s). Polymarket traffic varies.
 
+
+| Resource         | Measured reference                                                           | Explanation                                                                                                       |
+| ---------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| CPU             | Roughly one aggregate core in steady state.                                   | ClickHouse merges, cold subscription, and hourly export are bursty; 4 vCPUs can be tight, 8 leaves nice headroom. |
+| RAM             | About 6–7 GiB total; the publisher used roughly 3–4 GiB.                      | 16 GiB supports a healthy full-universe pipeline; 32 GiB provides safer burst and backlog capacity.               |
+| Open files      | ClickHouse loves high `nofile` limit and we need around ~1500 WS connections. | A high limit avoids failures during reconnect waves, merges, and export.                                          |
+| ClickHouse disk | About 3.4–3.8 GiB per raw hour; the rolling window normally uses 15–20 GiB.   | Any reasonable SSD should be fine, we need storage for the DB and exports.                                        |
+| Parquet archive | About 0.8–0.9 GB/hour, or 20–22 GB/day.                                       | The data take around 0.65 TB per 30 days in local storage or R2.                                                  |
+| Network in      | Roughly 60–75 Mbit/s sustained, with snapshot and reconnect bursts.           | 100 Mbit/s is a minimum. More bandwidth shortens full-universe and reconnect recovery.                            |
+| Network out     | Control traffic stays below 1 Mbit/s; Burst uploads of ~1 GB of data hourly.  | Faster outbound completes R2 uploads well before the next hour becomes eligible.                                  |
 
 RAM sizing assumes the ClickHouse writer is healthy. A writer outage leaves
-the durable Redis Stream growing at approximately the uncompressed event rate:
-the reference hour contained about 27 GiB of normalized JSON before Redis
-overhead. Monitor lag and memory closely rather than treating Redis as a
-multi-hour backlog store.
+the durable Redis Stream growing at approximately the uncompressed event rate
+of about 30 GiB an hour before Redis overhead. Monitor lag and memory closely
+and consider Redis as a short term back-off rather than treating Redis as
+a multi-hour backlog store.
 
 ## Documentation
 
-- `[docs/DATA_MODEL.md](docs/DATA_MODEL.md)` — collection guarantees,
-timestamps, ordering, reconnect behavior, deduplication, and replay.
-- `[docs/PARQUET_EXPORT.md](docs/PARQUET_EXPORT.md)` — every exported column,
-Arrow and Parquet type, nullability, encoding, file order, and manifest field.
+- `[docs/DATA_MODEL.md](docs/DATA_MODEL.md)` — collection guarantees, timestamps, ordering, reconnect behavior, deduplication, and replay.
+- `[docs/PARQUET_EXPORT.md](docs/PARQUET_EXPORT.md)` — every exported column, Arrow and Parquet type, nullability, encoding, file order, and manifest field.
 
 
 
