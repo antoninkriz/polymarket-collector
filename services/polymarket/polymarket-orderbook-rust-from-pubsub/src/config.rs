@@ -18,7 +18,6 @@ pub struct Config {
     pub redis_event_stream: String,
     pub stream_consumer_group: String,
     pub stream_consumer_name: String,
-    pub trim_acked_stream_entries: bool,
     pub pubsub_reconnect_delay: Duration,
     pub clickhouse_url: String,
     pub clickhouse_user: String,
@@ -44,7 +43,6 @@ impl Config {
             redis_event_stream: env_or("REDIS_EVENT_STREAM", "polymarket:events:v3"),
             stream_consumer_group: env_or("EVENT_CONSUMER_GROUP", "polymarket-clickhouse-v3"),
             stream_consumer_name: env_or("EVENT_CONSUMER_NAME", "polymarket-clickhouse-v3-1"),
-            trim_acked_stream_entries: env_bool("TRIM_ACKED_STREAM_ENTRIES"),
             pubsub_reconnect_delay: Duration::from_millis(env_u64_or(
                 "STREAM_RECONNECT_DELAY_MS",
                 2_000,
@@ -97,17 +95,6 @@ fn env_usize_or(name: &str, default: usize) -> Result<usize> {
             .parse()
             .with_context(|| format!("parse env var {name} as usize")),
         Err(_) => Ok(default),
-    }
-}
-
-fn env_bool(name: &str) -> bool {
-    env_bool_default(name, false)
-}
-
-fn env_bool_default(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(value) => matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
-        Err(_) => default,
     }
 }
 

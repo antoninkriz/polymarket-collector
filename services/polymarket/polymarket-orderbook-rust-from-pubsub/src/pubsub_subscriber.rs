@@ -21,57 +21,7 @@ use polymarket_orderbook_rust::sink::SinkItem;
 const READ_COUNT: usize = 1_000;
 const READ_BLOCK_MS: usize = 1_000;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
-
-// Acknowledgement and trimming must be one operation: after ClickHouse commits,
-// either an entry remains pending and replayable or Redis can remove it without
-// crossing the oldest pending entry. Trimming is permitted only when this is
-// the stream's sole consumer group; otherwise it could destroy data still
-// needed by another group.
-const ACK_AND_TRIM_EXCLUSIVE_SCRIPT: &str = r#"
-local groups = redis.call('XINFO', 'GROUPS', KEYS[1])
-if #groups ~= 1 then
-  return redis.error_reply('STREAM_GROUP_OWNERSHIP_MISMATCH expected exactly one group')
-end
-
-local group_name = nil
-local last_delivered_id = '0-0'
-for i = 1, #groups[1], 2 do
-  if groups[1][i] == 'name' then
-    group_name = groups[1][i + 1]
-  elseif groups[1][i] == 'last-delivered-id' then
-    last_delivered_id = groups[1][i + 1]
-  end
-end
-if group_name ~= ARGV[1] then
-  return redis.error_reply('STREAM_GROUP_OWNERSHIP_MISMATCH configured group is not sole owner')
-end
-
--- Lua cannot expand an arbitrarily large ARGV with unpack(). Recovery can
--- acknowledge several ClickHouse batches at once, so keep each Redis call
--- comfortably below the Lua stack limit while retaining script atomicity.
-local acknowledged = 0
-local first = 2
-local chunk_size = 256
-while first <= #ARGV do
-  local last = math.min(first + chunk_size - 1, #ARGV)
-  acknowledged = acknowledged + redis.call(
-    'XACK', KEYS[1], ARGV[1], unpack(ARGV, first, last)
-  )
-  first = last + 1
-end
-
--- Keep the oldest pending entry and everything after it. With no pending
--- entries, keep the last delivered entry as a harmless boundary marker; all
--- unread entries necessarily have greater IDs. One XTRIM replaces thousands
--- of per-entry XDEL arguments while preserving replay safety.
-local trim_before = last_delivered_id
-local pending = redis.call('XPENDING', KEYS[1], ARGV[1], '-', '+', 1)
-if #pending > 0 then
-  trim_before = pending[1][1]
-end
-local trimmed = redis.call('XTRIM', KEYS[1], 'MINID', trim_before)
-return {acknowledged, trimmed}
-"#;
+const ACK_DELETE_CHUNK_SIZE: usize = READ_COUNT;
 
 #[derive(Debug, Clone)]
 pub struct PubSubSubscriberConfig {
@@ -79,7 +29,6 @@ pub struct PubSubSubscriberConfig {
     pub stream: String,
     pub group: String,
     pub consumer: String,
-    pub trim_acked_entries: bool,
     pub reconnect_delay: Duration,
 }
 
@@ -87,7 +36,7 @@ pub struct PubSubSubscriberConfig {
 pub struct SubscriberStats {
     pub events_forwarded: AtomicU64,
     pub events_acked: AtomicU64,
-    pub events_trimmed: AtomicU64,
+    pub events_deleted: AtomicU64,
     pub parse_failures: AtomicU64,
     pub reconnects: AtomicU64,
 }
@@ -233,40 +182,65 @@ async fn flush_acks(
     }
     // A reconnect can replay committed-but-unacknowledged entries while their
     // previous acknowledgements are still queued. Avoid sending duplicate IDs
-    // to the cleanup script and cap its argument volume during recovery.
+    // and keep each Redis command bounded during recovery.
     pending_acks.sort_unstable();
     pending_acks.dedup();
-    let (acknowledged, trimmed) = if cfg.trim_acked_entries {
-        redis::Script::new(ACK_AND_TRIM_EXCLUSIVE_SCRIPT)
-            .key(&cfg.stream)
-            .arg(&cfg.group)
-            .arg(pending_acks.as_slice())
-            .invoke_async::<(i64, i64)>(conn)
-            .await
-            .with_context(|| {
-                format!(
-                    "atomically acknowledge and trim committed rows; {} must be the stream's only consumer group",
-                    cfg.group,
-                )
-            })?
-    } else {
-        let acknowledged: i64 = redis::cmd("XACK")
+    let mut processed = 0;
+    while processed < pending_acks.len() {
+        let end = (processed + ACK_DELETE_CHUNK_SIZE).min(pending_acks.len());
+        let result: redis::RedisResult<Vec<i64>> = redis::cmd("XACKDEL")
             .arg(&cfg.stream)
             .arg(&cfg.group)
-            .arg(pending_acks.as_slice())
+            .arg("ACKED")
+            .arg("IDS")
+            .arg(end - processed)
+            .arg(&pending_acks[processed..end])
             .query_async(conn)
-            .await
-            .context("XACK committed ClickHouse rows")?;
-        (acknowledged, 0)
-    };
-    stats
-        .events_acked
-        .fetch_add(acknowledged as u64, Ordering::Relaxed);
-    stats
-        .events_trimmed
-        .fetch_add(trimmed as u64, Ordering::Relaxed);
+            .await;
+        let statuses = match result {
+            Ok(statuses) => statuses,
+            Err(error) => {
+                pending_acks.drain(..processed);
+                return Err(error).context("XACKDEL committed ClickHouse rows");
+            }
+        };
+        let (acknowledged, deleted) = match ack_delete_counts(&statuses, end - processed) {
+            Ok(counts) => counts,
+            Err(error) => {
+                pending_acks.drain(..processed);
+                return Err(error);
+            }
+        };
+        stats
+            .events_acked
+            .fetch_add(acknowledged, Ordering::Relaxed);
+        stats.events_deleted.fetch_add(deleted, Ordering::Relaxed);
+        processed = end;
+    }
     pending_acks.clear();
     Ok(())
+}
+
+fn ack_delete_counts(statuses: &[i64], expected: usize) -> Result<(u64, u64)> {
+    anyhow::ensure!(
+        statuses.len() == expected,
+        "XACKDEL returned {} statuses for {expected} IDs",
+        statuses.len()
+    );
+    let mut acknowledged = 0;
+    let mut deleted = 0;
+    for status in statuses {
+        match status {
+            1 => {
+                acknowledged += 1;
+                deleted += 1;
+            }
+            2 => acknowledged += 1,
+            -1 => {}
+            status => anyhow::bail!("XACKDEL returned unknown status {status}"),
+        }
+    }
+    Ok((acknowledged, deleted))
 }
 
 fn preview(payload: &str) -> String {
@@ -290,7 +264,8 @@ mod tests {
     use anyhow::Result;
 
     use super::{
-        ensure_consumer_group, flush_acks, preview, PubSubSubscriberConfig, SubscriberStats,
+        ack_delete_counts, ensure_consumer_group, flush_acks, preview, PubSubSubscriberConfig,
+        SubscriberStats,
     };
 
     const TEST_REDIS_URL: &str = "redis://localhost:16380";
@@ -301,9 +276,16 @@ mod tests {
         assert_eq!(preview(&payload), format!("{}…", "a".repeat(199)));
     }
 
+    #[test]
+    fn ack_delete_statuses_are_counted_strictly() {
+        assert_eq!(ack_delete_counts(&[1, 2, -1], 3).unwrap(), (2, 1));
+        assert!(ack_delete_counts(&[1], 2).is_err());
+        assert!(ack_delete_counts(&[0], 1).is_err());
+    }
+
     #[tokio::test]
     #[ignore]
-    async fn committed_cleanup_requires_the_only_consumer_group() -> Result<()> {
+    async fn committed_cleanup_is_exact_and_group_safe() -> Result<()> {
         let suffix = format!(
             "{}:{}",
             std::process::id(),
@@ -314,7 +296,6 @@ mod tests {
             stream: format!("test:polymarket:v3:cleanup:{suffix}"),
             group: "clickhouse".into(),
             consumer: "clickhouse-1".into(),
-            trim_acked_entries: true,
             reconnect_delay: Duration::from_millis(1),
         };
         let client = redis::Client::open(TEST_REDIS_URL)?;
@@ -346,8 +327,9 @@ mod tests {
             .await?;
 
         let stats = SubscriberStats::default();
-        // Include a duplicate to exercise reconnect-time acknowledgement
-        // coalescing as well as Lua chunking above the stack limit.
+        // Include a duplicate to exercise reconnect-time coalescing and send
+        // enough IDs to cross the native-command chunk boundary.
+        let missing_id = first_ids[0].clone();
         first_ids.push(first_ids[0].clone());
         let mut pending = first_ids;
         flush_acks(&mut conn, &cfg, &mut pending, &stats).await?;
@@ -356,14 +338,23 @@ mod tests {
             .arg(&cfg.stream)
             .query_async(&mut conn)
             .await?;
-        assert_eq!(length, 1);
+        assert_eq!(length, 0);
         assert_eq!(
             stats.events_acked.load(Ordering::Relaxed),
             BULK_ENTRY_COUNT as u64
         );
         assert_eq!(
-            stats.events_trimmed.load(Ordering::Relaxed),
-            BULK_ENTRY_COUNT as u64 - 1
+            stats.events_deleted.load(Ordering::Relaxed),
+            BULK_ENTRY_COUNT as u64
+        );
+
+        // An already-applied ID is locally complete and safe to discard.
+        let mut missing_ack = vec![missing_id];
+        flush_acks(&mut conn, &cfg, &mut missing_ack, &stats).await?;
+        assert!(missing_ack.is_empty());
+        assert_eq!(
+            stats.events_acked.load(Ordering::Relaxed),
+            BULK_ENTRY_COUNT as u64
         );
 
         let mut ordered_ids = Vec::new();
@@ -390,15 +381,15 @@ mod tests {
             .query_async(&mut conn)
             .await?;
 
-        // Acknowledging newer entries must not trim across an older pending
-        // entry, even though this deployment has the only consumer group.
+        // Exact deletion can remove newer committed entries while preserving
+        // an older pending entry.
         let mut newer_acks = ordered_ids[1..].to_vec();
         flush_acks(&mut conn, &cfg, &mut newer_acks, &stats).await?;
         let length: i64 = redis::cmd("XLEN")
             .arg(&cfg.stream)
             .query_async(&mut conn)
             .await?;
-        assert_eq!(length, 3);
+        assert_eq!(length, 1);
 
         let mut oldest_ack = vec![ordered_ids[0].clone()];
         flush_acks(&mut conn, &cfg, &mut oldest_ack, &stats).await?;
@@ -406,7 +397,7 @@ mod tests {
             .arg(&cfg.stream)
             .query_async(&mut conn)
             .await?;
-        assert_eq!(length, 1);
+        assert_eq!(length, 0);
 
         let _: () = redis::cmd("XGROUP")
             .arg("CREATE")
@@ -433,19 +424,57 @@ mod tests {
             .arg(">")
             .query_async(&mut conn)
             .await?;
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg("observer")
+            .arg("observer-1")
+            .arg("COUNT")
+            .arg(1)
+            .arg("STREAMS")
+            .arg(&cfg.stream)
+            .arg(">")
+            .query_async(&mut conn)
+            .await?;
 
-        let mut pending = vec![second_id];
-        let error = flush_acks(&mut conn, &cfg, &mut pending, &stats)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("only consumer group"), "{error}");
-        assert_eq!(pending.len(), 1);
+        // The first group is acknowledged, but the entry remains because the
+        // observer group still has it pending.
+        let mut primary_ack = vec![second_id.clone()];
+        flush_acks(&mut conn, &cfg, &mut primary_ack, &stats).await?;
+        assert!(primary_ack.is_empty());
         let length: i64 = redis::cmd("XLEN")
             .arg(&cfg.stream)
             .query_async(&mut conn)
             .await?;
-        assert_eq!(length, 2);
+        assert_eq!(length, 1);
+
+        let acknowledged_before_retry = stats.events_acked.load(Ordering::Relaxed);
+        let deleted_before_retry = stats.events_deleted.load(Ordering::Relaxed);
+        let mut primary_retry = vec![second_id.clone()];
+        flush_acks(&mut conn, &cfg, &mut primary_retry, &stats).await?;
+        assert_eq!(
+            stats.events_acked.load(Ordering::Relaxed),
+            acknowledged_before_retry
+        );
+        assert_eq!(
+            stats.events_deleted.load(Ordering::Relaxed),
+            deleted_before_retry
+        );
+
+        let observer_cfg = PubSubSubscriberConfig {
+            group: "observer".into(),
+            consumer: "observer-1".into(),
+            ..cfg.clone()
+        };
+        let observer_stats = SubscriberStats::default();
+        let mut observer_ack = vec![second_id];
+        flush_acks(&mut conn, &observer_cfg, &mut observer_ack, &observer_stats).await?;
+        assert_eq!(observer_stats.events_acked.load(Ordering::Relaxed), 1);
+        assert_eq!(observer_stats.events_deleted.load(Ordering::Relaxed), 1);
+        let length: i64 = redis::cmd("XLEN")
+            .arg(&cfg.stream)
+            .query_async(&mut conn)
+            .await?;
+        assert_eq!(length, 0);
 
         let _: i64 = redis::cmd("DEL")
             .arg(&cfg.stream)
