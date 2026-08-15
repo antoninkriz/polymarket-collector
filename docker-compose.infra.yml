@@ -30,7 +30,24 @@ services:
       - obdata
     volumes:
       - .data/redis-data:/data
-    command: redis-server --appendonly yes
+    # AOF preserves the durable handoff across restarts. The stream is written
+    # at very high volume but normally contains only a small unacknowledged
+    # tail, so Redis's 64 MiB default would rewrite the AOF every few seconds.
+    # A 4 GiB floor keeps recovery bounded while avoiding continuous forks.
+    # Periodic RDB snapshots are redundant with AOF and would add another fork
+    # every minute under this workload.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --auto-aof-rewrite-percentage
+      - "100"
+      - --auto-aof-rewrite-min-size
+      - 4gb
+      - --save
+      - ""
 
 networks:
   obdata:
