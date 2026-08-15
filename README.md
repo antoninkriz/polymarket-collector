@@ -34,12 +34,9 @@ Full format specification can be found in [`docs/PARQUET_EXPORT.md`](docs/PARQUE
 
 Key format rules:
 
-- **Common columns:** `timestamp_received`, `sequence`, source `timestamp`, and
-a 32-byte `market`; token files add a 32-byte `asset_id`.
-- **Exact values:** prices and sizes are decimals, and book sides are typed
-lists of `(price, size)` structs.
-- **Physical order:** `(market, asset_id, sequence)` for token events and
-`(market, sequence)` for lifecycle events.
+- **Common columns:** `timestamp_received`, `sequence`, source `timestamp`, and `market`; token files add `asset_id`.
+- **Exact values:** prices and sizes are decimals, and book sides are typed lists of `(price, size)` structs.
+- **Physical order:** `(market, asset_id, sequence)` for token events and `(market, sequence)` for lifecycle events.
 - **Replay order:** always `sequence` column as seqnum, even across different files.
 - **Completion:** trust an hour only when `manifest.json` exists.
 
@@ -106,25 +103,19 @@ Parquet
 
 `[polymarket-orderbook-rust-pubsub](services/polymarket/polymarket-orderbook-rust-pubsub)`
 
-- Owns market state, authoritative WebSocket subscriptions, receive timestamps,
-and collector sequencing.
-- Listens for `new_market` on three lifecycle sockets and subscribes its assets
-immediately—important for short-lived markets.
+- Owns market state, authoritative WebSocket subscriptions, receive timestamps, and collector sequencing.
+- Listens for `new_market` on three lifecycle sockets and subscribes its assets immediately—important for short-lived markets.
 - Restores known markets from a validated Redis cache after restart.
-- Reconciles through one rate-limited Gamma client: new markets every 10
-seconds, resolutions every 30 seconds, and a full scan every 30 minutes.
+- Reconciles through one rate-limited Gamma client: new markets every 10 seconds, resolutions every 30 seconds, and a full scan every 30 minutes.
 
 
 
 ### Redis Stream — the durable handoff
 
-- Separates live WebSocket collection from ClickHouse restarts and write
-latency.
-- Uses a renewable lease and fencing generation so exactly one publisher can
-append to `polymarket:events:v3`.
+- Separates live WebSocket collection from ClickHouse restarts and write latency.
+- Uses a renewable lease and fencing generation so exactly one publisher can append to `polymarket:events:v3`.
 - Keeps records pending until ClickHouse commits; Redis AOF is enabled.
-- Absorbs short storage interruptions. It is not sized as a multi-hour RAM
-backlog.
+- Absorbs short storage interruptions. It is not sized as a multi-hour RAM backlog.
 
 
 
@@ -133,12 +124,9 @@ backlog.
 `[polymarket-orderbook-rust-from-pubsub](services/polymarket/polymarket-orderbook-rust-from-pubsub)`
 
 - Batches Redis records into `polymarket_orderbook_v3`.
-- Stores only receive time, collector sequence, and normalized JSON in hourly
-partitions.
+- Stores only receive time, collector sequence, and normalized JSON in hourly partitions.
 - Collapses delivery retries by `sequence`; it never deduplicates by payload.
-- Keeps ClickHouse as a short queryable export window. Validated archived
-partitions expire after three hours by default, while the newest is retained
-for sequence recovery.
+- Keeps ClickHouse as a short queryable export window. Validated archived partitions expire after three hours by default, while the newest is retained for sequence recovery.
 
 
 
@@ -148,29 +136,20 @@ The `[Rust exporter](services/r2-archive/exporter)`:
 
 - Streams Arrow batches into event-specific Parquet without buffering an hour.
 - Writes ZSTD level 9 files and publishes `manifest.json` last.
-- Supports atomic local output and bounded multipart uploads to an existing R2
-bucket.
+- Supports atomic local output and bounded multipart uploads to an existing R2 bucket.
 - Safely retries interrupted hours; an incomplete directory has no manifest.
 
 
 
 ### Correctness model
 
-- `sequence` is the authoritative order. Source and receive timestamps may tie
-and are never used to invent exchange order.
-- After a connection or subscription begins, `price_change` rows are withheld
-until a fresh `book` snapshot makes that asset reconstructible again.
-- A retry of one collector record keeps its sequence and is idempotent. A
-separate source observation gets a new sequence and is retained even when
-its public fields are identical.
-- `transaction_hash` is not a fill ID: one Polygon transaction can settle
-multiple fills, so trade payload fields are never used for deduplication.
-- Polymarket exposes no replay cursor or source sequence. The archive faithfully
-records what this collector accepted, but it is not an exchange audit log and
-cannot recreate an event missed during an outage.
+- `sequence` is the authoritative order. Source and receive timestamps may tie and are never used to invent exchange order.
+- After a connection or subscription begins, `price_change` rows are withheld until a fresh `book` snapshot makes that asset reconstructible again.
+- A retry of one collector record keeps its sequence and is idempotent. A separate source observation gets a new sequence and is retained even when its public fields are identical.
+- `transaction_hash` is not a fill ID: one Polygon transaction can settle multiple fills, so trade payload fields are never used for deduplication.
+- Polymarket exposes no replay cursor or source sequence. The archive faithfully records what this collector accepted, but it is not an exchange audit log and cannot recreate an event missed during an outage.
 
-The complete collection, restart, timestamp, reconnection, and replay contract
-is in `[docs/DATA_MODEL.md](docs/DATA_MODEL.md)`.
+The complete collection, restart, timestamp, reconnection, and replay contract is in `[docs/DATA_MODEL.md](docs/DATA_MODEL.md)`.
 
 
 
@@ -184,8 +163,7 @@ Requires Linux plus Docker Compose or Podman Compose:
 ./run_local.sh
 ```
 
-This creates `.env` when needed, starts the complete stack, builds the Rust
-services, and exports to `.data/parquet` without R2 credentials.
+This creates `.env` when needed, starts the complete stack, builds the Rust services, and exports to `.data/parquet` without R2 credentials.
 
 Use a specific container runtime when both are installed:
 
@@ -194,7 +172,6 @@ CONTAINER_RUNTIME=podman ./run_local.sh
 CONTAINER_RUNTIME=docker ./run_local.sh
 ```
 
-
 | Command                 | Action                                          |
 | ----------------------- | ----------------------------------------------- |
 | `./run_local.sh`        | Build and start the entire local pipeline.      |
@@ -202,14 +179,9 @@ CONTAINER_RUNTIME=docker ./run_local.sh
 | `./run_local.sh status` | Show infrastructure and application containers. |
 | `./run_local.sh down`   | Stop everything while retaining collected data. |
 
+Redis, ClickHouse, and Parquet data remain under `.data`. Completed files appear in `.data/parquet/YYYY-MM-DD/HH/`. An hour becomes exportable only after it is complete and the following receive-time hour has reached ClickHouse, so the first archive can take a little over one hour to appear.
 
-Redis, ClickHouse, and Parquet data remain under `.data`. Completed files
-appear in `.data/parquet/YYYY-MM-DD/HH/`. An hour becomes exportable only after
-it is complete and the following receive-time hour has reached ClickHouse, so
-the first archive can take a little over one hour to appear.
-
-Redis and ClickHouse are reachable only inside the private `obdata` container
-network:
+Redis and ClickHouse are reachable only inside the private `obdata` container network:
 
 | Service           | Internal address         |
 | ----------------- | ------------------------ |
@@ -217,8 +189,7 @@ network:
 | ClickHouse HTTP   | `obdata-clickhouse:8123` |
 | ClickHouse native | `obdata-clickhouse:9000` |
 
-Use `docker exec` or `podman exec` for local inspection rather than exposing a
-database port.
+Use `docker exec` or `podman exec` for local inspection rather than exposing a database port.
 
 ### Run in production
 
@@ -233,7 +204,7 @@ Production uses an existing R2 bucket. Prepare the environment:
 ```sh
 cp .env.example .env
 chmod 600 .env
-$EDITOR .env
+nano .env
 ```
 
 Start infrastructure and applications with Docker Compose:
@@ -243,25 +214,16 @@ docker compose -f docker-compose.infra.yml up -d --remove-orphans
 docker compose -f docker-compose.polymarket.yml up -d --build --remove-orphans
 ```
 
-Start infrastructure first: it creates the private `obdata` bridge that the
-application Compose project joins.
+Start infrastructure first: it creates the private `obdata` bridge that the application Compose project joins.
 
 Production notes:
 
-- Redis, ClickHouse, and all Rust services share the private `obdata` bridge.
-Redis and ClickHouse publish no host ports.
-- Keep `RLIMIT_NOFILE` high. The supplied configuration requests 262,144 open
-files through `CONTAINER_NOFILE_LIMIT`; 65,536 is a practical minimum for the
-full market universe. Rootless Podman cannot request more than `ulimit -Hn`,
-so lower the setting to that host limit when necessary.
-- Use a host firewall with default-deny inbound rules and allow only required
-management traffic—normally SSH or a VPN. Docker manages its own
-iptables/nftables rules, so verify the effective exposure after deployment
-instead of relying only on a firewall frontend.
+- Redis, ClickHouse, and all Rust services share the private `obdata` bridge. Redis and ClickHouse publish no host ports.
+- Keep `RLIMIT_NOFILE` high. The supplied configuration requests 262,144 open files through `CONTAINER_NOFILE_LIMIT`; 65,536 is a practical minimum for the full market universe. Rootless Podman cannot request more than `ulimit -Hn`, so lower the setting to that host limit when necessary.
+- Use a host firewall with default-deny inbound rules and allow only required management traffic—normally SSH or a VPN. Docker manages its own iptables/nftables rules, so verify the effective exposure after deployment instead of relying only on a firewall frontend.
 - Services use `restart: unless-stopped`.
 - `CLICKHOUSE_RETENTION_HOURS=0` retains every raw partition.
-- Do not use `run_local.sh` for R2: its local overlay switches the exporter to
-`.data/parquet`.
+- Do not use `run_local.sh` for R2: its local overlay switches the exporter to `.data/parquet`.
 
 
 
@@ -292,9 +254,7 @@ docker exec obdata-redis redis-cli XINFO GROUPS polymarket:events:v3
 docker exec obdata-redis redis-cli INFO memory
 ```
 
-For an archive-level check, verify that each expected hour has a readable
-`manifest.json`, that its seven listed objects exist, and that consumers verify
-the recorded SHA-256 digests before trusting the hour.
+For an archive-level check, verify that each expected hour has a readable `manifest.json`, that its seven listed objects exist, and that consumers verify the recorded SHA-256 digests before trusting the hour.
 
 ### System requirements
 
@@ -323,11 +283,7 @@ the recorded SHA-256 digests before trusting the hour.
 | Network in      | Roughly 60–75 Mbit/s sustained, with snapshot and reconnect bursts.           | 100 Mbit/s is a minimum. More bandwidth shortens full-universe and reconnect recovery.                            |
 | Network out     | Control traffic stays below 1 Mbit/s; Burst uploads of ~1 GB of data hourly.  | Faster outbound completes R2 uploads well before the next hour becomes eligible.                                  |
 
-RAM sizing assumes the ClickHouse writer is healthy. A writer outage leaves
-the durable Redis Stream growing at approximately the uncompressed event rate
-of about 30 GiB an hour before Redis overhead. Monitor lag and memory closely
-and consider Redis as a short term back-off rather than treating Redis as
-a multi-hour backlog store.
+RAM sizing assumes the ClickHouse writer is healthy. A writer outage leaves the durable Redis Stream growing at approximately the uncompressed event rate of about 30 GiB an hour before Redis overhead. Monitor lag and memory closely and consider Redis as a short term back-off rather than treating Redis as a multi-hour backlog store.
 
 ## Documentation
 
@@ -338,8 +294,7 @@ a multi-hour backlog store.
 
 ## Thanks
 
-This project builds on the work and public datasets that made independent
-Polymarket market-data research practical:
+This project builds on the work and public datasets that made independent Polymarket market-data research practical:
 
 - [PMXT archive](https://archive.pmxt.dev/)
 - [AG6 Polymarket archive](https://polymarket-archive.ag6.ai/)
