@@ -3,6 +3,7 @@
 use tokio::sync::oneshot;
 
 use crate::events::{Market, MarketLifecycleObservation};
+use crate::markets::gamma::GammaMarket;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleSource {
@@ -16,11 +17,6 @@ pub type LifecycleCompletion = oneshot::Sender<Result<(), String>>;
 pub struct ActiveMarketSnapshot {
     pub revision: u64,
     pub markets: Vec<Market>,
-}
-
-pub struct ScannedActiveMarket {
-    pub market: Market,
-    pub observation: Option<MarketLifecycleObservation>,
 }
 
 pub type LifecycleSnapshotCompletion = oneshot::Sender<ActiveMarketSnapshot>;
@@ -41,22 +37,9 @@ pub enum LifecycleRequest {
     Snapshot {
         completion: LifecycleSnapshotCompletion,
     },
-    ScanStart {
-        scan_id: u64,
+    GammaPage {
         cold_start: bool,
-        completion: LifecycleCompletion,
-    },
-    ScanPage {
-        scan_id: u64,
-        markets: Vec<ScannedActiveMarket>,
-        completion: LifecycleCompletion,
-    },
-    ScanFinish {
-        scan_id: u64,
-        completion: LifecycleCompletion,
-    },
-    ScanAbort {
-        scan_id: u64,
+        markets: Vec<GammaMarket>,
         completion: LifecycleCompletion,
     },
 }

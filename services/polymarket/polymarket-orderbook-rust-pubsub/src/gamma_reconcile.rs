@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use polymarket_orderbook_rust::events::{Event, Market, MarketLifecycleObservation};
 use polymarket_orderbook_rust::markets::gamma::{GammaClient, GammaMarket};
 use polymarket_orderbook_rust::markets::lifecycle::{
-    ActiveMarketSnapshot, LifecycleRequest, LifecycleSource, ScannedActiveMarket,
+    ActiveMarketSnapshot, LifecycleRequest, LifecycleSource,
 };
 use polymarket_orderbook_rust::markets::redis_cache::{self, CacheDocument};
 
@@ -24,6 +24,7 @@ const CLOSED_MARKET_INTERVAL: Duration = Duration::from_secs(30);
 const CACHE_INTERVAL: Duration = Duration::from_secs(60);
 const POLL_OVERLAP: TimeDelta = TimeDelta::minutes(2);
 const RESTART_PRIORITY_PAGES: usize = 20;
+const GAMMA_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheBaseline {
@@ -73,7 +74,7 @@ impl ReconciliationStats {
 
 pub struct RestartMarketPlan {
     pub prioritized: usize,
-    pub missing: Vec<ScannedActiveMarket>,
+    pub missing: Vec<GammaMarket>,
 }
 
 /// Prioritize cached markets and recover recent active markets missing from it.
@@ -113,12 +114,13 @@ fn build_restart_market_plan(
     let mut priorities = Vec::with_capacity(recent.len());
     let mut missing = Vec::new();
     for market in recent {
-        let Some(scanned) = scanned_active(market) else {
-            continue;
-        };
-        priorities.push(scanned.market.hash.clone());
-        let condition = scanned.market.hash.as_str();
-        let assets = canonical_asset_refs(&scanned.market.assets);
+        ensure!(
+            market.is_active_binary(),
+            "recent Gamma scan returned an invalid active binary market"
+        );
+        priorities.push(market.condition_id.clone());
+        let condition = market.condition_id.as_str();
+        let assets = canonical_asset_refs(&market.assets_ids);
         if let Some(cached_assets) = cached_conditions.get(condition) {
             ensure!(
                 cached_assets == &assets,
@@ -146,8 +148,11 @@ fn build_restart_market_plan(
             }
             missing_asset_owners.insert(asset.to_string(), condition.to_string());
         }
-        missing_conditions.insert(condition.to_string(), scanned.market.assets.clone());
-        missing.push(scanned);
+        missing_conditions.insert(
+            condition.to_string(),
+            [market.assets_ids[0].clone(), market.assets_ids[1].clone()],
+        );
+        missing.push(market);
     }
     drop(cached_conditions);
     drop(cached_asset_owners);
@@ -157,7 +162,7 @@ fn build_restart_market_plan(
     })
 }
 
-fn canonical_asset_refs(assets: &[String; 2]) -> [&str; 2] {
+fn canonical_asset_refs(assets: &[String]) -> [&str; 2] {
     if assets[0] <= assets[1] {
         [&assets[0], &assets[1]]
     } else {
@@ -167,19 +172,14 @@ fn canonical_asset_refs(assets: &[String; 2]) -> [&str; 2] {
 
 pub async fn admit_restart_markets(
     lifecycle_tx: &mpsc::Sender<LifecycleRequest>,
-    markets: Vec<ScannedActiveMarket>,
+    markets: Vec<GammaMarket>,
 ) -> Result<()> {
-    let mut silent = Vec::new();
-    for market in markets {
-        if let Some(observation) = market.observation {
-            send_observation(lifecycle_tx, observation).await?;
-        } else {
-            silent.push(market.market);
-        }
-    }
-    if !silent.is_empty() {
-        send_confirmed(lifecycle_tx, |completion| LifecycleRequest::Bootstrap {
-            markets: silent,
+    let mut markets = markets.into_iter().peekable();
+    while markets.peek().is_some() {
+        let page = markets.by_ref().take(GAMMA_PAGE_SIZE).collect();
+        send_confirmed(lifecycle_tx, |completion| LifecycleRequest::GammaPage {
+            cold_start: false,
+            markets: page,
             completion,
         })
         .await?;
@@ -217,16 +217,13 @@ pub async fn run_full_scans(
     stats: Arc<ReconciliationStats>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut scan_id = 0_u64;
     let mut first = true;
     loop {
-        scan_id = scan_id.saturating_add(1);
         let cold = first && cold_start;
         let succeeded = tokio::select! {
-            result = run_full_scan(&client, &lifecycle_tx, scan_id, cold) => {
+            result = run_full_scan(&client, &lifecycle_tx, cold) => {
                 if let Err(error) = result {
-                    warn!(scan_id, %error, "full Gamma reconciliation failed");
-                    let _ = abort_scan(&lifecycle_tx, scan_id).await;
+                    warn!(%error, "full Gamma reconciliation failed");
                     false
                 } else {
                     stats
@@ -238,7 +235,6 @@ pub async fn run_full_scans(
                 }
             }
             changed = shutdown.changed() => {
-                let _ = abort_scan(&lifecycle_tx, scan_id).await;
                 changed.context("Gamma shutdown sender dropped")?;
                 return Ok(());
             }
@@ -264,54 +260,33 @@ pub async fn run_full_scans(
 async fn run_full_scan(
     client: &GammaClient,
     lifecycle_tx: &mpsc::Sender<LifecycleRequest>,
-    scan_id: u64,
     cold_start: bool,
 ) -> Result<()> {
-    send_confirmed(lifecycle_tx, |completion| LifecycleRequest::ScanStart {
-        scan_id,
-        cold_start,
-        completion,
-    })
-    .await?;
     let mut scan = client.full_active_scan();
     let mut pages = 0_usize;
     let mut total_markets = 0_usize;
     while let Some(markets) = client.next_keyset_page(&mut scan).await? {
         pages += 1;
         total_markets += markets.len();
-        let markets: Vec<_> = markets.into_iter().filter_map(scanned_active).collect();
-        send_confirmed(lifecycle_tx, |completion| LifecycleRequest::ScanPage {
-            scan_id,
+        send_confirmed(lifecycle_tx, |completion| LifecycleRequest::GammaPage {
+            cold_start,
             markets,
             completion,
         })
         .await?;
         if pages.is_multiple_of(100) {
-            info!(scan_id, pages, total_markets, "full Gamma scan progress");
+            info!(pages, total_markets, "full Gamma scan progress");
         }
     }
     ensure!(
         total_markets > 0,
         "full Gamma scan returned no active binary markets"
     );
-    send_confirmed(lifecycle_tx, |completion| LifecycleRequest::ScanFinish {
-        scan_id,
-        completion,
-    })
-    .await?;
     info!(
-        scan_id,
-        pages, total_markets, cold_start, "full Gamma scan completed"
+        pages,
+        total_markets, cold_start, "full Gamma scan completed"
     );
     Ok(())
-}
-
-async fn abort_scan(lifecycle_tx: &mpsc::Sender<LifecycleRequest>, scan_id: u64) -> Result<()> {
-    send_confirmed(lifecycle_tx, |completion| LifecycleRequest::ScanAbort {
-        scan_id,
-        completion,
-    })
-    .await
 }
 
 pub async fn run_new_market_polls(
@@ -518,28 +493,8 @@ where
         .map_err(anyhow::Error::msg)
 }
 
-fn scanned_active(market: GammaMarket) -> Option<ScannedActiveMarket> {
-    let subscription = market.active_subscription()?;
-    Some(ScannedActiveMarket {
-        market: subscription,
-        observation: new_market_observation(&market),
-    })
-}
-
 fn new_market_observation(market: &GammaMarket) -> Option<MarketLifecycleObservation> {
-    let timestamp = market.new_market_timestamp_ms()?;
-    Some(MarketLifecycleObservation {
-        event: Event::NewMarket {
-            id: market.id.clone(),
-            market: market.condition_id.clone(),
-            timestamp: timestamp.to_string(),
-            assets_ids: market.assets_ids.clone(),
-            outcomes: market.outcomes.clone(),
-            question: (!market.question.is_empty()).then(|| market.question.clone()),
-            slug: (!market.slug.is_empty()).then(|| market.slug.clone()),
-        },
-        timestamp_received_ns: market.received_at_ns,
-    })
+    market.new_market_observation()
 }
 
 fn resolved_observation(market: &GammaMarket) -> Option<MarketLifecycleObservation> {
@@ -645,8 +600,8 @@ mod tests {
         assert_eq!(plan.prioritized, 1);
         assert_eq!(cached[0].hash, "cached-recent");
         assert_eq!(plan.missing.len(), 1);
-        assert_eq!(plan.missing[0].market.hash, "missing");
-        assert!(plan.missing[0].observation.is_some());
+        assert_eq!(plan.missing[0].condition_id, "missing");
+        assert!(plan.missing[0].new_market_observation().is_some());
     }
 
     #[test]
@@ -673,43 +628,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_admission_emits_only_timestamped_discoveries() {
-        let timestamped = scanned_active(gamma_market_for("timestamped")).unwrap();
+    async fn restart_admission_sends_warm_gamma_pages() {
+        let timestamped = gamma_market_for("timestamped");
         let mut without_timestamp = gamma_market_for("silent");
         without_timestamp.created_at_ms = None;
         without_timestamp.start_date_ms = None;
-        let silent = scanned_active(without_timestamp).unwrap();
+        let silent = without_timestamp;
         let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(2);
 
         let admission = tokio::spawn(async move {
             admit_restart_markets(&lifecycle_tx, vec![timestamped, silent]).await
         });
 
-        let LifecycleRequest::Observation {
-            source,
-            observation,
-            completion,
-        } = lifecycle_rx.recv().await.unwrap()
-        else {
-            panic!("expected timestamped lifecycle observation")
-        };
-        assert_eq!(source, LifecycleSource::Gamma);
-        assert_eq!(observation.timestamp_received_ns, 300);
-        assert!(matches!(
-            observation.event,
-            Event::NewMarket { ref market, .. } if market == "timestamped"
-        ));
-        completion.send(Ok(())).unwrap();
-
-        let LifecycleRequest::Bootstrap {
+        let LifecycleRequest::GammaPage {
+            cold_start,
             markets,
             completion,
         } = lifecycle_rx.recv().await.unwrap()
         else {
-            panic!("expected silent bootstrap")
+            panic!("expected Gamma page")
         };
-        assert_eq!(markets.len(), 1);
-        assert_eq!(markets[0].hash, "silent");
+        assert!(!cold_start);
+        assert_eq!(markets.len(), 2);
+        assert_eq!(markets[0].condition_id, "timestamped");
+        assert_eq!(markets[0].received_at_ns, 300);
+        assert!(markets[0].new_market_observation().is_some());
+        assert_eq!(markets[1].condition_id, "silent");
+        assert!(markets[1].new_market_observation().is_none());
         completion.send(Ok(())).unwrap();
 
         admission.await.unwrap().unwrap();
@@ -735,7 +680,7 @@ mod tests {
         market.created_at_ms = None;
         market.start_date_ms = None;
         assert!(new_market_observation(&market).is_none());
-        assert!(scanned_active(market).unwrap().observation.is_none());
+        assert!(market.new_market_observation().is_none());
     }
 
     #[test]

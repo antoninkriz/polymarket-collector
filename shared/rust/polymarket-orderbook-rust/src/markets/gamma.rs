@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::warn;
 
-use crate::events::Market;
+use crate::events::{Event, Market, MarketLifecycleObservation};
 use crate::record::now_ns;
 
 pub const GAMMA_BASE_URL: &str = "https://gamma-api.polymarket.com";
@@ -51,20 +51,23 @@ pub struct GammaMarket {
 }
 
 impl GammaMarket {
+    pub fn is_active_binary(&self) -> bool {
+        self.active
+            && !self.closed
+            && !self.condition_id.is_empty()
+            && self.assets_ids.len() == 2
+            && self.outcomes.len() == 2
+            && self.assets_ids.iter().all(|asset| !asset.is_empty())
+            && self.assets_ids[0] != self.assets_ids[1]
+    }
+
     /// Convert an active, open binary Gamma record to a pool subscription.
     ///
     /// Asset order deliberately follows Gamma's outcome/token array order. It
     /// has no YES/NO meaning for arbitrary binary sports and scalar markets;
     /// the pool only requires the pair to remain on one connection.
     pub fn active_subscription(&self) -> Option<Market> {
-        if !self.active
-            || self.closed
-            || self.condition_id.is_empty()
-            || self.assets_ids.len() != 2
-            || self.outcomes.len() != 2
-            || self.assets_ids.iter().any(String::is_empty)
-            || self.assets_ids[0] == self.assets_ids[1]
-        {
+        if !self.is_active_binary() {
             return None;
         }
         Some(Market::new(
@@ -72,6 +75,25 @@ impl GammaMarket {
             self.assets_ids[0].clone(),
             self.assets_ids[1].clone(),
         ))
+    }
+
+    pub fn new_market_observation(&self) -> Option<MarketLifecycleObservation> {
+        if !self.is_active_binary() {
+            return None;
+        }
+        let timestamp = self.new_market_timestamp_ms()?;
+        Some(MarketLifecycleObservation {
+            event: Event::NewMarket {
+                id: self.id.clone(),
+                market: self.condition_id.clone(),
+                timestamp: timestamp.to_string(),
+                assets_ids: self.assets_ids.clone(),
+                outcomes: self.outcomes.clone(),
+                question: (!self.question.is_empty()).then(|| self.question.clone()),
+                slug: (!self.slug.is_empty()).then(|| self.slug.clone()),
+            },
+            timestamp_received_ns: self.received_at_ns,
+        })
     }
 
     /// Return an unambiguous resolved winner when exactly one aligned outcome
@@ -198,12 +220,12 @@ impl GammaClient {
                 }
             };
             let include = match scan.kind {
-                KeysetScanKind::FullActive => market.active_subscription().is_some(),
+                KeysetScanKind::FullActive => market.is_active_binary(),
                 KeysetScanKind::ActiveSince(since_ms) => {
                     let timestamp = market.start_date_ms;
                     newest_relevant_timestamp = newest_relevant_timestamp.max(timestamp);
                     timestamp.is_some_and(|timestamp| timestamp >= since_ms)
-                        && market.active_subscription().is_some()
+                        && market.is_active_binary()
                 }
                 KeysetScanKind::ClosedSince(since_ms) => {
                     newest_relevant_timestamp =
