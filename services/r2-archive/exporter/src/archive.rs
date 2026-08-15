@@ -244,9 +244,6 @@ impl Archive for R2Archive {
 
     fn commit(&self, key: &str, file: NamedTempFile) -> Result<()> {
         validate_archive_key(key)?;
-        file.as_file()
-            .sync_all()
-            .with_context(|| format!("sync staged R2 object for {key}"))?;
         let size = file
             .as_file()
             .metadata()

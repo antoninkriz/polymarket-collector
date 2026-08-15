@@ -168,11 +168,6 @@ where
     output
         .flush()
         .with_context(|| format!("flush {event} Parquet file"))?;
-    output
-        .inner
-        .as_file()
-        .sync_all()
-        .with_context(|| format!("sync {event} Parquet file"))?;
     let byte_size = output.byte_size;
     let sha256 = format!("{:x}", output.hasher.finalize());
 
