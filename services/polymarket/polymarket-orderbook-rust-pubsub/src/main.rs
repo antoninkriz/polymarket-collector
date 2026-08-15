@@ -389,6 +389,8 @@ async fn stats_loop(
     let mut queue_high_water = 0_usize;
     let mut websocket_lifecycle_high_water = 0_usize;
     let mut reconciliation_high_water = 0_usize;
+    let mut previous_asset_recovery_events = 0_u64;
+    let mut previous_asset_recovery_latency_us = 0_u64;
     loop {
         tick.tick().await;
 
@@ -415,6 +417,20 @@ async fn stats_loop(
             p.pool_stats()
         };
         let reconciliation_ages = reconciliation_stats.ages();
+        let asset_recoveries = stats
+            .asset_recovery_events
+            .saturating_sub(previous_asset_recovery_events);
+        let asset_recovery_latency_us = stats
+            .asset_recovery_latency_us
+            .saturating_sub(previous_asset_recovery_latency_us);
+        let asset_recovery_avg_ms = if asset_recoveries > 0 {
+            asset_recovery_latency_us as f64 / asset_recoveries as f64 / 1_000.0
+        } else {
+            0.0
+        };
+        let asset_recovery_max_ms = stats.asset_recovery_latency_us_max as f64 / 1_000.0;
+        previous_asset_recovery_events = stats.asset_recovery_events;
+        previous_asset_recovery_latency_us = stats.asset_recovery_latency_us;
 
         let queue_pct = if queue_max > 0 {
             (queue_used as f64 / queue_max as f64) * 100.0
@@ -461,6 +477,10 @@ async fn stats_loop(
             gamma_closed_poll_age_s = ?reconciliation_ages.closed_poll_seconds,
             restart_cache_save_age_s = ?reconciliation_ages.cache_save_seconds,
             asset_down_events = stats.asset_down_events,
+            asset_recovery_events = stats.asset_recovery_events,
+            asset_recoveries,
+            asset_recovery_avg_ms = format!("{asset_recovery_avg_ms:.1}"),
+            asset_recovery_max_ms = format!("{asset_recovery_max_ms:.1}"),
             conn_down_events = stats.conn_down_events,
             "[QUEUE-STATS]",
         );
@@ -489,6 +509,10 @@ async fn stats_loop(
                 "reconciliation_queue_max": reconciliation_max,
                 "reconciliation_queue_high_water_pct": format!("{:.1}", reconciliation_high_water_pct),
                 "asset_down_events_total": stats.asset_down_events,
+                "asset_recovery_events_total": stats.asset_recovery_events,
+                "asset_recoveries": asset_recoveries,
+                "asset_recovery_avg_ms": format!("{asset_recovery_avg_ms:.1}"),
+                "asset_recovery_max_ms": format!("{asset_recovery_max_ms:.1}"),
                 "conn_down_events_total": stats.conn_down_events,
                 "gamma_full_scan_age_s": reconciliation_ages.full_scan_seconds,
                 "gamma_new_poll_age_s": reconciliation_ages.new_poll_seconds,

@@ -37,6 +37,9 @@ pub struct PoolStats {
     pub connection_count: usize,
     pub lifecycle_listener_count: usize,
     pub asset_down_events: u64,
+    pub asset_recovery_events: u64,
+    pub asset_recovery_latency_us: u64,
+    pub asset_recovery_latency_us_max: u64,
     pub conn_down_events: u64,
     pub conns_down: usize,
     pub assets_down: usize,
@@ -45,6 +48,9 @@ pub struct PoolStats {
 #[derive(Default)]
 pub struct HealthCounters {
     pub asset_down_events: AtomicU64,
+    pub asset_recovery_events: AtomicU64,
+    pub asset_recovery_latency_us: AtomicU64,
+    pub asset_recovery_latency_us_max: AtomicU64,
     pub conn_down_events: AtomicU64,
     pub conns_down: AtomicU64,
     pub assets_down: AtomicU64,
@@ -164,6 +170,18 @@ impl Pool {
                 .health_counters
                 .asset_down_events
                 .load(Ordering::Relaxed),
+            asset_recovery_events: self
+                .health_counters
+                .asset_recovery_events
+                .load(Ordering::Relaxed),
+            asset_recovery_latency_us: self
+                .health_counters
+                .asset_recovery_latency_us
+                .load(Ordering::Relaxed),
+            asset_recovery_latency_us_max: self
+                .health_counters
+                .asset_recovery_latency_us_max
+                .swap(0, Ordering::Relaxed),
             conn_down_events: self
                 .health_counters
                 .conn_down_events
@@ -520,10 +538,13 @@ impl HealthState {
                     for asset in &ready_before {
                         counters.asset_down_events.fetch_add(1, Ordering::Relaxed);
                         self.down_since.insert(asset.clone(), now);
+                    }
+                    if !ready_before.is_empty() {
                         warn!(
-                            asset,
                             conn = conn_id,
-                            "[ASSET-DATA-GAP] authoritative connection down"
+                            invalidated_assets = ready_before.len(),
+                            assigned_assets = assigned_assets.len(),
+                            "[CONNECTION-DATA-GAP] authoritative connection down"
                         );
                     }
                 } else {
@@ -570,12 +591,16 @@ impl HealthState {
                     self.publish_gauges(counters);
                 }
                 if let Some(started) = self.down_since.remove(&asset_id) {
-                    info!(
-                        asset = asset_id,
-                        conn = conn_id,
-                        recovery_ms = started.elapsed().as_secs_f64() * 1000.0,
-                        "[ASSET-DATA-RECOVERED] fresh book snapshot received"
-                    );
+                    let recovery_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                    counters
+                        .asset_recovery_events
+                        .fetch_add(1, Ordering::Relaxed);
+                    counters
+                        .asset_recovery_latency_us
+                        .fetch_add(recovery_us, Ordering::Relaxed);
+                    counters
+                        .asset_recovery_latency_us_max
+                        .fetch_max(recovery_us, Ordering::Relaxed);
                 }
             }
         }
@@ -707,6 +732,7 @@ mod tests {
             &counters,
         );
         assert_eq!(counters.assets_down.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.asset_recovery_events.load(Ordering::Relaxed), 1);
         assert!(state.down_since.is_empty());
     }
 
