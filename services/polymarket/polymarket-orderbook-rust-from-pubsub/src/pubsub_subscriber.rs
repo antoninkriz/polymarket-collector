@@ -85,7 +85,6 @@ pub struct PubSubSubscriberConfig {
 
 #[derive(Default)]
 pub struct SubscriberStats {
-    pub events_received: AtomicU64,
     pub events_forwarded: AtomicU64,
     pub events_acked: AtomicU64,
     pub events_trimmed: AtomicU64,
@@ -173,7 +172,6 @@ async fn consume_once(
                 if draining_pending {
                     last_pending_id.clone_from(&entry.id);
                 }
-                stats.events_received.fetch_add(1, Ordering::Relaxed);
                 let payload: String = entry
                     .get("payload")
                     .ok_or_else(|| anyhow::anyhow!("stream entry {} has no payload", entry.id))?;

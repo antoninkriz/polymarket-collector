@@ -39,7 +39,6 @@ pub struct PubSubSink {
     cfg: PubSubSinkConfig,
     conn: ConnectionManager,
     total_published: u64,
-    total_dropped: u64,
 }
 
 impl PubSubSink {
@@ -54,7 +53,6 @@ impl PubSubSink {
             cfg,
             conn,
             total_published: 0,
-            total_dropped: 0,
         })
     }
 
@@ -98,7 +96,6 @@ impl PubSubSink {
 
         info!(
             total_published = self.total_published,
-            total_dropped = self.total_dropped,
             "Polymarket Redis stream sink shutting down",
         );
         Ok(())

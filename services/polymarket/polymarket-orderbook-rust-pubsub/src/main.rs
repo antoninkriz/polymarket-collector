@@ -417,7 +417,6 @@ async fn stats_loop(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
 
-    let mut iteration = 0_u64;
     let mut samples = 0_u64;
     let mut queue_high_water = 0_usize;
     let mut websocket_lifecycle_high_water = 0_usize;
@@ -443,8 +442,6 @@ async fn stats_loop(
             continue;
         }
         samples = 0;
-        iteration += 1;
-
         let stats = {
             let p = pool.lock().await;
             p.pool_stats()
@@ -487,24 +484,24 @@ async fn stats_loop(
         };
 
         info!(
-            iter = iteration,
             queue_size = queue_used,
             queue_high_water,
             queue_max,
-            queue_pct = format!("{:.1}", queue_pct),
-            queue_high_water_pct = format!("{:.1}", queue_high_water_pct),
+            queue_pct,
+            queue_high_water_pct,
             websocket_lifecycle_queue_size = websocket_lifecycle_used,
             websocket_lifecycle_queue_high_water = websocket_lifecycle_high_water,
             websocket_lifecycle_queue_max = websocket_lifecycle_max,
-            websocket_lifecycle_queue_high_water_pct =
-                format!("{:.1}", websocket_lifecycle_high_water_pct),
+            websocket_lifecycle_queue_high_water_pct = websocket_lifecycle_high_water_pct,
             reconciliation_queue_size = reconciliation_used,
             reconciliation_queue_high_water = reconciliation_high_water,
             reconciliation_queue_max = reconciliation_max,
-            reconciliation_queue_high_water_pct = format!("{:.1}", reconciliation_high_water_pct),
+            reconciliation_queue_high_water_pct = reconciliation_high_water_pct,
             subscribed_markets = stats.market_count,
             connections = stats.connection_count,
             lifecycle_listeners = stats.lifecycle_listener_count,
+            conns_down = stats.conns_down,
+            assets_down = stats.assets_down,
             gamma_full_scan_age_s = ?reconciliation_ages.full_scan_seconds,
             gamma_new_poll_age_s = ?reconciliation_ages.new_poll_seconds,
             gamma_closed_poll_age_s = ?reconciliation_ages.closed_poll_seconds,
@@ -512,47 +509,10 @@ async fn stats_loop(
             asset_down_events = stats.asset_down_events,
             asset_recovery_events = stats.asset_recovery_events,
             asset_recoveries,
-            asset_recovery_avg_ms = format!("{asset_recovery_avg_ms:.1}"),
-            asset_recovery_max_ms = format!("{asset_recovery_max_ms:.1}"),
+            asset_recovery_avg_ms,
+            asset_recovery_max_ms,
             conn_down_events = stats.conn_down_events,
             "[QUEUE-STATS]",
-        );
-
-        info!(
-            grafana = true,
-            event = "pool_stats",
-            conns_down = stats.conns_down,
-            assets_down = stats.assets_down,
-            meta = %serde_json::json!({
-                "iter": iteration,
-                "subscribed_markets": stats.market_count,
-                "connections": stats.connection_count,
-                "lifecycle_listeners": stats.lifecycle_listener_count,
-                "queue_size": queue_used,
-                "queue_high_water": queue_high_water,
-                "queue_max": queue_max,
-                "queue_pct": format!("{:.1}", queue_pct),
-                "queue_high_water_pct": format!("{:.1}", queue_high_water_pct),
-                "websocket_lifecycle_queue_size": websocket_lifecycle_used,
-                "websocket_lifecycle_queue_high_water": websocket_lifecycle_high_water,
-                "websocket_lifecycle_queue_max": websocket_lifecycle_max,
-                "websocket_lifecycle_queue_high_water_pct": format!("{:.1}", websocket_lifecycle_high_water_pct),
-                "reconciliation_queue_size": reconciliation_used,
-                "reconciliation_queue_high_water": reconciliation_high_water,
-                "reconciliation_queue_max": reconciliation_max,
-                "reconciliation_queue_high_water_pct": format!("{:.1}", reconciliation_high_water_pct),
-                "asset_down_events_total": stats.asset_down_events,
-                "asset_recovery_events_total": stats.asset_recovery_events,
-                "asset_recoveries": asset_recoveries,
-                "asset_recovery_avg_ms": format!("{asset_recovery_avg_ms:.1}"),
-                "asset_recovery_max_ms": format!("{asset_recovery_max_ms:.1}"),
-                "conn_down_events_total": stats.conn_down_events,
-                "gamma_full_scan_age_s": reconciliation_ages.full_scan_seconds,
-                "gamma_new_poll_age_s": reconciliation_ages.new_poll_seconds,
-                "gamma_closed_poll_age_s": reconciliation_ages.closed_poll_seconds,
-                "restart_cache_save_age_s": reconciliation_ages.cache_save_seconds,
-            }),
-            "pool_stats",
         );
 
         if queue_high_water_pct >= PRESSURE_THRESHOLD_PCT
@@ -563,35 +523,15 @@ async fn stats_loop(
                 queue_size = queue_used,
                 queue_high_water,
                 queue_max,
-                queue_pct = format!("{:.1}", queue_pct),
-                queue_high_water_pct = format!("{:.1}", queue_high_water_pct),
+                queue_pct,
+                queue_high_water_pct,
                 websocket_lifecycle_queue_high_water = websocket_lifecycle_high_water,
                 websocket_lifecycle_queue_max = websocket_lifecycle_max,
-                websocket_lifecycle_queue_high_water_pct =
-                    format!("{:.1}", websocket_lifecycle_high_water_pct),
+                websocket_lifecycle_queue_high_water_pct = websocket_lifecycle_high_water_pct,
                 reconciliation_queue_high_water = reconciliation_high_water,
                 reconciliation_queue_max = reconciliation_max,
-                reconciliation_queue_high_water_pct =
-                    format!("{:.1}", reconciliation_high_water_pct),
+                reconciliation_queue_high_water_pct = reconciliation_high_water_pct,
                 "[QUEUE-PRESSURE] pipeline queue high-water at or above 50%",
-            );
-            warn!(
-                grafana = true,
-                event = "queue_pressure",
-                meta = %serde_json::json!({
-                    "queue_size": queue_used,
-                    "queue_high_water": queue_high_water,
-                    "queue_max": queue_max,
-                    "queue_pct": format!("{:.1}", queue_pct),
-                    "queue_high_water_pct": format!("{:.1}", queue_high_water_pct),
-                    "websocket_lifecycle_queue_high_water": websocket_lifecycle_high_water,
-                    "websocket_lifecycle_queue_max": websocket_lifecycle_max,
-                    "websocket_lifecycle_queue_high_water_pct": format!("{:.1}", websocket_lifecycle_high_water_pct),
-                    "reconciliation_queue_high_water": reconciliation_high_water,
-                    "reconciliation_queue_max": reconciliation_max,
-                    "reconciliation_queue_high_water_pct": format!("{:.1}", reconciliation_high_water_pct),
-                }),
-                "queue_pressure",
             );
         }
         queue_high_water = 0;
