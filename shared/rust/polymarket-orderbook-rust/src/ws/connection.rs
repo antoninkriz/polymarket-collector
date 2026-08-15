@@ -20,11 +20,9 @@
 //!
 //! ## Subscription state
 //!
-//! - `desired: HashSet<String>` — durable intent across reconnects, used to
-//!   re-subscribe after a drop and to filter incoming events.
-//! - `subscribed: HashSet<String>` — what has been sent to the server in
-//!   the current session. Cleared on every reconnect so the diff in
-//!   `subscribe()` re-sends everything.
+//! - `desired: HashMap<String, DesiredAsset>` — durable intent plus each
+//!   asset's current-session subscription, fresh-book readiness, and recovery
+//!   timing. Session-local fields are reset on reconnect.
 //!
 //! ## Wire protocol
 //!
@@ -43,8 +41,9 @@
 //! exit the process. If the channel is **closed**, the sink has shut down
 //! and we return cleanly.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -60,24 +59,62 @@ use crate::ws::WS_MARKET_URL;
 type MarketWebSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// Liveness state of a single WebSocket connection. Published by the
-/// connection task on every transition and observed by the pool's health
-/// monitor to track asset-level up/down status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnStatus {
-    /// Socket is open. Each asset remains unavailable until its fresh book
-    /// snapshot arrives for this session.
-    Connected,
-    /// No live socket. Either we haven't connected yet, the previous session
-    /// ended, or we're inside the reconnect backoff.
-    Disconnected,
+#[derive(Default)]
+pub(crate) struct ConnMetrics {
+    connected: AtomicBool,
+    ready_assets: AtomicUsize,
 }
 
-/// Transport and reconstruction events consumed by the pool health monitor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HealthEvent {
-    Connection { conn_id: usize, status: ConnStatus },
-    BookSnapshot { conn_id: usize, asset_id: String },
+impl ConnMetrics {
+    pub(crate) fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn ready_assets(&self) -> usize {
+        self.ready_assets.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct HealthCounters {
+    pub(crate) asset_down_events: AtomicU64,
+    recovery: Mutex<RecoveryCounters>,
+    pub(crate) conn_down_events: AtomicU64,
+}
+
+#[derive(Default)]
+struct RecoveryCounters {
+    total: u64,
+    window: RecoveryWindow,
+}
+
+#[derive(Default)]
+pub(crate) struct RecoveryWindow {
+    pub(crate) count: u64,
+    pub(crate) latency_us: u64,
+    pub(crate) latency_us_max: u64,
+}
+
+impl HealthCounters {
+    fn record_recovery(&self, latency_us: u64) {
+        let mut recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recovery.total = recovery.total.saturating_add(1);
+        recovery.window.count = recovery.window.count.saturating_add(1);
+        recovery.window.latency_us = recovery.window.latency_us.saturating_add(latency_us);
+        recovery.window.latency_us_max = recovery.window.latency_us_max.max(latency_us);
+    }
+
+    pub(crate) fn take_recovery_window(&self) -> (u64, RecoveryWindow) {
+        let mut recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let total = recovery.total;
+        (total, std::mem::take(&mut recovery.window))
+    }
 }
 
 /// Per Polymarket docs (Market & User channels): client sends `"PING"`
@@ -110,28 +147,30 @@ async fn connect_websocket(url: &str, timeout: Duration) -> Result<MarketWebSock
 /// by closing the command channel (dropping every sender), which makes
 /// `recv()` return `None`; no explicit `Shutdown` variant is needed.
 #[derive(Debug)]
-pub enum Command {
+pub(crate) enum Command {
     Subscribe(Vec<String>),
     Unsubscribe(Vec<String>),
 }
 
-pub struct Connection {
-    pub index: usize,
-    pub event_tx: mpsc::Sender<EventRecord>,
-    pub collector: Arc<CollectorContext>,
-    pub status_tx: mpsc::UnboundedSender<HealthEvent>,
+pub(crate) struct Connection {
+    index: usize,
+    event_tx: mpsc::Sender<EventRecord>,
+    collector: Arc<CollectorContext>,
+    metrics: Arc<ConnMetrics>,
+    health_counters: Arc<HealthCounters>,
     /// Whether this socket is one of the redundant listeners for global
     /// `new_market` notifications.
-    pub lifecycle_listener: bool,
-    pub lifecycle_tx: Option<mpsc::Sender<MarketLifecycleObservation>>,
+    lifecycle_listener: bool,
+    lifecycle_tx: Option<mpsc::Sender<MarketLifecycleObservation>>,
 }
 
 impl Connection {
-    pub fn new(
+    pub(crate) fn new(
         index: usize,
         event_tx: mpsc::Sender<EventRecord>,
         collector: Arc<CollectorContext>,
-        status_tx: mpsc::UnboundedSender<HealthEvent>,
+        metrics: Arc<ConnMetrics>,
+        health_counters: Arc<HealthCounters>,
         lifecycle_listener: bool,
         lifecycle_tx: Option<mpsc::Sender<MarketLifecycleObservation>>,
     ) -> Self {
@@ -139,7 +178,8 @@ impl Connection {
             index,
             event_tx,
             collector,
-            status_tx,
+            metrics,
+            health_counters,
             lifecycle_listener,
             lifecycle_tx,
         }
@@ -149,21 +189,17 @@ impl Connection {
     /// is closed. Returns an error only
     /// if the event channel sender is dropped (i.e. the sink died) — in
     /// that case the caller should shut down all connections.
-    ///
-    /// Publishes [`ConnStatus`] transitions on `status_tx` so the pool's
-    /// health monitor can track asset-level health. The watch is
-    /// *edge-triggered*: we only `send` on a genuine transition, not on
-    /// every loop iteration.
-    pub async fn run(self, mut commands: mpsc::Receiver<Command>) -> Result<()> {
+    pub(crate) async fn run(self, mut commands: mpsc::Receiver<Command>) -> Result<()> {
         let Connection {
             index,
             event_tx,
             collector,
-            status_tx,
+            metrics,
+            health_counters,
             lifecycle_listener,
             lifecycle_tx,
         } = self;
-        let mut sub = SubState::default();
+        let mut sub = SubState::new(metrics, health_counters);
         let mut backoff = Duration::from_secs(1);
         let mut last_message_time: Option<Instant> = None;
         let mut fast_reconnect_reason: Option<&'static str> = None;
@@ -201,10 +237,7 @@ impl Connection {
             // `try_recv()` would consume buffered commands like the
             // pool's pre-loaded initial Subscribe and silently drop them.
             if commands.is_closed() && commands.is_empty() {
-                let _ = status_tx.send(HealthEvent::Connection {
-                    conn_id: index,
-                    status: ConnStatus::Disconnected,
-                });
+                sub.stop();
                 return Ok(());
             }
 
@@ -216,16 +249,11 @@ impl Connection {
                 }
                 Err(error) => {
                     warn!(conn = index, %error, "ws connect failed; will retry");
-                    // Stay in Disconnected; loop and retry with backoff.
-                    let _ = status_tx.send(HealthEvent::Connection {
-                        conn_id: index,
-                        status: ConnStatus::Disconnected,
-                    });
                     continue;
                 }
             };
-            // Reset session state. `desired` survives, `subscribed` does not.
-            sub.reset_session();
+            // Reset session flags while durable desired entries survive.
+            sub.reset_wire_session();
 
             // Record reconnect gap if this isn't the first connection.
             let connect_time = Instant::now();
@@ -239,12 +267,7 @@ impl Connection {
                 );
             }
 
-            // We're connected; publish before entering the session loop so
-            // the pool's health monitor sees us go up immediately.
-            let _ = status_tx.send(HealthEvent::Connection {
-                conn_id: index,
-                status: ConnStatus::Connected,
-            });
+            sub.connected();
 
             // Run a single connected session. A heartbeat timeout skips the
             // next reconnect backoff.
@@ -252,7 +275,6 @@ impl Connection {
                 index,
                 event_tx: &event_tx,
                 collector: &collector,
-                status_tx: &status_tx,
                 lifecycle_listener,
                 lifecycle_tx: lifecycle_tx.as_ref(),
             };
@@ -265,30 +287,25 @@ impl Connection {
             )
             .await;
 
-            // Session ended for any reason → we're no longer Connected.
-            // Clear every session-local claim immediately; durable intent in
-            // `desired` survives and will be reconstructed after reconnect.
-            sub.reset_session();
-            // Always publish before deciding what to do next.
-            let _ = status_tx.send(HealthEvent::Connection {
-                conn_id: index,
-                status: ConnStatus::Disconnected,
-            });
-
             match outcome {
                 SessionOutcome::HeartbeatTimeout => {
+                    log_connection_gap(index, &mut sub);
                     fast_reconnect_reason = Some("heartbeat timeout");
                 }
                 SessionOutcome::Closed => {
+                    log_connection_gap(index, &mut sub);
                     fast_reconnect_reason = Some("session ended");
                 }
                 SessionOutcome::ChannelClosed => {
+                    sub.stop();
                     return Ok(());
                 }
                 SessionOutcome::Shutdown => {
+                    sub.stop();
                     return Ok(());
                 }
                 SessionOutcome::Error(e) => {
+                    log_connection_gap(index, &mut sub);
                     warn!(conn = index, error = %e, "session error, will reconnect");
                 }
             }
@@ -296,25 +313,182 @@ impl Connection {
     }
 }
 
-/// Subscription state: durable intent and per-session reconstruction state.
 #[derive(Default)]
-pub(crate) struct SubState {
-    pub desired: HashSet<String>,
-    pub subscribed: HashSet<String>,
-    /// Assets for which this socket session has delivered a fresh book.
-    /// Price deltas are not reconstructible until that snapshot arrives.
-    pub initialized: HashSet<String>,
+struct DesiredAsset {
+    subscribed: bool,
+    initialized: bool,
+    recovery_started: Option<Instant>,
+}
+
+/// Subscription intent and reconstruction state, owned by the connection task.
+struct SubState {
+    desired: HashMap<String, DesiredAsset>,
     /// Whether the initial subscribe message has been sent on the current
     /// session. The first message uses `{"type": "market"}`; subsequent
     /// ones use `{"operation": "subscribe"}`.
-    pub initial_sent: bool,
+    initial_sent: bool,
+    metrics: Arc<ConnMetrics>,
+    health_counters: Arc<HealthCounters>,
 }
 
 impl SubState {
-    pub fn reset_session(&mut self) {
-        self.subscribed.clear();
-        self.initialized.clear();
+    fn new(metrics: Arc<ConnMetrics>, health_counters: Arc<HealthCounters>) -> Self {
+        Self {
+            desired: HashMap::new(),
+            initial_sent: false,
+            metrics,
+            health_counters,
+        }
+    }
+
+    fn reset_wire_session(&mut self) {
+        for asset in self.desired.values_mut() {
+            asset.subscribed = false;
+        }
         self.initial_sent = false;
+    }
+
+    fn connected(&self) {
+        self.metrics.connected.store(true, Ordering::Relaxed);
+    }
+
+    /// End one failed wire session and retain the first recovery timestamp for
+    /// every asset that remains uninitialized across further failed sessions.
+    fn disconnected(&mut self) -> usize {
+        self.disconnected_at(Instant::now())
+    }
+
+    fn disconnected_at(&mut self, now: Instant) -> usize {
+        self.reset_wire_session();
+        if !self.metrics.connected.swap(false, Ordering::Relaxed) {
+            return 0;
+        }
+
+        self.health_counters
+            .conn_down_events
+            .fetch_add(1, Ordering::Relaxed);
+        let mut invalidated = 0;
+        for asset in self.desired.values_mut() {
+            if asset.initialized {
+                asset.initialized = false;
+                asset.recovery_started = Some(now);
+                invalidated += 1;
+            }
+        }
+        self.decrement_ready(invalidated);
+        self.health_counters
+            .asset_down_events
+            .fetch_add(invalidated as u64, Ordering::Relaxed);
+        invalidated
+    }
+
+    /// Stop intentionally without turning shutdown into a data-gap event.
+    fn stop(&self) {
+        self.metrics.connected.store(false, Ordering::Relaxed);
+        self.metrics.ready_assets.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn subscribe(&mut self, asset_id: String) {
+        self.desired.entry(asset_id).or_default();
+    }
+
+    fn unsubscribe(&mut self, asset_id: &str) -> bool {
+        let Some(asset) = self.desired.remove(asset_id) else {
+            return false;
+        };
+        if asset.initialized {
+            self.decrement_ready(1);
+        }
+        true
+    }
+
+    fn contains(&self, asset_id: &str) -> bool {
+        self.desired.contains_key(asset_id)
+    }
+
+    fn initialized(&self, asset_id: &str) -> bool {
+        self.desired
+            .get(asset_id)
+            .is_some_and(|asset| asset.initialized)
+    }
+
+    fn subscribe_for_session(&mut self, asset_id: String) -> bool {
+        !std::mem::replace(
+            &mut self.desired.entry(asset_id).or_default().subscribed,
+            true,
+        )
+    }
+
+    fn mark_all_subscribed(&mut self) {
+        for asset in self.desired.values_mut() {
+            asset.subscribed = true;
+        }
+    }
+
+    fn require_fresh_snapshot(&mut self, asset_id: &str) {
+        let Some(asset) = self.desired.get_mut(asset_id) else {
+            return;
+        };
+        if asset.initialized {
+            asset.initialized = false;
+            asset.recovery_started = None;
+            self.decrement_ready(1);
+        }
+    }
+
+    fn initialize(&mut self, asset_id: &str) {
+        self.initialize_at(asset_id, Instant::now());
+    }
+
+    fn initialize_at(&mut self, asset_id: &str, now: Instant) {
+        let Some(asset) = self.desired.get_mut(asset_id) else {
+            return;
+        };
+        if asset.initialized {
+            return;
+        }
+        asset.initialized = true;
+        self.metrics.ready_assets.fetch_add(1, Ordering::Relaxed);
+        if let Some(started) = asset.recovery_started.take() {
+            let latency_us = now
+                .saturating_duration_since(started)
+                .as_micros()
+                .min(u64::MAX as u128) as u64;
+            self.health_counters.record_recovery(latency_us);
+        }
+    }
+
+    fn decrement_ready(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let ready = self.metrics.ready_assets.load(Ordering::Relaxed);
+        self.metrics
+            .ready_assets
+            .store(ready.saturating_sub(count), Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+impl Default for SubState {
+    fn default() -> Self {
+        Self::new(
+            Arc::new(ConnMetrics::default()),
+            Arc::new(HealthCounters::default()),
+        )
+    }
+}
+
+fn log_connection_gap(index: usize, sub: &mut SubState) {
+    let invalidated_assets = sub.disconnected();
+    if invalidated_assets != 0 {
+        warn!(
+            conn = index,
+            invalidated_assets,
+            assigned_assets = sub.desired.len(),
+            "[CONNECTION-DATA-GAP] authoritative connection down"
+        );
     }
 }
 
@@ -337,7 +511,6 @@ struct SessionContext<'a> {
     index: usize,
     event_tx: &'a mpsc::Sender<EventRecord>,
     collector: &'a CollectorContext,
-    status_tx: &'a mpsc::UnboundedSender<HealthEvent>,
     lifecycle_listener: bool,
     lifecycle_tx: Option<&'a mpsc::Sender<MarketLifecycleObservation>>,
 }
@@ -357,13 +530,13 @@ async fn run_session(
 
     // (Re-)subscribe everything we want.
     if !sub.desired.is_empty() || context.lifecycle_listener {
-        let assets: Vec<String> = sub.desired.iter().cloned().collect();
+        let assets: Vec<String> = sub.desired.keys().cloned().collect();
         if let Err(e) = send_subscribe(&mut write, sub, &assets).await {
             return SessionOutcome::Error(e);
         }
         // Re-subscribing doesn't add new assets, but it does mean we've
         // sent everything we know about for this session.
-        sub.subscribed.extend(sub.desired.iter().cloned());
+        sub.mark_all_subscribed();
     }
 
     let mut ping_interval = tokio::time::interval(PING_INTERVAL);
@@ -521,16 +694,14 @@ where
             if assets.is_empty() {
                 return Ok(());
             }
-            // Update desired (durable) and compute the diff against the
-            // per-session subscribed set.
+            // Update durable intent and compute the current-session diff.
             let mut new_in_session = Vec::new();
             for asset in &assets {
-                sub.desired.insert(asset.clone());
-                if sub.subscribed.insert(asset.clone()) {
+                if sub.subscribe_for_session(asset.clone()) {
                     // A new subscription needs its own fresh snapshot, even if
                     // this asset was subscribed earlier in the same socket
                     // session and then removed.
-                    sub.initialized.remove(asset);
+                    sub.require_fresh_snapshot(asset);
                     new_in_session.push(asset.clone());
                 }
             }
@@ -547,9 +718,7 @@ where
             }
             let mut removed = Vec::new();
             for asset in &assets {
-                if sub.desired.remove(asset) {
-                    sub.subscribed.remove(asset);
-                    sub.initialized.remove(asset);
+                if sub.unsubscribe(asset) {
                     removed.push(asset.clone());
                 }
             }
@@ -598,19 +767,14 @@ fn handle_text(
         explode(msg, &mut staged);
         for ev in staged {
             if let Some(asset_id) = ev.asset_id() {
-                if !sub.desired.contains(asset_id) {
+                if !sub.contains(asset_id) {
                     continue;
                 }
                 match &ev {
                     Event::Book { .. } => {
-                        if sub.initialized.insert(asset_id.to_owned()) {
-                            let _ = context.status_tx.send(HealthEvent::BookSnapshot {
-                                conn_id: context.index,
-                                asset_id: asset_id.to_owned(),
-                            });
-                        }
+                        sub.initialize(asset_id);
                     }
-                    Event::PriceChange { .. } if !sub.initialized.contains(asset_id) => {
+                    Event::PriceChange { .. } if !sub.initialized(asset_id) => {
                         debug!(
                             conn = context.index,
                             asset_id, "dropping price delta before fresh book snapshot"
@@ -626,7 +790,7 @@ fn handle_text(
             let authoritative = match &ev {
                 Event::NewMarket { .. } => context.lifecycle_listener,
                 Event::MarketResolved { assets_ids, .. } => {
-                    assets_ids.iter().any(|asset| sub.desired.contains(asset))
+                    assets_ids.iter().any(|asset| sub.contains(asset))
                         || (assets_ids.is_empty() && context.lifecycle_listener)
                 }
                 _ => unreachable!("every token event has an asset ID"),
@@ -755,13 +919,11 @@ mod tests {
 
     fn handle(text: &str, sub: &mut SubState, events: &mut Vec<EventRecord>) -> Result<()> {
         let (event_tx, _event_rx) = mpsc::channel(1);
-        let (status_tx, _status_rx) = mpsc::unbounded_channel();
         let collector = CollectorContext::new();
         let context = SessionContext {
             index: 0,
             event_tx: &event_tx,
             collector: &collector,
-            status_tx: &status_tx,
             lifecycle_listener: false,
             lifecycle_tx: None,
         };
@@ -770,11 +932,91 @@ mod tests {
 
     fn sub_state(desired: &[&str]) -> SubState {
         let mut s = SubState::default();
+        s.connected();
         for a in desired {
-            s.desired.insert((*a).into());
-            s.initialized.insert((*a).into());
+            s.subscribe((*a).into());
+            s.initialize(a);
         }
         s
+    }
+
+    fn health_state() -> (SubState, Arc<ConnMetrics>, Arc<HealthCounters>) {
+        let metrics = Arc::new(ConnMetrics::default());
+        let counters = Arc::new(HealthCounters::default());
+        (
+            SubState::new(Arc::clone(&metrics), Arc::clone(&counters)),
+            metrics,
+            counters,
+        )
+    }
+
+    #[test]
+    fn readiness_and_recovery_follow_fresh_books_across_repeated_failures() {
+        let (mut sub, metrics, counters) = health_state();
+        sub.subscribe("a".into());
+        sub.subscribe("b".into());
+        let start = Instant::now();
+
+        sub.connected();
+        sub.initialize_at("a", start);
+        sub.initialize_at("a", start);
+        assert_eq!(
+            metrics.ready_assets(),
+            1,
+            "a repeated book is not a transition"
+        );
+
+        assert_eq!(sub.disconnected_at(start + Duration::from_micros(10)), 1);
+        assert_eq!(metrics.ready_assets(), 0);
+        assert_eq!(counters.conn_down_events.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.asset_down_events.load(Ordering::Relaxed), 1);
+
+        assert_eq!(
+            sub.disconnected_at(start + Duration::from_micros(20)),
+            0,
+            "a repeated failure cannot restart recovery clocks"
+        );
+        sub.connected();
+        sub.initialize_at("b", start + Duration::from_micros(20));
+        assert_eq!(metrics.ready_assets(), 1);
+        assert_eq!(sub.disconnected_at(start + Duration::from_micros(30)), 1);
+        assert_eq!(counters.conn_down_events.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.asset_down_events.load(Ordering::Relaxed), 2);
+
+        sub.connected();
+        sub.initialize_at("a", start + Duration::from_micros(310));
+        sub.initialize_at("b", start + Duration::from_micros(130));
+        assert_eq!(metrics.ready_assets(), 2);
+        let (total, window) = counters.take_recovery_window();
+        assert_eq!(total, 2);
+        assert_eq!(window.count, 2);
+        assert_eq!(window.latency_us, 400);
+        assert_eq!(window.latency_us_max, 300);
+        let (total, next_window) = counters.take_recovery_window();
+        assert_eq!(total, 2);
+        assert_eq!(next_window.count, 0);
+        assert_eq!(next_window.latency_us, 0);
+        assert_eq!(next_window.latency_us_max, 0);
+    }
+
+    #[test]
+    fn intentional_stop_does_not_count_as_a_data_gap() {
+        let (mut sub, metrics, counters) = health_state();
+        sub.subscribe_for_session("a".into());
+        sub.connected();
+        sub.initialize("a");
+
+        sub.stop();
+
+        assert!(!metrics.is_connected());
+        assert_eq!(metrics.ready_assets(), 0);
+        assert!(sub.desired["a"].subscribed);
+        assert!(sub.initialized("a"));
+        assert_eq!(counters.conn_down_events.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.asset_down_events.load(Ordering::Relaxed), 0);
+        let (total, window) = counters.take_recovery_window();
+        assert_eq!(total, 0);
+        assert_eq!(window.count, 0);
     }
 
     #[tokio::test]
@@ -872,8 +1114,7 @@ mod tests {
     fn handle_text_requires_fresh_book_before_price_changes() {
         let mut buf = Vec::new();
         let mut sub = sub_state(&["a"]);
-        sub.reset_session();
-        sub.desired.insert("a".into());
+        sub.disconnected();
 
         let price_change = r#"{
             "event_type": "price_change", "market": "m", "timestamp": "1",
@@ -888,6 +1129,7 @@ mod tests {
             "event_type": "book", "asset_id": "a", "market": "m",
             "bids": [], "asks": [], "timestamp": "2", "hash": "h"
         }"#;
+        sub.connected();
         handle(book, &mut sub, &mut buf).unwrap();
         handle(price_change, &mut sub, &mut buf).unwrap();
         assert_eq!(
@@ -896,7 +1138,7 @@ mod tests {
             "snapshot followed by delta is reconstructible"
         );
 
-        sub.reset_session();
+        sub.disconnected();
         handle(price_change, &mut sub, &mut buf).unwrap();
         assert_eq!(buf.len(), 2, "reconnect must require another snapshot");
     }
@@ -963,13 +1205,11 @@ mod tests {
         assert!(buf.is_empty());
 
         let (event_tx, _event_rx) = mpsc::channel(1);
-        let (status_tx, _status_rx) = mpsc::unbounded_channel();
         let collector = CollectorContext::new();
         let context = SessionContext {
             index: 0,
             event_tx: &event_tx,
             collector: &collector,
-            status_tx: &status_tx,
             lifecycle_listener: true,
             lifecycle_tx: None,
         };
@@ -988,14 +1228,12 @@ mod tests {
         let mut sub = sub_state(&[]);
         let mut buf = Vec::new();
         let (event_tx, _event_rx) = mpsc::channel(1);
-        let (status_tx, _status_rx) = mpsc::unbounded_channel();
         let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(8);
         let collector = CollectorContext::new();
         let context = SessionContext {
             index: 0,
             event_tx: &event_tx,
             collector: &collector,
-            status_tx: &status_tx,
             lifecycle_listener: true,
             lifecycle_tx: Some(&lifecycle_tx),
         };
@@ -1021,14 +1259,12 @@ mod tests {
         let mut sub = sub_state(&["yes", "no"]);
         let mut buf = Vec::new();
         let (event_tx, _event_rx) = mpsc::channel(1);
-        let (status_tx, _status_rx) = mpsc::unbounded_channel();
         let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(8);
         let collector = CollectorContext::new();
         let context = SessionContext {
             index: 17,
             event_tx: &event_tx,
             collector: &collector,
-            status_tx: &status_tx,
             lifecycle_listener: false,
             lifecycle_tx: Some(&lifecycle_tx),
         };
@@ -1051,14 +1287,12 @@ mod tests {
         let mut sub = sub_state(&["other"]);
         let mut buf = Vec::new();
         let (event_tx, _event_rx) = mpsc::channel(1);
-        let (status_tx, _status_rx) = mpsc::unbounded_channel();
         let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(8);
         let collector = CollectorContext::new();
         let context = SessionContext {
             index: 18,
             event_tx: &event_tx,
             collector: &collector,
-            status_tx: &status_tx,
             lifecycle_listener: false,
             lifecycle_tx: Some(&lifecycle_tx),
         };
@@ -1094,30 +1328,31 @@ mod tests {
     async fn failed_live_subscribe_preserves_desired_for_reconnect() {
         let mut write = FailingSink;
         let mut sub = SubState::default();
-        sub.initialized.insert("a".into());
+        sub.connected();
+        sub.subscribe("a".into());
+        sub.initialize("a");
 
         let error = apply_command(&mut write, &mut sub, Command::Subscribe(vec!["a".into()]))
             .await
             .unwrap_err();
 
         assert!(error.to_string().contains("subscribe command write failed"));
-        assert!(sub.desired.contains("a"));
-        assert!(sub.subscribed.contains("a"));
-        assert!(!sub.initialized.contains("a"));
-        sub.reset_session();
-        assert!(sub.desired.contains("a"));
-        assert!(sub.subscribed.is_empty());
-        assert!(sub.initialized.is_empty());
+        assert!(sub.contains("a"));
+        assert!(sub.desired["a"].subscribed);
+        assert!(!sub.initialized("a"));
+        sub.disconnected();
+        assert!(sub.contains("a"));
+        assert!(!sub.desired["a"].subscribed);
+        assert!(!sub.initialized("a"));
         assert!(!sub.initial_sent);
     }
 
     #[tokio::test]
     async fn failed_live_unsubscribe_reconstructs_remaining_desired_assets() {
         let mut write = FailingSink;
-        let mut sub = SubState::default();
-        sub.desired.extend(["a".into(), "b".into()]);
-        sub.subscribed.extend(["a".into(), "b".into()]);
-        sub.initialized.extend(["a".into(), "b".into()]);
+        let mut sub = sub_state(&["a", "b"]);
+        sub.subscribe_for_session("a".into());
+        sub.subscribe_for_session("b".into());
         sub.initial_sent = true;
 
         let error = apply_command(&mut write, &mut sub, Command::Unsubscribe(vec!["a".into()]))
@@ -1127,11 +1362,13 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsubscribe command write failed"));
-        assert_eq!(sub.desired, HashSet::from(["b".into()]));
-        sub.reset_session();
-        assert_eq!(sub.desired, HashSet::from(["b".into()]));
-        assert!(sub.subscribed.is_empty());
-        assert!(sub.initialized.is_empty());
+        assert!(!sub.contains("a"));
+        assert!(sub.contains("b"));
+        sub.disconnected();
+        assert!(!sub.contains("a"));
+        assert!(sub.contains("b"));
+        assert!(!sub.desired["b"].subscribed);
+        assert!(!sub.initialized("b"));
         assert!(!sub.initial_sent);
     }
 

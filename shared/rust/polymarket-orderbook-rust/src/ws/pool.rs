@@ -8,9 +8,8 @@
 //! reconnect, fresh `book` snapshots replace the full local state.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use anyhow::{anyhow, ensure, Result};
 use tokio::sync::mpsc;
@@ -19,20 +18,15 @@ use tracing::{debug, info, warn};
 
 use crate::events::{Event, Market, MarketLifecycleObservation};
 use crate::record::{CollectorContext, EventRecord};
-use crate::ws::connection::{Command, ConnStatus, Connection, HealthEvent};
+use crate::ws::connection::{Command, ConnMetrics, Connection, HealthCounters};
 
 const COMMAND_CHANNEL_SIZE: usize = 64;
-const ROUTE_UPDATE_CHANNEL_SIZE: usize = 8_192;
 const LIFECYCLE_LISTENER_CONNECTIONS: usize = 3;
-
-enum RouteUpdate {
-    Assigned(Vec<(String, usize)>),
-    Removed { conn_id: usize, assets: Vec<String> },
-}
 
 struct ConnHandle {
     conn_id: usize,
     assets: HashSet<String>,
+    metrics: Arc<ConnMetrics>,
     lifecycle_listener: bool,
     cmd_tx: mpsc::Sender<Command>,
     join: JoinHandle<Result<()>>,
@@ -52,50 +46,6 @@ pub struct PoolStats {
     pub assets_down: usize,
 }
 
-#[derive(Default)]
-pub struct HealthCounters {
-    pub asset_down_events: AtomicU64,
-    recovery: Mutex<RecoveryCounters>,
-    pub conn_down_events: AtomicU64,
-    pub conns_down: AtomicU64,
-    pub assets_down: AtomicU64,
-}
-
-#[derive(Default)]
-struct RecoveryCounters {
-    total: u64,
-    window: RecoveryWindow,
-}
-
-#[derive(Default)]
-struct RecoveryWindow {
-    count: u64,
-    latency_us: u64,
-    latency_us_max: u64,
-}
-
-impl HealthCounters {
-    fn record_recovery(&self, latency_us: u64) {
-        let mut recovery = self
-            .recovery
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        recovery.total = recovery.total.saturating_add(1);
-        recovery.window.count = recovery.window.count.saturating_add(1);
-        recovery.window.latency_us = recovery.window.latency_us.saturating_add(latency_us);
-        recovery.window.latency_us_max = recovery.window.latency_us_max.max(latency_us);
-    }
-
-    fn take_recovery_window(&self) -> (u64, RecoveryWindow) {
-        let mut recovery = self
-            .recovery
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let total = recovery.total;
-        (total, std::mem::take(&mut recovery.window))
-    }
-}
-
 pub struct Pool {
     max_assets_per_conn: usize,
     event_tx: mpsc::Sender<EventRecord>,
@@ -110,9 +60,6 @@ pub struct Pool {
     lifecycle_conn_id: Option<usize>,
     lifecycle_tx: Option<mpsc::Sender<MarketLifecycleObservation>>,
     health_counters: Arc<HealthCounters>,
-    monitor_join: Option<JoinHandle<()>>,
-    status_event_tx: mpsc::UnboundedSender<HealthEvent>,
-    route_update_tx: mpsc::Sender<RouteUpdate>,
 }
 
 impl Pool {
@@ -152,14 +99,6 @@ impl Pool {
             publisher_generation,
         ));
         let health_counters = Arc::new(HealthCounters::default());
-        let (status_event_tx, status_event_rx) = mpsc::unbounded_channel();
-        let (route_update_tx, route_update_rx) = mpsc::channel(ROUTE_UPDATE_CHANNEL_SIZE);
-
-        let monitor_join = Some(tokio::spawn(run_health_monitor(
-            status_event_rx,
-            route_update_rx,
-            Arc::clone(&health_counters),
-        )));
 
         Self {
             max_assets_per_conn,
@@ -172,9 +111,6 @@ impl Pool {
             lifecycle_conn_id: None,
             lifecycle_tx,
             health_counters,
-            monitor_join,
-            status_event_tx,
-            route_update_tx,
         }
     }
 
@@ -193,6 +129,23 @@ impl Pool {
 
     pub fn pool_stats(&self) -> PoolStats {
         let (asset_recovery_events, recovery_window) = self.health_counters.take_recovery_window();
+        let conns_down = self
+            .connections
+            .iter()
+            .filter(|connection| {
+                !connection.assets.is_empty() && !connection.metrics.is_connected()
+            })
+            .count();
+        let assets_down = self
+            .connections
+            .iter()
+            .map(|connection| {
+                connection
+                    .assets
+                    .len()
+                    .saturating_sub(connection.metrics.ready_assets())
+            })
+            .sum();
         PoolStats {
             market_count: self.market_to_conn.len(),
             connection_count: self.connections.len(),
@@ -213,8 +166,8 @@ impl Pool {
                 .health_counters
                 .conn_down_events
                 .load(Ordering::Relaxed),
-            conns_down: self.health_counters.conns_down.load(Ordering::Relaxed) as usize,
-            assets_down: self.health_counters.assets_down.load(Ordering::Relaxed) as usize,
+            conns_down,
+            assets_down,
         }
     }
 
@@ -283,7 +236,6 @@ impl Pool {
 
         let mut pending_assets = vec![Vec::new(); self.connections.len()];
         let mut conn_index = 0;
-        let mut assigned_routes = Vec::with_capacity(new_markets.len() * 2);
         for market in new_markets {
             // Every market consumes two slots. Once a connection has fewer
             // than two free slots, no later market in this batch can use it.
@@ -305,12 +257,8 @@ impl Pool {
             self.market_to_conn.insert(market.hash.clone(), conn_id);
             for asset in assets {
                 self.asset_to_conn.insert(asset.clone(), conn_id);
-                assigned_routes.push((asset.clone(), conn_id));
             }
         }
-
-        self.send_route_update(RouteUpdate::Assigned(assigned_routes))
-            .await;
 
         let mut command_error = None;
         for (handle, assets) in self.connections.iter_mut().zip(pending_assets) {
@@ -352,12 +300,6 @@ impl Pool {
         for asset in assets {
             self.asset_to_conn.remove(asset);
         }
-        self.send_route_update(RouteUpdate::Removed {
-            conn_id,
-            assets: assets.to_vec(),
-        })
-        .await;
-
         let mut command_error = None;
         if let Some(handle) = self.connections.iter_mut().find(|h| h.conn_id == conn_id) {
             for asset in assets {
@@ -401,10 +343,6 @@ impl Pool {
         // producer before awaiting any of them.
         self.abort_tasks();
 
-        if let Some(join) = self.monitor_join.take() {
-            let _ = join.await;
-        }
-
         for handle in self.connections.drain(..) {
             let conn_id = handle.conn_id;
             drop(handle.cmd_tx);
@@ -421,9 +359,6 @@ impl Pool {
     }
 
     fn abort_tasks(&mut self) {
-        if let Some(join) = &self.monitor_join {
-            join.abort();
-        }
         for handle in &self.connections {
             handle.join.abort();
         }
@@ -440,11 +375,13 @@ impl Pool {
             || (self.lifecycle_tx.is_some()
                 && self.connections.len() < LIFECYCLE_LISTENER_CONNECTIONS);
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_SIZE);
+        let metrics = Arc::new(ConnMetrics::default());
         let connection = Connection::new(
             conn_id,
             self.event_tx.clone(),
             Arc::clone(&self.collector),
-            self.status_event_tx.clone(),
+            Arc::clone(&metrics),
+            Arc::clone(&self.health_counters),
             lifecycle_listener,
             self.lifecycle_tx.clone(),
         );
@@ -452,259 +389,17 @@ impl Pool {
         self.connections.push(ConnHandle {
             conn_id,
             assets: HashSet::new(),
+            metrics,
             lifecycle_listener,
             cmd_tx,
             join,
         });
-    }
-
-    async fn send_route_update(&self, update: RouteUpdate) {
-        if self.route_update_tx.send(update).await.is_err() {
-            warn!("pool health monitor route channel closed");
-        }
     }
 }
 
 impl Drop for Pool {
     fn drop(&mut self) {
         self.abort_tasks();
-    }
-}
-
-async fn run_health_monitor(
-    mut status_rx: mpsc::UnboundedReceiver<HealthEvent>,
-    mut route_update_rx: mpsc::Receiver<RouteUpdate>,
-    counters: Arc<HealthCounters>,
-) {
-    let mut state = HealthState::default();
-
-    loop {
-        tokio::select! {
-            biased;
-            update = route_update_rx.recv() => {
-                let Some(update) = update else { break };
-                state.apply_route_update(update, &counters);
-            }
-            event = status_rx.recv() => {
-                let Some(event) = event else { break };
-                state.apply_event(event, &counters);
-            }
-        }
-    }
-}
-
-#[derive(Default)]
-struct HealthState {
-    connections: HashMap<usize, ConnHealth>,
-    assets_down_count: usize,
-    conns_down_count: usize,
-}
-
-struct ConnHealth {
-    status: ConnStatus,
-    generation: u64,
-    assets: HashMap<String, AssetHealth>,
-}
-
-impl Default for ConnHealth {
-    fn default() -> Self {
-        Self {
-            status: ConnStatus::Disconnected,
-            generation: 0,
-            assets: HashMap::new(),
-        }
-    }
-}
-
-#[derive(Default)]
-struct AssetHealth {
-    ready_generation: Option<u64>,
-    down_since: Option<Instant>,
-}
-
-impl ConnHealth {
-    fn asset_is_ready(&self, asset: &AssetHealth) -> bool {
-        self.status == ConnStatus::Connected && asset.ready_generation == Some(self.generation)
-    }
-
-    fn ready_asset_count(&self) -> usize {
-        self.assets
-            .values()
-            .filter(|asset| self.asset_is_ready(asset))
-            .count()
-    }
-}
-
-impl HealthState {
-    fn apply_event(&mut self, event: HealthEvent, counters: &HealthCounters) {
-        match event {
-            HealthEvent::Connection { conn_id, status } => {
-                let connection = self.connections.entry(conn_id).or_default();
-                let old_status = connection.status;
-                if old_status == status {
-                    return;
-                }
-
-                let assigned_assets = connection.assets.len();
-                let was_down = assigned_assets != 0 && old_status == ConnStatus::Disconnected;
-                let ready_before = connection.ready_asset_count();
-
-                if status == ConnStatus::Disconnected {
-                    counters.conn_down_events.fetch_add(1, Ordering::Relaxed);
-                    let now = Instant::now();
-                    let generation = connection.generation;
-                    for asset in connection
-                        .assets
-                        .values_mut()
-                        .filter(|asset| asset.ready_generation == Some(generation))
-                    {
-                        counters.asset_down_events.fetch_add(1, Ordering::Relaxed);
-                        asset.down_since = Some(now);
-                    }
-                    if ready_before != 0 {
-                        warn!(
-                            conn = conn_id,
-                            invalidated_assets = ready_before,
-                            assigned_assets,
-                            "[CONNECTION-DATA-GAP] authoritative connection down"
-                        );
-                    }
-                } else {
-                    connection.generation = connection.generation.wrapping_add(1);
-                }
-                connection.status = status;
-
-                let ready_after = connection.ready_asset_count();
-                self.assets_down_count =
-                    adjust_down_count(self.assets_down_count, ready_before, ready_after);
-                let is_down = assigned_assets != 0 && status == ConnStatus::Disconnected;
-                self.conns_down_count =
-                    adjust_boolean_count(self.conns_down_count, was_down, is_down);
-                self.publish_gauges(counters);
-            }
-            HealthEvent::BookSnapshot { conn_id, asset_id } => {
-                let authoritative = self
-                    .connections
-                    .get(&conn_id)
-                    .is_some_and(|connection| connection.assets.contains_key(&asset_id));
-                if !authoritative {
-                    if let Some(expected_conn) = self.connection_for_asset(&asset_id) {
-                        warn!(
-                            asset = asset_id,
-                            conn = conn_id,
-                            expected_conn,
-                            "ignoring book readiness from non-authoritative connection"
-                        );
-                    }
-                    return;
-                }
-                let (became_ready, recovery_us) = {
-                    let connection = self
-                        .connections
-                        .get_mut(&conn_id)
-                        .expect("authoritative connection must exist");
-                    let status = connection.status;
-                    let generation = connection.generation;
-                    let asset = connection
-                        .assets
-                        .get_mut(&asset_id)
-                        .expect("authoritative asset must exist");
-                    let was_ready = status == ConnStatus::Connected
-                        && asset.ready_generation == Some(generation);
-                    asset.ready_generation = Some(generation);
-                    let became_ready = !was_ready && status == ConnStatus::Connected;
-                    let recovery_us = became_ready
-                        .then(|| asset.down_since.take())
-                        .flatten()
-                        .map(|started| started.elapsed().as_micros().min(u64::MAX as u128) as u64);
-                    (became_ready, recovery_us)
-                };
-                // Snapshots are the hot path at startup and after a batch
-                // reconnect. Updating this one asset must remain O(1), not
-                // scan the complete subscription universe.
-                if became_ready {
-                    self.assets_down_count = self.assets_down_count.saturating_sub(1);
-                    self.publish_gauges(counters);
-                }
-                if let Some(recovery_us) = recovery_us {
-                    counters.record_recovery(recovery_us);
-                }
-            }
-        }
-    }
-
-    fn apply_route_update(&mut self, update: RouteUpdate, counters: &HealthCounters) {
-        match update {
-            RouteUpdate::Assigned(routes) => {
-                for (asset, conn_id) in routes {
-                    // Pool routing validates ownership before emitting this
-                    // update; the monitor only projects the accepted route.
-                    let connection = self.connections.entry(conn_id).or_default();
-                    if connection.assets.contains_key(&asset) {
-                        continue;
-                    }
-                    let conn_was_empty = connection.assets.is_empty();
-                    connection.assets.insert(asset, AssetHealth::default());
-                    self.assets_down_count = self.assets_down_count.saturating_add(1);
-                    if conn_was_empty && connection.status != ConnStatus::Connected {
-                        self.conns_down_count = self.conns_down_count.saturating_add(1);
-                    }
-                }
-            }
-            RouteUpdate::Removed { conn_id, assets } => {
-                let Some(connection) = self.connections.get_mut(&conn_id) else {
-                    self.publish_gauges(counters);
-                    return;
-                };
-                let conn_was_empty = connection.assets.is_empty();
-                for asset in assets {
-                    let Some(asset_health) = connection.assets.remove(&asset) else {
-                        continue;
-                    };
-                    if !connection.asset_is_ready(&asset_health) {
-                        self.assets_down_count = self.assets_down_count.saturating_sub(1);
-                    }
-                }
-                if !conn_was_empty
-                    && connection.assets.is_empty()
-                    && connection.status == ConnStatus::Disconnected
-                {
-                    self.conns_down_count = self.conns_down_count.saturating_sub(1);
-                }
-            }
-        }
-        self.publish_gauges(counters);
-    }
-
-    fn connection_for_asset(&self, asset: &str) -> Option<usize> {
-        self.connections.iter().find_map(|(conn_id, connection)| {
-            connection.assets.contains_key(asset).then_some(*conn_id)
-        })
-    }
-
-    fn publish_gauges(&self, counters: &HealthCounters) {
-        counters
-            .conns_down
-            .store(self.conns_down_count as u64, Ordering::Relaxed);
-        counters
-            .assets_down
-            .store(self.assets_down_count as u64, Ordering::Relaxed);
-    }
-}
-
-fn adjust_down_count(current: usize, ready_before: usize, ready_after: usize) -> usize {
-    if ready_before >= ready_after {
-        current.saturating_add(ready_before - ready_after)
-    } else {
-        current.saturating_sub(ready_after - ready_before)
-    }
-}
-
-fn adjust_boolean_count(current: usize, before: bool, after: bool) -> usize {
-    match (before, after) {
-        (false, true) => current.saturating_add(1),
-        (true, false) => current.saturating_sub(1),
-        _ => current,
     }
 }
 
@@ -739,6 +434,7 @@ mod tests {
         pool.connections.push(ConnHandle {
             conn_id,
             assets: HashSet::new(),
+            metrics: Arc::new(ConnMetrics::default()),
             lifecycle_listener: true,
             cmd_tx,
             join,
@@ -775,267 +471,25 @@ mod tests {
         assert!(error.to_string().contains("sink is closed"));
     }
 
-    #[test]
-    fn asset_recovers_only_after_a_fresh_book_snapshot() {
-        let counters = HealthCounters::default();
-        let mut state = HealthState::default();
-        state.apply_route_update(RouteUpdate::Assigned(vec![("asset".into(), 7)]), &counters);
+    #[tokio::test]
+    async fn stats_include_never_initialized_assignments_and_remove_routes_immediately() {
+        let mut pool = pool(2);
+        let _commands = add_test_connection(&mut pool, 7);
+        let subscribed = market("m1", "yes", "no");
 
-        state.apply_event(
-            HealthEvent::Connection {
-                conn_id: 7,
-                status: ConnStatus::Connected,
-            },
-            &counters,
-        );
-        assert_eq!(counters.conns_down.load(Ordering::Relaxed), 0);
-        assert_eq!(counters.assets_down.load(Ordering::Relaxed), 1);
+        pool.subscribe_markets(std::slice::from_ref(&subscribed))
+            .await
+            .unwrap();
+        let stats = pool.pool_stats();
+        assert_eq!(stats.conns_down, 1);
+        assert_eq!(stats.assets_down, 2);
 
-        state.apply_event(
-            HealthEvent::BookSnapshot {
-                conn_id: 7,
-                asset_id: "asset".into(),
-            },
-            &counters,
-        );
-        assert_eq!(counters.assets_down.load(Ordering::Relaxed), 0);
-
-        state.apply_event(
-            HealthEvent::Connection {
-                conn_id: 7,
-                status: ConnStatus::Disconnected,
-            },
-            &counters,
-        );
-        assert_eq!(counters.asset_down_events.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.assets_down.load(Ordering::Relaxed), 1);
-
-        state.apply_event(
-            HealthEvent::Connection {
-                conn_id: 7,
-                status: ConnStatus::Connected,
-            },
-            &counters,
-        );
-        assert_eq!(
-            counters.assets_down.load(Ordering::Relaxed),
-            1,
-            "a new TCP session is not data recovery"
-        );
-
-        state.apply_event(
-            HealthEvent::BookSnapshot {
-                conn_id: 7,
-                asset_id: "asset".into(),
-            },
-            &counters,
-        );
-        assert_eq!(counters.assets_down.load(Ordering::Relaxed), 0);
-        let (recovery_events, recovery_window) = counters.take_recovery_window();
-        assert_eq!(recovery_events, 1);
-        assert_eq!(recovery_window.count, 1);
-        assert!(state.connections[&7].assets["asset"].down_since.is_none());
-    }
-
-    #[test]
-    fn snapshot_while_disconnected_does_not_end_recovery() {
-        let counters = HealthCounters::default();
-        let mut state = HealthState::default();
-        state.apply_route_update(RouteUpdate::Assigned(vec![("asset".into(), 7)]), &counters);
-        state.apply_event(
-            HealthEvent::Connection {
-                conn_id: 7,
-                status: ConnStatus::Connected,
-            },
-            &counters,
-        );
-        state.apply_event(
-            HealthEvent::BookSnapshot {
-                conn_id: 7,
-                asset_id: "asset".into(),
-            },
-            &counters,
-        );
-        state.apply_event(
-            HealthEvent::Connection {
-                conn_id: 7,
-                status: ConnStatus::Disconnected,
-            },
-            &counters,
-        );
-
-        state.apply_event(
-            HealthEvent::BookSnapshot {
-                conn_id: 7,
-                asset_id: "asset".into(),
-            },
-            &counters,
-        );
-        assert!(state.connections[&7].assets["asset"].down_since.is_some());
-        let (recovery_events, recovery_window) = counters.take_recovery_window();
-        assert_eq!(recovery_events, 0);
-        assert_eq!(recovery_window.count, 0);
-
-        state.apply_event(
-            HealthEvent::Connection {
-                conn_id: 7,
-                status: ConnStatus::Connected,
-            },
-            &counters,
-        );
-        state.apply_event(
-            HealthEvent::BookSnapshot {
-                conn_id: 7,
-                asset_id: "asset".into(),
-            },
-            &counters,
-        );
-        assert!(state.connections[&7].assets["asset"].down_since.is_none());
-        let (recovery_events, recovery_window) = counters.take_recovery_window();
-        assert_eq!(recovery_events, 1);
-        assert_eq!(recovery_window.count, 1);
-    }
-
-    #[test]
-    fn removing_an_unready_route_updates_health_gauges() {
-        let counters = HealthCounters::default();
-        let mut state = HealthState::default();
-        state.apply_route_update(RouteUpdate::Assigned(vec![("asset".into(), 7)]), &counters);
-
-        assert_eq!(counters.conns_down.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.assets_down.load(Ordering::Relaxed), 1);
-
-        state.apply_route_update(
-            RouteUpdate::Removed {
-                conn_id: 7,
-                assets: vec!["asset".into()],
-            },
-            &counters,
-        );
-
-        assert_eq!(counters.conns_down.load(Ordering::Relaxed), 0);
-        assert_eq!(counters.assets_down.load(Ordering::Relaxed), 0);
-        assert!(state.connections[&7].assets.is_empty());
-    }
-
-    #[test]
-    fn removing_a_route_uses_its_stable_connection_id() {
-        let counters = HealthCounters::default();
-        let mut state = HealthState::default();
-        state.apply_route_update(RouteUpdate::Assigned(vec![("asset".into(), 7)]), &counters);
-
-        state.apply_route_update(
-            RouteUpdate::Removed {
-                conn_id: 8,
-                assets: vec!["asset".into()],
-            },
-            &counters,
-        );
-
-        assert!(state.connections[&7].assets.contains_key("asset"));
-        assert_eq!(counters.conns_down.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.assets_down.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn removed_asset_can_be_reassigned_without_stale_readiness() {
-        let counters = HealthCounters::default();
-        let mut state = HealthState::default();
-        state.apply_route_update(RouteUpdate::Assigned(vec![("asset".into(), 7)]), &counters);
-        state.apply_event(
-            HealthEvent::Connection {
-                conn_id: 7,
-                status: ConnStatus::Connected,
-            },
-            &counters,
-        );
-        state.apply_event(
-            HealthEvent::BookSnapshot {
-                conn_id: 7,
-                asset_id: "asset".into(),
-            },
-            &counters,
-        );
-        state.apply_route_update(
-            RouteUpdate::Removed {
-                conn_id: 7,
-                assets: vec!["asset".into()],
-            },
-            &counters,
-        );
-        state.apply_route_update(RouteUpdate::Assigned(vec![("asset".into(), 8)]), &counters);
-
-        state.apply_event(
-            HealthEvent::BookSnapshot {
-                conn_id: 7,
-                asset_id: "asset".into(),
-            },
-            &counters,
-        );
-        assert_eq!(counters.conns_down.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.assets_down.load(Ordering::Relaxed), 1);
-
-        state.apply_event(
-            HealthEvent::Connection {
-                conn_id: 8,
-                status: ConnStatus::Connected,
-            },
-            &counters,
-        );
-        state.apply_event(
-            HealthEvent::BookSnapshot {
-                conn_id: 8,
-                asset_id: "asset".into(),
-            },
-            &counters,
-        );
-        assert_eq!(counters.conns_down.load(Ordering::Relaxed), 0);
-        assert_eq!(counters.assets_down.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn snapshot_from_non_authoritative_connection_does_not_recover_asset() {
-        let counters = HealthCounters::default();
-        let mut state = HealthState::default();
-        state.apply_route_update(RouteUpdate::Assigned(vec![("asset".into(), 7)]), &counters);
-        state.apply_event(
-            HealthEvent::Connection {
-                conn_id: 7,
-                status: ConnStatus::Connected,
-            },
-            &counters,
-        );
-
-        state.apply_event(
-            HealthEvent::BookSnapshot {
-                conn_id: 8,
-                asset_id: "asset".into(),
-            },
-            &counters,
-        );
-
-        assert_eq!(counters.assets_down.load(Ordering::Relaxed), 1);
-        assert_eq!(state.connections[&7].assets["asset"].ready_generation, None);
-    }
-
-    #[test]
-    fn recovery_window_is_taken_as_one_consistent_interval() {
-        let counters = HealthCounters::default();
-        counters.record_recovery(725);
-        counters.record_recovery(125);
-
-        let (total, window) = counters.take_recovery_window();
-        assert_eq!(total, 2);
-        assert_eq!(window.count, 2);
-        assert_eq!(window.latency_us, 850);
-        assert_eq!(window.latency_us_max, 725);
-        assert!(window.latency_us <= window.latency_us_max * window.count);
-
-        let (total, next_window) = counters.take_recovery_window();
-        assert_eq!(total, 2);
-        assert_eq!(next_window.count, 0);
-        assert_eq!(next_window.latency_us, 0);
-        assert_eq!(next_window.latency_us_max, 0);
+        pool.unsubscribe_market(&subscribed.hash, &subscribed.assets)
+            .await
+            .unwrap();
+        let stats = pool.pool_stats();
+        assert_eq!(stats.conns_down, 0);
+        assert_eq!(stats.assets_down, 0);
     }
 
     #[tokio::test]
@@ -1325,6 +779,7 @@ mod tests {
         pool.connections.push(ConnHandle {
             conn_id: 0,
             assets: HashSet::new(),
+            metrics: Arc::new(ConnMetrics::default()),
             lifecycle_listener: true,
             cmd_tx,
             join,
@@ -1337,7 +792,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drop_cancels_monitor_and_connection_tasks() {
+    async fn drop_cancels_connection_tasks() {
         struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
 
         impl Drop for DropSignal {
@@ -1349,18 +804,6 @@ mod tests {
         }
 
         let mut pool = pool(2);
-        let original_monitor = pool.monitor_join.take().unwrap();
-        original_monitor.abort();
-        let _ = original_monitor.await;
-
-        let (monitor_started_tx, monitor_started_rx) = tokio::sync::oneshot::channel();
-        let (monitor_dropped_tx, monitor_dropped_rx) = tokio::sync::oneshot::channel();
-        pool.monitor_join = Some(tokio::spawn(async move {
-            let _drop_signal = DropSignal(Some(monitor_dropped_tx));
-            let _ = monitor_started_tx.send(());
-            std::future::pending::<()>().await;
-        }));
-
         let (connection_started_tx, connection_started_rx) = tokio::sync::oneshot::channel();
         let (connection_dropped_tx, connection_dropped_rx) = tokio::sync::oneshot::channel();
         let connection_join = tokio::spawn(async move {
@@ -1372,20 +815,18 @@ mod tests {
         pool.connections.push(ConnHandle {
             conn_id: 0,
             assets: HashSet::new(),
+            metrics: Arc::new(ConnMetrics::default()),
             lifecycle_listener: true,
             cmd_tx,
             join: connection_join,
         });
 
-        monitor_started_rx.await.unwrap();
         connection_started_rx.await.unwrap();
         drop(pool);
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            monitor_dropped_rx.await.unwrap();
-            connection_dropped_rx.await.unwrap();
-        })
-        .await
-        .expect("dropping the pool should cancel all owned tasks");
+        tokio::time::timeout(std::time::Duration::from_secs(1), connection_dropped_rx)
+            .await
+            .expect("dropping the pool should cancel all owned tasks")
+            .unwrap();
     }
 }
