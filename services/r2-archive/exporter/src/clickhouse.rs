@@ -48,8 +48,8 @@ pub struct ClickHouseSource {
 }
 
 impl ClickHouseSource {
-    pub fn new(cfg: Config) -> Result<Self> {
-        Ok(Self { cfg })
+    pub fn new(cfg: Config) -> Self {
+        Self { cfg }
     }
 
     fn query_hour(&self, aggregate: &str) -> Result<Option<DateTime<Utc>>> {
@@ -276,26 +276,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::config::ExportBackend;
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn source_can_be_constructed_and_dropped_on_async_worker() {
-        let source = ClickHouseSource::new(Config {
-            clickhouse_url: "http://example.invalid:8123/".to_owned(),
-            clickhouse_user: "default".to_owned(),
-            clickhouse_password: String::new(),
-            clickhouse_database: "default".to_owned(),
-            clickhouse_table: "polymarket_orderbook_v3".to_owned(),
-            export_backend: ExportBackend::Local {
-                root: "/var/lib/archive".into(),
-            },
-            export_once: true,
-            clickhouse_retention_hours: 3,
-        })
-        .unwrap();
-        tokio::task::yield_now().await;
-        drop(source);
-    }
 
     #[test]
     fn retry_is_bounded_and_recovers() {

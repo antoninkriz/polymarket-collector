@@ -501,7 +501,7 @@ fn update_hour_stats(
 
 pub async fn run(cfg: Config) -> Result<()> {
     let archive = build_archive(cfg.export_backend.clone()).await?;
-    let source: Arc<dyn EventSource> = Arc::new(ClickHouseSource::new(cfg.clone())?);
+    let source: Arc<dyn EventSource> = Arc::new(ClickHouseSource::new(cfg.clone()));
     let exporter = Exporter::new(cfg.clone(), source, archive);
 
     info!(

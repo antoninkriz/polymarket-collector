@@ -79,10 +79,6 @@ impl LocalArchive {
         Ok(Self { root })
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     fn target(&self, key: &str) -> Result<PathBuf> {
         validate_archive_key(key)?;
         let relative = Path::new(key);
@@ -616,7 +612,7 @@ mod tests {
         archive.put_bytes(key, b"second").unwrap();
 
         let mut contents = Vec::new();
-        File::open(archive.root().join(key))
+        File::open(archive.root.join(key))
             .unwrap()
             .read_to_end(&mut contents)
             .unwrap();
@@ -627,7 +623,7 @@ mod tests {
         assert_eq!(archive.get("missing", 10).unwrap(), None);
         assert!(!archive.exists("2026-08-13/04/manifest.json").unwrap());
         assert_eq!(
-            fs::read_dir(archive.root().join("2026-08-13/04"))
+            fs::read_dir(archive.root.join("2026-08-13/04"))
                 .unwrap()
                 .count(),
             1
@@ -647,7 +643,7 @@ mod tests {
         #[cfg(unix)]
         {
             fs::write(directory.path().join("outside"), b"outside").unwrap();
-            std::os::unix::fs::symlink(directory.path(), archive.root().join("escape")).unwrap();
+            std::os::unix::fs::symlink(directory.path(), archive.root.join("escape")).unwrap();
             assert!(archive.put_bytes("escape/outside", b"bad").is_err());
             assert!(archive.exists("escape/outside").is_err());
             assert!(archive.get("escape/outside", 32).is_err());
