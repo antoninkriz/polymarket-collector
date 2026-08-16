@@ -2,6 +2,27 @@
 
 This repository collects Polymarket's public market WebSocket feed across active binary markets, discovers short-lived contracts such as 5-minute BTC up/down markets, preserves collector order for deterministic orderbook reconstruction, and exports each UTC receive-time hour as compact event-specific Parquet files.
 
+
+## How is this collector different?
+
+Compared with [PMXT's original collector](https://github.com/pmxt-dev/polymarket-orderbook-collector), which the [PMXT archive](https://archive.pmxt.dev/) and its successor [AG6 archive](https://polymarket-archive.ag6.ai/) are based on, this implementation focuses on producing a more complete and reliably reconstructible dataset. This is not a simple in-place replacement, but rather a substantial rewrite with different output formats, improved stability and performance.
+
+The main differences are:
+
+- **Actually reconstructible orderbooks:** one collector-wide `sequence` number preserves the accepted order across WebSocket frames and event types. When the collector has to reconnect, price changes are withheld until a fresh book snapshot provides a valid reconstruction point.
+- **All supported event types:** the archiver includes not only `book`, `price_change`, `last_trade_price` and `tick_size_change` events, but also `best_bid_ask`, `new_market`, and `market_resolved` events.
+- **Faster market discovery:** dedicated lifecycle connections normally discover and subscribe to new markets as they are announced, with Gamma polling as a fallback. This reduces discovery lag for short-lived markets such as 5-minute BTC contracts instead of waiting for the next periodic Gamma poll.
+- **Cleaner file structure:** each event type has its own typed Parquet file with exact decimal values. Files can be queried independently or merged by `sequence` to recover the complete accepted event order.
+- **Rust only:** the collector, writer, and exporter are now written purely in Rust, replacing the previous mixed Rust/Python application code. That means fewer runtimes to babysit and, naturally, being *BlAZinG fAsT with seAmLEsS CoNcuRReNcy and zerO COsT aBstrActIOnS* 🚀🦀✨ or something.
+
+
+## Where to find the data
+
+There is no known archive running this version yet.
+
+To generate this dataset yourself, follow [Local development and execution](#local-development-and-execution), or [Run in production](#run-in-production) for a long-running R2 deployment.
+
+
 ## The archive structure TLDR
 
 Every completed UTC receive-time hour is a self-contained directory:
