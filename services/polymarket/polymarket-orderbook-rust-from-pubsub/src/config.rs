@@ -28,10 +28,10 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Result<Self> {
         let clickhouse_host = env_or("CLICKHOUSE_HOST", "localhost");
-        let clickhouse_port = env_u16_or("CLICKHOUSE_PORT", 8123)?;
-        let flush_batch_size = env_usize_or("FLUSH_BATCH_SIZE", DEFAULT_FLUSH_BATCH_SIZE)?;
+        let clickhouse_port = env_parse("CLICKHOUSE_PORT", 8123_u16)?;
+        let flush_batch_size = env_parse("FLUSH_BATCH_SIZE", DEFAULT_FLUSH_BATCH_SIZE)?;
         let flush_interval =
-            Duration::from_millis(env_u64_or("FLUSH_INTERVAL_MS", DEFAULT_FLUSH_INTERVAL_MS)?);
+            Duration::from_millis(env_parse("FLUSH_INTERVAL_MS", DEFAULT_FLUSH_INTERVAL_MS)?);
         validate_writer_settings(flush_batch_size, flush_interval)?;
 
         Ok(Self {
@@ -39,7 +39,7 @@ impl Config {
             redis_event_stream: env_or("REDIS_EVENT_STREAM", "polymarket:events:v3"),
             stream_consumer_group: env_or("EVENT_CONSUMER_GROUP", "polymarket-clickhouse-v3"),
             stream_consumer_name: env_or("EVENT_CONSUMER_NAME", "polymarket-clickhouse-v3-1"),
-            pubsub_reconnect_delay: Duration::from_millis(env_u64_or(
+            pubsub_reconnect_delay: Duration::from_millis(env_parse(
                 "STREAM_RECONNECT_DELAY_MS",
                 2_000,
             )?),
@@ -62,31 +62,15 @@ fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
-fn env_u16_or(name: &str, default: u16) -> Result<u16> {
-    match std::env::var(name) {
-        Ok(value) => value
+fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> Result<T>
+where
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    std::env::var(name).map_or(Ok(default), |value| {
+        value
             .parse()
-            .with_context(|| format!("parse env var {name} as u16")),
-        Err(_) => Ok(default),
-    }
-}
-
-fn env_u64_or(name: &str, default: u64) -> Result<u64> {
-    match std::env::var(name) {
-        Ok(value) => value
-            .parse()
-            .with_context(|| format!("parse env var {name} as u64")),
-        Err(_) => Ok(default),
-    }
-}
-
-fn env_usize_or(name: &str, default: usize) -> Result<usize> {
-    match std::env::var(name) {
-        Ok(value) => value
-            .parse()
-            .with_context(|| format!("parse env var {name} as usize")),
-        Err(_) => Ok(default),
-    }
+            .with_context(|| format!("parse env var {name}"))
+    })
 }
 
 fn validate_writer_settings(batch_size: usize, flush_interval: Duration) -> Result<()> {
