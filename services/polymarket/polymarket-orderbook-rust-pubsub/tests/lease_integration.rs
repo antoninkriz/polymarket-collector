@@ -7,10 +7,10 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use polymarket_orderbook_rust::events::Event;
-use polymarket_orderbook_rust::record::CollectorContext;
+use polymarket_orderbook_rust_pubsub::events::Event;
 use polymarket_orderbook_rust_pubsub::lease::{PublisherLease, PublisherLeaseConfig};
 use polymarket_orderbook_rust_pubsub::pubsub_sink::{PubSubSink, PubSubSinkConfig};
+use polymarket_orderbook_rust_pubsub::record::{CollectorContext, EventRecord};
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
@@ -28,7 +28,7 @@ fn lease_config(suffix: &str) -> PublisherLeaseConfig {
     }
 }
 
-fn records(generation: u64) -> [polymarket_orderbook_rust::record::EventRecord; 2] {
+fn records(generation: u64) -> [EventRecord; 2] {
     let collector = CollectorContext::with_publisher_generation(generation);
     let event = Event::LastTradePrice {
         market: "m".into(),

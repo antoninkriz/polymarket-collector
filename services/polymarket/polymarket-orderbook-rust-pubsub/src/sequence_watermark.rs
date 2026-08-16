@@ -9,9 +9,8 @@ use std::time::Duration;
 use anyhow::{ensure, Context, Result};
 use reqwest::Client;
 
-use polymarket_orderbook_rust::record::sequence_generation;
-
 use crate::config::Config;
+use crate::record::sequence_generation;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 

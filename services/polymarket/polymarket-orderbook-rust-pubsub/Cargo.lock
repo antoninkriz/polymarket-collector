@@ -1021,11 +1021,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
-name = "polymarket-orderbook-rust"
+name = "polymarket-orderbook-rust-pubsub"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "dotenvy",
  "futures-util",
  "redis",
  "reqwest",
@@ -1034,21 +1035,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
- "tracing",
-]
-
-[[package]]
-name = "polymarket-orderbook-rust-pubsub"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "dotenvy",
- "polymarket-orderbook-rust",
- "redis",
- "reqwest",
- "serde_json",
- "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",

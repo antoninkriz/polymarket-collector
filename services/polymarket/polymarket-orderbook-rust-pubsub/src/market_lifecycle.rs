@@ -6,13 +6,11 @@ use anyhow::{ensure, Context, Result};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
-use polymarket_orderbook_rust::events::{Market, MarketLifecycle, MarketLifecycleObservation};
-use polymarket_orderbook_rust::markets;
-use polymarket_orderbook_rust::markets::gamma::GammaMarket;
-use polymarket_orderbook_rust::markets::lifecycle::{
-    ActiveMarketSnapshot, LifecycleRequest, LifecycleSource,
-};
-use polymarket_orderbook_rust::ws::pool::Pool;
+use crate::events::{Market, MarketLifecycle, MarketLifecycleObservation};
+use crate::markets;
+use crate::markets::gamma::GammaMarket;
+use crate::markets::lifecycle::{ActiveMarketSnapshot, LifecycleRequest, LifecycleSource};
+use crate::ws::pool::Pool;
 
 #[derive(Debug, Clone)]
 enum PlannedObservation {
@@ -303,8 +301,7 @@ pub struct LifecycleCoordinator {
     state: LifecycleState,
     websocket_rx: mpsc::Receiver<MarketLifecycleObservation>,
     reconciliation_rx: mpsc::Receiver<LifecycleRequest>,
-    shutdown_rx:
-        oneshot::Receiver<polymarket_orderbook_rust::markets::lifecycle::LifecycleCompletion>,
+    shutdown_rx: oneshot::Receiver<crate::markets::lifecycle::LifecycleCompletion>,
 }
 
 impl LifecycleCoordinator {
@@ -312,9 +309,7 @@ impl LifecycleCoordinator {
         pool: Pool,
         websocket_rx: mpsc::Receiver<MarketLifecycleObservation>,
         reconciliation_rx: mpsc::Receiver<LifecycleRequest>,
-        shutdown_rx: oneshot::Receiver<
-            polymarket_orderbook_rust::markets::lifecycle::LifecycleCompletion,
-        >,
+        shutdown_rx: oneshot::Receiver<crate::markets::lifecycle::LifecycleCompletion>,
     ) -> Self {
         Self {
             pool,
@@ -352,7 +347,7 @@ impl LifecycleCoordinator {
 
     async fn run_until_shutdown(
         &mut self,
-    ) -> Result<Option<polymarket_orderbook_rust::markets::lifecycle::LifecycleCompletion>> {
+    ) -> Result<Option<crate::markets::lifecycle::LifecycleCompletion>> {
         let mut websocket_open = true;
         let mut reconciliation_open = true;
         while websocket_open || reconciliation_open {
@@ -531,7 +526,7 @@ impl LifecycleCoordinator {
 }
 
 fn complete_or_fail(
-    completion: polymarket_orderbook_rust::markets::lifecycle::LifecycleCompletion,
+    completion: crate::markets::lifecycle::LifecycleCompletion,
     result: Result<()>,
 ) -> Result<()> {
     match result {
@@ -584,7 +579,7 @@ fn canonical_asset_refs(assets: &[String]) -> [&str; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polymarket_orderbook_rust::events::Event;
+    use crate::events::Event;
 
     fn market(hash: &str, first: &str, second: &str) -> Market {
         Market::new(hash.into(), first.into(), second.into())

@@ -1,8 +1,6 @@
 //! Polymarket orderbook → durable Redis Stream publisher.
 //!
-//! Mirrors the streaming pipeline of the sibling `polymarket-orderbook-rust`
-//! service, but the terminal sink appends v3 records to a Redis Stream
-//! instead of inserting into ClickHouse.
+//! Collects the full market stream and appends v3 records to durable Redis.
 //!
 //! ```text
 //!   Redis restart cache + Gamma reconciliation ──────┐
@@ -19,18 +17,17 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use polymarket_orderbook_rust::events::{Market, MarketLifecycleObservation};
-use polymarket_orderbook_rust::markets;
-use polymarket_orderbook_rust::markets::lifecycle::LifecycleRequest;
-use polymarket_orderbook_rust::record::EventRecord;
-use polymarket_orderbook_rust::ws::pool::{Pool, PoolStats};
-
 use polymarket_orderbook_rust_pubsub::config::Config;
+use polymarket_orderbook_rust_pubsub::events::{Market, MarketLifecycleObservation};
 use polymarket_orderbook_rust_pubsub::gamma_reconcile::{self, ReconciliationProgress};
 use polymarket_orderbook_rust_pubsub::lease::{PublisherLease, PublisherLeaseConfig};
 use polymarket_orderbook_rust_pubsub::market_lifecycle::LifecycleCoordinator;
+use polymarket_orderbook_rust_pubsub::markets;
+use polymarket_orderbook_rust_pubsub::markets::lifecycle::LifecycleRequest;
 use polymarket_orderbook_rust_pubsub::pubsub_sink::{PubSubSink, PubSubSinkConfig};
+use polymarket_orderbook_rust_pubsub::record::EventRecord;
 use polymarket_orderbook_rust_pubsub::sequence_watermark::clickhouse_generation_floor;
+use polymarket_orderbook_rust_pubsub::ws::pool::{Pool, PoolStats};
 
 const CACHE_BOOTSTRAP_BATCH_SIZE: usize = 100;
 // A valid restart cache is much faster than a full Gamma scan, but opening the
@@ -346,7 +343,7 @@ async fn request_pool_stats(lifecycle_tx: &mpsc::Sender<LifecycleRequest>) -> Re
 
 async fn request_coordinator_shutdown(
     shutdown_tx: oneshot::Sender<
-        polymarket_orderbook_rust::markets::lifecycle::LifecycleCompletion,
+        polymarket_orderbook_rust_pubsub::markets::lifecycle::LifecycleCompletion,
     >,
 ) -> Result<()> {
     let (completion, completed) = oneshot::channel();

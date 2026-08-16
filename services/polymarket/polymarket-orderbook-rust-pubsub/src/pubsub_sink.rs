@@ -13,7 +13,7 @@ use redis::Script;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
-use polymarket_orderbook_rust::record::EventRecord;
+use crate::record::EventRecord;
 
 #[derive(Debug, Clone)]
 pub struct PubSubSinkConfig {

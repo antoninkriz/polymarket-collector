@@ -1,7 +1,4 @@
 //! Runtime configuration loaded from environment variables.
-//!
-//! Standalone from the upstream `polymarket-orderbook-rust` config because
-//! this service appends v3 records to Redis and has no ClickHouse dependency.
 
 use std::time::Duration;
 

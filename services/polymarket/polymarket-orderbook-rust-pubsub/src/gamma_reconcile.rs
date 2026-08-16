@@ -8,12 +8,10 @@ use chrono::{DateTime, TimeDelta, Utc};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{info, warn};
 
-use polymarket_orderbook_rust::events::{Event, Market, MarketLifecycleObservation};
-use polymarket_orderbook_rust::markets::gamma::{GammaClient, GammaMarket};
-use polymarket_orderbook_rust::markets::lifecycle::{
-    ActiveMarketSnapshot, LifecycleRequest, LifecycleSource,
-};
-use polymarket_orderbook_rust::markets::redis_cache::{self, CacheDocument};
+use crate::events::{Event, Market, MarketLifecycleObservation};
+use crate::markets::gamma::{GammaClient, GammaMarket};
+use crate::markets::lifecycle::{ActiveMarketSnapshot, LifecycleRequest, LifecycleSource};
+use crate::markets::redis_cache::{self, CacheDocument};
 
 const FULL_SCAN_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const FULL_SCAN_RETRY_INTERVAL: Duration = Duration::from_secs(30);
@@ -347,7 +345,7 @@ pub async fn run_closed_market_polls(
 
 async fn stream_scan_observations(
     client: &GammaClient,
-    mut scan: polymarket_orderbook_rust::markets::gamma::KeysetScan,
+    mut scan: crate::markets::gamma::KeysetScan,
     lifecycle_tx: &mpsc::Sender<LifecycleRequest>,
     to_observation: fn(&GammaMarket) -> Option<MarketLifecycleObservation>,
 ) -> Result<()> {

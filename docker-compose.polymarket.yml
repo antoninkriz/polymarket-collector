@@ -70,7 +70,7 @@ services:
       # Redis Stream publisher batching
       MAX_BATCH: "200"
       LINGER_MS: "2"
-      RUST_LOG: info,polymarket_orderbook_rust_pubsub=info,polymarket_orderbook_rust=info
+      RUST_LOG: info,polymarket_orderbook_rust_pubsub=info
 
   obdata-polymarket-orderbook-rust-from-pubsub:
     build:
@@ -106,7 +106,7 @@ services:
       CLICKHOUSE_TABLE: polymarket_orderbook_v3
       FLUSH_BATCH_SIZE: "5000"
       FLUSH_INTERVAL_MS: "500"
-      RUST_LOG: info,polymarket_orderbook_rust_from_pubsub=info,polymarket_orderbook_rust=info
+      RUST_LOG: info,polymarket_orderbook_rust_from_pubsub=info
 
   obdata-polymarket-r2-archive-exporter:
     build:

@@ -14,7 +14,7 @@ use tokio::sync::watch;
 use tracing::info;
 use uuid::Uuid;
 
-use polymarket_orderbook_rust::record::SEQUENCE_GENERATION_MAX;
+use crate::record::SEQUENCE_GENERATION_MAX;
 
 const ACQUIRE_SCRIPT: &str = r#"
 if redis.call('EXISTS', KEYS[1]) ~= 0 then
