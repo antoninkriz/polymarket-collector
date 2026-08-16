@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -168,7 +169,8 @@ where
         .flush()
         .with_context(|| format!("flush {event} Parquet file"))?;
     let byte_size = output.byte_size;
-    let sha256 = format!("{:x}", output.hasher.finalize());
+    let digest = output.hasher.finalize();
+    let sha256 = lower_hex(digest.as_ref());
 
     Ok(StagedArtifact {
         file: output.inner,
@@ -180,6 +182,14 @@ where
             max_sequence,
         },
     })
+}
+
+pub(crate) fn lower_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
 }
 
 fn update_sequence_bounds(

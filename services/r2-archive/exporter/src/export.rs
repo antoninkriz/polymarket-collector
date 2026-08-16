@@ -603,7 +603,7 @@ mod tests {
     use tempfile::{NamedTempFile, TempDir};
 
     use super::*;
-    use crate::parquet_file::StagedArtifact;
+    use crate::parquet_file::{StagedArtifact, lower_hex};
 
     fn hour(value: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 13, value, 0, 0).unwrap()
@@ -775,7 +775,7 @@ mod tests {
                 FileStats {
                     row_count: self.rows_per_event,
                     byte_size: data.len() as u64,
-                    sha256: format!("{:x}", Sha256::digest(data)),
+                    sha256: lower_hex(Sha256::digest(data).as_ref()),
                     min_sequence: (self.rows_per_event > 0).then_some(minimum),
                     max_sequence: (self.rows_per_event > 0).then_some(minimum + 1),
                 },
