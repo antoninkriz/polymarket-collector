@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail, ensure};
 use arrow_array::{Array, ListArray, RecordBatch, StructArray, UInt64Array};
 use arrow_cast::cast;
-use arrow_schema::{ArrowError, DataType, Field};
+use arrow_schema::{ArrowError, DataType, Field, SchemaRef};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::{WriterProperties, WriterVersion};
@@ -63,6 +63,14 @@ pub fn writer_properties(event: EventType) -> Result<WriterProperties> {
 
 pub fn cast_batch(event: EventType, batch: &RecordBatch) -> Result<RecordBatch> {
     let target_schema = event.schema();
+    cast_batch_to_schema(event, batch, &target_schema)
+}
+
+fn cast_batch_to_schema(
+    event: EventType,
+    batch: &RecordBatch,
+    target_schema: &SchemaRef,
+) -> Result<RecordBatch> {
     ensure!(
         batch.num_columns() == target_schema.fields().len(),
         "{} source has {} columns, expected {}",
@@ -99,7 +107,7 @@ pub fn cast_batch(event: EventType, batch: &RecordBatch) -> Result<RecordBatch> 
         validate_nullability(converted.as_ref(), target_field, target_field.name())?;
         columns.push(converted);
     }
-    RecordBatch::try_new(target_schema, columns).context("build typed export batch")
+    RecordBatch::try_new(Arc::clone(target_schema), columns).context("build typed export batch")
 }
 
 fn validate_nullability(array: &dyn Array, field: &Field, path: &str) -> Result<()> {
@@ -155,7 +163,7 @@ where
 
     for batch in batches {
         let source = batch.with_context(|| format!("decode {event} Arrow batch"))?;
-        let batch = cast_batch(event, &source)?;
+        let batch = cast_batch_to_schema(event, &source, &schema)?;
         update_sequence_bounds(&batch, &mut row_count, &mut min_sequence, &mut max_sequence)?;
         writer
             .write(&batch)
