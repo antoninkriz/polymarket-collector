@@ -156,8 +156,6 @@ fn build_restart_market_plan(
         );
         missing.push(market);
     }
-    drop(cached_conditions);
-    drop(cached_asset_owners);
     Ok(RestartMarketPlan {
         prioritized: reorder_cached_markets(markets, &priorities),
         missing,

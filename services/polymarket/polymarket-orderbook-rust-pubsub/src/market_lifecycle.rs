@@ -429,12 +429,9 @@ impl LifecycleCoordinator {
                 .await?;
         }
         if !plan.bootstrap.is_empty() {
-            let planned = self.state.plan_bootstrap(plan.bootstrap)?;
-            self.pool
-                .subscribe_markets(&planned)
+            self.apply_bootstrap(plan.bootstrap)
                 .await
-                .context("subscribe Gamma page")?;
-            self.state.commit_bootstrap(&planned);
+                .context("apply Gamma bootstrap page")?;
         }
         Ok(())
     }
