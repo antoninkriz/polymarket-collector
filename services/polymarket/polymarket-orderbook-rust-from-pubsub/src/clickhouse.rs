@@ -1,8 +1,7 @@
-//! Compact Polymarket v3 ClickHouse sink.
+//! ClickHouse storage for the raw Polymarket event stream.
 //!
-//! The sink owns the ClickHouse HTTP client and writes complete caller-owned
-//! batches to the three-column raw event log. Failed inserts retry the same
-//! serialized body so callers can retain delivery ownership until commit.
+//! Failed inserts retry the same serialized batch, allowing the writer actor
+//! to retain Redis delivery ownership until ClickHouse commits it.
 
 use std::time::Duration;
 
@@ -11,16 +10,14 @@ use reqwest::Client;
 use serde::Serialize;
 use tracing::{error, info};
 
-/// One Redis Stream delivery normalized to the ClickHouse raw-row contract.
-#[derive(Debug)]
-pub struct SinkItem {
+#[derive(Debug, Serialize)]
+pub struct RawRow {
     pub timestamp_received: i64,
     pub sequence: u64,
     pub data: String,
-    pub delivery_id: String,
 }
 
-pub struct SinkConfig {
+pub struct ClickHouseConfig {
     pub url: String,
     pub user: String,
     pub password: String,
@@ -28,16 +25,15 @@ pub struct SinkConfig {
     pub table: String,
 }
 
-pub struct Sink {
-    cfg: SinkConfig,
+pub struct ClickHouseSink {
+    cfg: ClickHouseConfig,
     http: Client,
     total_flushed: u64,
     total_failures: u64,
 }
 
-impl Sink {
-    /// Connect to ClickHouse and ensure the compact v3 table exists.
-    pub async fn connect(cfg: SinkConfig) -> Result<Self> {
+impl ClickHouseSink {
+    pub async fn connect(cfg: ClickHouseConfig) -> Result<Self> {
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -61,13 +57,15 @@ impl Sink {
         Ok(sink)
     }
 
-    /// Insert one complete batch, retrying transient ClickHouse failures.
-    pub async fn insert(&mut self, batch: &[SinkItem]) -> Result<()> {
-        if batch.is_empty() {
+    pub async fn insert<'a>(
+        &mut self,
+        rows: impl ExactSizeIterator<Item = &'a RawRow>,
+    ) -> Result<()> {
+        let count = rows.len();
+        if count == 0 {
             return Ok(());
         }
-        let count = batch.len();
-        let body = Self::serialize_batch(batch).context("serialize ClickHouse batch")?;
+        let body = Self::serialize_batch(rows).context("serialize ClickHouse batch")?;
         let mut retry_delay = Duration::from_secs(1);
         loop {
             match self.send_insert(body.clone()).await {
@@ -99,18 +97,10 @@ impl Sink {
         self.total_failures
     }
 
-    fn serialize_batch(batch: &[SinkItem]) -> Result<Vec<u8>> {
-        let mut body = Vec::with_capacity(batch.len() * 256);
-        for item in batch {
-            serde_json::to_writer(
-                &mut body,
-                &RawRow {
-                    timestamp_received: item.timestamp_received,
-                    sequence: item.sequence,
-                    data: &item.data,
-                },
-            )
-            .context("serialize v3 row")?;
+    fn serialize_batch<'a>(rows: impl ExactSizeIterator<Item = &'a RawRow>) -> Result<Vec<u8>> {
+        let mut body = Vec::with_capacity(rows.len() * 256);
+        for row in rows {
+            serde_json::to_writer(&mut body, row).context("serialize v3 row")?;
             body.push(b'\n');
         }
         Ok(body)
@@ -203,84 +193,52 @@ impl Sink {
     }
 }
 
-#[derive(Serialize)]
-struct RawRow<'a> {
-    timestamp_received: i64,
-    sequence: u64,
-    data: &'a str,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::Event;
-    use crate::record::CollectorContext;
-    use rust_decimal::Decimal;
 
-    fn dec(value: &str) -> Decimal {
-        value.parse().unwrap()
-    }
-
-    fn item(event: Event, sequence: u64) -> SinkItem {
-        let collector = CollectorContext::with_publisher_generation(42);
-        let mut record = collector.record(event, 1_757_908_892_351_123_456);
-        record.sequence += sequence;
-        SinkItem {
-            timestamp_received: record.timestamp_received_ns,
-            sequence: record.sequence,
-            data: serde_json::to_string(&record.event).unwrap(),
-            delivery_id: format!("{sequence}-0"),
+    fn row(sequence: u64, data: &str) -> RawRow {
+        RawRow {
+            timestamp_received: 1_757_908_892_351_123_456,
+            sequence,
+            data: data.into(),
         }
     }
 
     #[test]
     fn serializes_only_receive_time_sequence_and_event_json() {
-        let batch = [item(
-            Event::LastTradePrice {
-                market: "m".into(),
-                asset_id: "a".into(),
-                timestamp: "not-interpreted-by-the-raw-sink".into(),
-                price: dec("0.42"),
-                size: dec("75"),
-                side: "BUY".into(),
-                fee_rate_bps: "10".into(),
-                transaction_hash: "0xtx".into(),
-            },
-            0,
+        let batch = [row(
+            42,
+            r#"{"event_type":"last_trade_price","timestamp":"not-interpreted-by-the-raw-sink","transaction_hash":"0xtx"}"#,
         )];
 
-        let body = Sink::serialize_batch(&batch).unwrap();
-        let row: serde_json::Value =
+        let body = ClickHouseSink::serialize_batch(batch.iter()).unwrap();
+        let value: serde_json::Value =
             serde_json::from_slice(body.strip_suffix(b"\n").unwrap()).unwrap();
-        assert_eq!(row.as_object().unwrap().len(), 3);
-        assert_eq!(row["timestamp_received"], 1_757_908_892_351_123_456_i64);
-        assert_eq!(row["sequence"], 42_u64 << 48);
-        let event: serde_json::Value = serde_json::from_str(row["data"].as_str().unwrap()).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 3);
+        assert_eq!(value["timestamp_received"], 1_757_908_892_351_123_456_i64);
+        assert_eq!(value["sequence"], 42_u64);
+        let event: serde_json::Value =
+            serde_json::from_str(value["data"].as_str().unwrap()).unwrap();
         assert_eq!(event["timestamp"], "not-interpreted-by-the-raw-sink");
         assert_eq!(event["transaction_hash"], "0xtx");
     }
 
     #[test]
     fn identical_public_events_keep_distinct_sequences() {
-        let event = Event::TickSizeChange {
-            market: "m".into(),
-            asset_id: "a".into(),
-            timestamp: "1".into(),
-            old_tick_size: dec("0.01"),
-            new_tick_size: dec("0.001"),
-        };
-        let batch = [item(event.clone(), 0), item(event, 1)];
+        let data =
+            r#"{"event_type":"tick_size_change","old_tick_size":"0.01","new_tick_size":"0.001"}"#;
+        let batch = [row(42, data), row(43, data)];
 
-        let body = Sink::serialize_batch(&batch).unwrap();
+        let body = ClickHouseSink::serialize_batch(batch.iter()).unwrap();
         let rows = std::str::from_utf8(&body)
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[1]["sequence"].as_u64(),
-            rows[0]["sequence"].as_u64().map(|v| v + 1)
-        );
+        assert_eq!(rows[0]["sequence"], 42_u64);
+        assert_eq!(rows[1]["sequence"], 43_u64);
+        assert_eq!(rows[0]["data"], rows[1]["data"]);
     }
 }

@@ -10,18 +10,15 @@ name = "polymarket-orderbook-rust-from-pubsub"
 path = "src/main.rs"
 
 [dependencies]
-polymarket-orderbook-rust = { path = "../../../shared/rust/polymarket-orderbook-rust" }
-
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 redis = { version = "1.5.0", default-features = false, features = ["streams", "tokio-comp"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["query", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
 dotenvy = "0.15.7"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json"] }
 anyhow = "1.0.104"
-
-[dev-dependencies]
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 
 [profile.release]
 opt-level = 3

@@ -3,7 +3,7 @@ name = "polymarket-orderbook-rust"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Polymarket orderbook library: WS connection pool, REST client, ClickHouse sink, and shared event types used by the polymarket-orderbook-rust-pubsub and polymarket-orderbook-rust-from-pubsub binaries"
+description = "Polymarket market events, API clients, and WebSocket connection pool used by the Redis publisher"
 
 [lib]
 path = "src/lib.rs"
@@ -14,7 +14,7 @@ tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "s
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 
-# HTTP client (used for both ClickHouse inserts and Gamma API)
+# HTTP client for the Gamma API
 reqwest = { version = "0.13.4", default-features = false, features = ["gzip", "http2", "json", "query", "rustls"] }
 
 # Redis restart cache

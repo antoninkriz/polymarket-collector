@@ -1,4 +1,4 @@
-//! End-to-end compact v3 sink test against a disposable ClickHouse instance.
+//! End-to-end raw-row sink test against a disposable ClickHouse instance.
 //!
 //! Run with ClickHouse listening on `localhost:8124`:
 //!
@@ -7,11 +7,8 @@
 //! ```
 
 use anyhow::Result;
-use polymarket_orderbook_rust::events::Event;
-use polymarket_orderbook_rust::record::{CollectorContext, EventRecord};
-use polymarket_orderbook_rust::sink::{Sink, SinkConfig, SinkItem};
+use polymarket_orderbook_rust_from_pubsub::clickhouse::{ClickHouseConfig, ClickHouseSink, RawRow};
 use reqwest::Client;
-use rust_decimal::Decimal;
 
 const CH_URL: &str = "http://localhost:8124";
 const CH_USER: &str = "default";
@@ -22,16 +19,11 @@ fn ch_password() -> String {
     std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default()
 }
 
-fn dec(value: &str) -> Decimal {
-    value.parse().unwrap()
-}
-
-fn item(record: EventRecord, delivery_id: &str) -> SinkItem {
-    SinkItem {
-        timestamp_received: record.timestamp_received_ns,
-        sequence: record.sequence,
-        data: serde_json::to_string(&record.event).unwrap(),
-        delivery_id: delivery_id.into(),
+fn row(timestamp_received: i64, sequence: u64, data: &str) -> RawRow {
+    RawRow {
+        timestamp_received,
+        sequence,
+        data: data.into(),
     }
 }
 
@@ -58,7 +50,7 @@ async fn sink_collapses_only_same_sequence_retry() -> Result<()> {
     )
     .await?;
 
-    let mut sink = Sink::connect(SinkConfig {
+    let mut sink = ClickHouseSink::connect(ClickHouseConfig {
         url: CH_URL.into(),
         user: CH_USER.into(),
         password: ch_password(),
@@ -66,26 +58,25 @@ async fn sink_collapses_only_same_sequence_retry() -> Result<()> {
         table: CH_TABLE.into(),
     })
     .await?;
-    let trade = Event::LastTradePrice {
-        market: "0xmarket".into(),
-        asset_id: "asset".into(),
-        timestamp: "1757908892351".into(),
-        price: dec("0.42"),
-        size: dec("75"),
-        side: "BUY".into(),
-        fee_rate_bps: "10".into(),
-        transaction_hash: "0xsame-transaction".into(),
-    };
-    let collector = CollectorContext::with_publisher_generation(7);
-    let first = collector.record(trade.clone(), 1_757_908_892_351_123_456);
-    let second = collector.record(trade, 1_757_908_892_351_123_457);
-
+    let data = serde_json::json!({
+        "event_type": "last_trade_price",
+        "market": "0xmarket",
+        "asset_id": "asset",
+        "timestamp": "1757908892351",
+        "price": "0.42",
+        "size": "75",
+        "side": "BUY",
+        "fee_rate_bps": "10",
+        "transaction_hash": "0xsame-transaction",
+    })
+    .to_string();
+    let first_sequence = 7_u64 << 48;
     let batch = [
-        item(first.clone(), "1-0"),
-        item(first, "1-1"),
-        item(second, "1-2"),
+        row(1_757_908_892_351_123_456, first_sequence, &data),
+        row(1_757_908_892_351_123_456, first_sequence, &data),
+        row(1_757_908_892_351_123_457, first_sequence + 1, &data),
     ];
-    sink.insert(&batch).await?;
+    sink.insert(batch.iter()).await?;
     assert_eq!(sink.total_flushed(), 3);
     assert_eq!(sink.total_failures(), 0);
 
@@ -107,7 +98,6 @@ async fn sink_collapses_only_same_sequence_retry() -> Result<()> {
     .await?;
     let rows = rows.lines().collect::<Vec<_>>();
     assert_eq!(rows.len(), 2);
-    let first_sequence = 7_u64 << 48;
     assert!(rows[0].starts_with(&format!("{first_sequence}\t1757908892351123456\t")));
     assert!(rows[1].starts_with(&format!("{}\t1757908892351123457\t", first_sequence + 1,)));
     assert!(rows.iter().all(|row| row.contains("0xsame-transaction")));

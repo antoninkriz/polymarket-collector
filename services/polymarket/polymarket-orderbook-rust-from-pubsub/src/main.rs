@@ -14,8 +14,7 @@ use anyhow::{Context, Result};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use polymarket_orderbook_rust::sink::{Sink, SinkConfig};
-
+use polymarket_orderbook_rust_from_pubsub::clickhouse::{ClickHouseConfig, ClickHouseSink};
 use polymarket_orderbook_rust_from_pubsub::config::Config;
 use polymarket_orderbook_rust_from_pubsub::pubsub_subscriber::{Writer, WriterConfig};
 
@@ -36,7 +35,7 @@ async fn main() -> Result<()> {
         "starting polymarket-orderbook-rust-from-pubsub",
     );
 
-    let sink = Sink::connect(SinkConfig {
+    let sink = ClickHouseSink::connect(ClickHouseConfig {
         url: cfg.clickhouse_url.clone(),
         user: cfg.clickhouse_user.clone(),
         password: cfg.clickhouse_password.clone(),

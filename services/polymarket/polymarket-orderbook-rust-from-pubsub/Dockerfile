@@ -15,9 +15,6 @@ RUN apt-get update \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY shared/rust/polymarket-orderbook-rust/Cargo.toml ./shared/rust/polymarket-orderbook-rust/Cargo.toml
-COPY shared/rust/polymarket-orderbook-rust/src ./shared/rust/polymarket-orderbook-rust/src
-
 COPY services/polymarket/polymarket-orderbook-rust-from-pubsub/Cargo.toml ./services/polymarket/polymarket-orderbook-rust-from-pubsub/Cargo.toml
 COPY services/polymarket/polymarket-orderbook-rust-from-pubsub/Cargo.lock ./services/polymarket/polymarket-orderbook-rust-from-pubsub/Cargo.lock
 COPY services/polymarket/polymarket-orderbook-rust-from-pubsub/src ./services/polymarket/polymarket-orderbook-rust-from-pubsub/src

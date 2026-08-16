@@ -10,7 +10,7 @@ use std::fmt::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use polymarket_orderbook_rust::sink::{Sink, SinkConfig};
+use polymarket_orderbook_rust_from_pubsub::clickhouse::{ClickHouseConfig, ClickHouseSink};
 use polymarket_orderbook_rust_from_pubsub::pubsub_subscriber::{Writer, WriterConfig};
 use reqwest::Client;
 use tokio::sync::watch;
@@ -152,7 +152,7 @@ async fn writer_drains_pending_and_flushes_before_shutdown_ack() -> Result<()> {
         .query_async(&mut conn)
         .await?;
 
-    let sink = Sink::connect(SinkConfig {
+    let sink = ClickHouseSink::connect(ClickHouseConfig {
         url: CLICKHOUSE_URL.into(),
         user: "default".into(),
         password: clickhouse_password(),

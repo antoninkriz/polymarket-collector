@@ -14,7 +14,7 @@ use serde_json::value::RawValue;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use polymarket_orderbook_rust::sink::{Sink, SinkItem};
+use crate::clickhouse::{ClickHouseSink, RawRow};
 
 const READ_COUNT: usize = 1_000;
 const READ_BLOCK_MS: usize = 1_000;
@@ -41,11 +41,17 @@ struct WriterStats {
     reconnects: u64,
 }
 
+#[derive(Debug)]
+struct PendingEntry {
+    row: RawRow,
+    delivery_id: String,
+}
+
 pub struct Writer {
     cfg: WriterConfig,
     redis: redis::Client,
-    sink: Sink,
-    batch: Vec<SinkItem>,
+    sink: ClickHouseSink,
+    batch: Vec<PendingEntry>,
     committed_unacked: Vec<String>,
     batch_deadline: Option<Instant>,
     batch_high_water: usize,
@@ -54,7 +60,7 @@ pub struct Writer {
 }
 
 impl Writer {
-    pub fn new(redis_url: &str, cfg: WriterConfig, sink: Sink) -> Result<Self> {
+    pub fn new(redis_url: &str, cfg: WriterConfig, sink: ClickHouseSink) -> Result<Self> {
         anyhow::ensure!(cfg.batch_size > 0, "writer batch size must be positive");
         anyhow::ensure!(
             !cfg.flush_interval.is_zero(),
@@ -230,7 +236,9 @@ impl Writer {
             "cannot commit a new batch while Redis acknowledgements are pending",
         );
         let committed = self.batch.len() as u64;
-        self.sink.insert(&self.batch).await?;
+        self.sink
+            .insert(self.batch.iter().map(|entry| &entry.row))
+            .await?;
         self.stats.events_committed += committed;
         self.committed_unacked
             .extend(self.batch.drain(..).map(|item| item.delivery_id));
@@ -410,7 +418,7 @@ fn ack_delete_counts(statuses: &[i64], expected: usize) -> Result<(u64, u64)> {
     Ok((acknowledged, deleted))
 }
 
-fn parse_stream_entry(entry: &StreamId, stats: &mut WriterStats) -> Result<SinkItem> {
+fn parse_stream_entry(entry: &StreamId, stats: &mut WriterStats) -> Result<PendingEntry> {
     let result = parse_stream_entry_fields(entry).with_context(|| {
         format!(
             "parse v3 stream entry {}; fields={}",
@@ -424,7 +432,7 @@ fn parse_stream_entry(entry: &StreamId, stats: &mut WriterStats) -> Result<SinkI
     result
 }
 
-fn parse_stream_entry_fields(entry: &StreamId) -> Result<SinkItem> {
+fn parse_stream_entry_fields(entry: &StreamId) -> Result<PendingEntry> {
     let has_raw_fields = entry.map.len() == 3
         && entry.map.contains_key("timestamp_received")
         && entry.map.contains_key("sequence")
@@ -450,10 +458,12 @@ fn parse_stream_entry_fields(entry: &StreamId) -> Result<SinkItem> {
         raw.get().trim_start().starts_with('{'),
         "data must be a JSON object"
     );
-    Ok(SinkItem {
-        timestamp_received,
-        sequence,
-        data: data.to_owned(),
+    Ok(PendingEntry {
+        row: RawRow {
+            timestamp_received,
+            sequence,
+            data: data.to_owned(),
+        },
         delivery_id: entry.id.clone(),
     })
 }
@@ -566,9 +576,9 @@ mod tests {
 
         let item = parse_stream_entry(&entry, &mut stats).unwrap();
 
-        assert_eq!(item.timestamp_received, 1_757_908_892_351_123_456);
-        assert_eq!(item.sequence, 42);
-        assert_eq!(item.data, data);
+        assert_eq!(item.row.timestamp_received, 1_757_908_892_351_123_456);
+        assert_eq!(item.row.sequence, 42);
+        assert_eq!(item.row.data, data);
         assert_eq!(stats.parse_failures, 0);
     }
 
