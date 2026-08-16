@@ -1,8 +1,6 @@
 //! Background Gamma reconciliation and Rust-owned restart-cache persistence.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
@@ -27,23 +25,47 @@ const RESTART_PRIORITY_PAGES: usize = 20;
 const GAMMA_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CacheBaseline {
-    active_scan_complete: bool,
-    closed_catchup_complete: bool,
+pub struct ReconciliationProgress {
+    full_scan_completed_at: Option<DateTime<Utc>>,
+    new_markets_through: Option<DateTime<Utc>>,
+    resolutions_through: Option<DateTime<Utc>>,
+    cache_saved_at: Option<DateTime<Utc>>,
 }
 
-impl CacheBaseline {
-    pub fn is_complete(self) -> bool {
-        self.active_scan_complete && self.closed_catchup_complete
+impl ReconciliationProgress {
+    pub fn safe_fetched_at(self) -> Option<DateTime<Utc>> {
+        self.full_scan_completed_at?;
+        Some(self.new_markets_through?.min(self.resolutions_through?) - POLL_OVERLAP)
     }
-}
 
-#[derive(Default)]
-pub struct ReconciliationStats {
-    full_scan_success_ms: AtomicI64,
-    new_poll_success_ms: AtomicI64,
-    closed_poll_success_ms: AtomicI64,
-    cache_save_success_ms: AtomicI64,
+    pub fn ages(&self) -> ReconciliationAges {
+        self.ages_at(Utc::now())
+    }
+
+    fn ages_at(self, now: DateTime<Utc>) -> ReconciliationAges {
+        ReconciliationAges {
+            full_scan_seconds: age_seconds(now, self.full_scan_completed_at),
+            new_poll_seconds: age_seconds(now, self.new_markets_through),
+            closed_poll_seconds: age_seconds(now, self.resolutions_through),
+            cache_save_seconds: age_seconds(now, self.cache_saved_at),
+        }
+    }
+
+    fn record_full_scan(&mut self, completed_at: DateTime<Utc>) {
+        advance(&mut self.full_scan_completed_at, completed_at);
+    }
+
+    fn record_new_markets(&mut self, through: DateTime<Utc>) {
+        advance(&mut self.new_markets_through, through);
+    }
+
+    fn record_resolutions(&mut self, through: DateTime<Utc>) {
+        advance(&mut self.resolutions_through, through);
+    }
+
+    fn record_cache_save(&mut self, saved_at: DateTime<Utc>) {
+        advance(&mut self.cache_saved_at, saved_at);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -52,24 +74,6 @@ pub struct ReconciliationAges {
     pub new_poll_seconds: Option<u64>,
     pub closed_poll_seconds: Option<u64>,
     pub cache_save_seconds: Option<u64>,
-}
-
-impl ReconciliationStats {
-    pub fn ages(&self) -> ReconciliationAges {
-        let now = Utc::now().timestamp_millis();
-        ReconciliationAges {
-            full_scan_seconds: age_seconds(now, self.full_scan_success_ms.load(Ordering::Relaxed)),
-            new_poll_seconds: age_seconds(now, self.new_poll_success_ms.load(Ordering::Relaxed)),
-            closed_poll_seconds: age_seconds(
-                now,
-                self.closed_poll_success_ms.load(Ordering::Relaxed),
-            ),
-            cache_save_seconds: age_seconds(
-                now,
-                self.cache_save_success_ms.load(Ordering::Relaxed),
-            ),
-        }
-    }
 }
 
 pub struct RestartMarketPlan {
@@ -212,9 +216,7 @@ pub async fn run_full_scans(
     client: GammaClient,
     lifecycle_tx: mpsc::Sender<LifecycleRequest>,
     cold_start: bool,
-    cache_progress: watch::Sender<CacheBaseline>,
-    force_cache_save: mpsc::Sender<()>,
-    stats: Arc<ReconciliationStats>,
+    progress: watch::Sender<ReconciliationProgress>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut first = true;
@@ -226,11 +228,7 @@ pub async fn run_full_scans(
                     warn!(%error, "full Gamma reconciliation failed");
                     false
                 } else {
-                    stats
-                        .full_scan_success_ms
-                        .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
-                    cache_progress.send_modify(|progress| progress.active_scan_complete = true);
-                    let _ = force_cache_save.try_send(());
+                    progress.send_modify(|progress| progress.record_full_scan(Utc::now()));
                     true
                 }
             }
@@ -293,7 +291,7 @@ pub async fn run_new_market_polls(
     client: GammaClient,
     lifecycle_tx: mpsc::Sender<LifecycleRequest>,
     initial_since: DateTime<Utc>,
-    stats: Arc<ReconciliationStats>,
+    progress: watch::Sender<ReconciliationProgress>,
 ) -> Result<()> {
     let mut watermark = initial_since.min(Utc::now());
     let mut first_poll = true;
@@ -309,11 +307,9 @@ pub async fn run_new_market_polls(
         .await
         {
             Ok(()) => {
-                watermark = poll_started_at;
+                watermark = watermark.max(poll_started_at);
                 first_poll = false;
-                stats
-                    .new_poll_success_ms
-                    .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+                progress.send_modify(|progress| progress.record_new_markets(watermark));
             }
             Err(error) => warn!(%error, "incremental Gamma new-market poll failed"),
         }
@@ -325,8 +321,7 @@ pub async fn run_closed_market_polls(
     client: GammaClient,
     lifecycle_tx: mpsc::Sender<LifecycleRequest>,
     initial_since: DateTime<Utc>,
-    cache_progress: watch::Sender<CacheBaseline>,
-    stats: Arc<ReconciliationStats>,
+    progress: watch::Sender<ReconciliationProgress>,
 ) -> Result<()> {
     let mut watermark = initial_since.min(Utc::now());
     loop {
@@ -341,11 +336,8 @@ pub async fn run_closed_market_polls(
         .await
         {
             Ok(()) => {
-                watermark = poll_started_at;
-                stats
-                    .closed_poll_success_ms
-                    .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
-                cache_progress.send_modify(|progress| progress.closed_catchup_complete = true);
+                watermark = watermark.max(poll_started_at);
+                progress.send_modify(|progress| progress.record_resolutions(watermark));
             }
             Err(error) => warn!(%error, "Gamma closed-market poll failed"),
         }
@@ -373,60 +365,56 @@ pub async fn run_cache_saver(
     lifecycle_tx: mpsc::Sender<LifecycleRequest>,
     redis_url: String,
     key: String,
-    mut cache_progress: watch::Receiver<CacheBaseline>,
-    mut force_save_rx: mpsc::Receiver<()>,
-    stats: Arc<ReconciliationStats>,
+    progress_tx: watch::Sender<ReconciliationProgress>,
+    mut progress_rx: watch::Receiver<ReconciliationProgress>,
 ) -> Result<()> {
-    wait_for_cache_readiness(&mut cache_progress).await?;
-    let mut interval =
-        tokio::time::interval_at(tokio::time::Instant::now() + CACHE_INTERVAL, CACHE_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut saved_revision = None;
+    wait_for_cache_readiness(&mut progress_rx).await?;
+    let mut saved_snapshot = None;
     loop {
-        let mut force = false;
-        tokio::select! {
-            _ = interval.tick() => {}
-            trigger = force_save_rx.recv() => {
-                match trigger {
-                    Some(()) => force = true,
-                    None => {
-                        // Periodic persistence remains useful if the force
-                        // trigger sender stops during shutdown.
-                        interval.tick().await;
-                    }
-                }
-            }
-        }
-        match persist_snapshot(&lifecycle_tx, &redis_url, &key, &mut saved_revision, force).await {
+        let safe_fetched_at = progress_rx
+            .borrow()
+            .safe_fetched_at()
+            .context("cache readiness regressed after a complete baseline")?;
+        match persist_snapshot(
+            &lifecycle_tx,
+            &redis_url,
+            &key,
+            safe_fetched_at,
+            &mut saved_snapshot,
+        )
+        .await
+        {
             Ok(true) => {
-                stats
-                    .cache_save_success_ms
-                    .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+                progress_tx.send_modify(|progress| progress.record_cache_save(Utc::now()));
             }
             Ok(false) => {}
             Err(error) => warn!(%error, "save Rust market restart cache failed"),
         }
+        tokio::time::sleep(CACHE_INTERVAL).await;
     }
 }
 
 async fn wait_for_cache_readiness(
-    cache_progress: &mut watch::Receiver<CacheBaseline>,
-) -> Result<()> {
-    while !cache_progress.borrow_and_update().is_complete() {
-        cache_progress
+    progress: &mut watch::Receiver<ReconciliationProgress>,
+) -> Result<DateTime<Utc>> {
+    loop {
+        if let Some(fetched_at) = progress.borrow_and_update().safe_fetched_at() {
+            return Ok(fetched_at);
+        }
+        progress
             .changed()
             .await
             .context("cache readiness sender dropped before a complete baseline")?;
     }
-    Ok(())
 }
 
 pub async fn persist_final_snapshot(
     lifecycle_tx: &mpsc::Sender<LifecycleRequest>,
     redis_url: &str,
     key: &str,
+    safe_fetched_at: DateTime<Utc>,
 ) -> Result<()> {
-    persist_snapshot(lifecycle_tx, redis_url, key, &mut None, true)
+    persist_snapshot(lifecycle_tx, redis_url, key, safe_fetched_at, &mut None)
         .await
         .map(|_| ())
 }
@@ -435,22 +423,31 @@ async fn persist_snapshot(
     lifecycle_tx: &mpsc::Sender<LifecycleRequest>,
     redis_url: &str,
     key: &str,
-    saved_revision: &mut Option<u64>,
-    force: bool,
+    safe_fetched_at: DateTime<Utc>,
+    saved_snapshot: &mut Option<(u64, DateTime<Utc>)>,
 ) -> Result<bool> {
     let snapshot = request_snapshot(lifecycle_tx).await?;
-    if !force && *saved_revision == Some(snapshot.revision) {
+    let identity = (snapshot.revision, safe_fetched_at);
+    if !snapshot_changed(*saved_snapshot, identity) {
         return Ok(false);
     }
-    let revision = snapshot.revision;
-    let raw = tokio::task::spawn_blocking(move || {
-        CacheDocument::new(Utc::now(), snapshot.markets)?.to_json()
-    })
-    .await
-    .context("cache serialization task failed")??;
+    let raw = tokio::task::spawn_blocking(move || serialize_snapshot(snapshot, safe_fetched_at))
+        .await
+        .context("cache serialization task failed")??;
     redis_cache::save_json(redis_url, key, raw).await?;
-    *saved_revision = Some(revision);
+    *saved_snapshot = Some(identity);
     Ok(true)
+}
+
+fn snapshot_changed(saved: Option<(u64, DateTime<Utc>)>, candidate: (u64, DateTime<Utc>)) -> bool {
+    saved != Some(candidate)
+}
+
+fn serialize_snapshot(
+    snapshot: ActiveMarketSnapshot,
+    safe_fetched_at: DateTime<Utc>,
+) -> Result<String> {
+    CacheDocument::new(safe_fetched_at, snapshot.markets)?.to_json()
 }
 
 async fn request_snapshot(
@@ -516,8 +513,14 @@ fn resolved_observation(market: &GammaMarket) -> Option<MarketLifecycleObservati
     })
 }
 
-fn age_seconds(now_ms: i64, then_ms: i64) -> Option<u64> {
-    (then_ms > 0).then(|| now_ms.saturating_sub(then_ms).max(0) as u64 / 1_000)
+fn advance(slot: &mut Option<DateTime<Utc>>, candidate: DateTime<Utc>) {
+    if slot.is_none_or(|current| candidate > current) {
+        *slot = Some(candidate);
+    }
+}
+
+fn age_seconds(now: DateTime<Utc>, then: Option<DateTime<Utc>>) -> Option<u64> {
+    then.map(|then| now.signed_duration_since(then).num_seconds().max(0) as u64)
 }
 
 fn new_poll_cutoff(watermark: DateTime<Utc>, first_poll: bool) -> i64 {
@@ -560,6 +563,10 @@ mod tests {
         market.condition_id = hash.into();
         market.assets_ids = vec![format!("{hash}-a"), format!("{hash}-b")];
         market
+    }
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(seconds, 0).unwrap()
     }
 
     #[test]
@@ -706,28 +713,130 @@ mod tests {
         assert!(resolved_observation(&market).is_none());
     }
 
+    #[test]
+    fn safe_watermark_requires_every_reconciliation_in_any_order() {
+        #[derive(Clone, Copy)]
+        enum Step {
+            Full,
+            New,
+            Resolved,
+        }
+
+        let permutations = [
+            [Step::Full, Step::New, Step::Resolved],
+            [Step::Full, Step::Resolved, Step::New],
+            [Step::New, Step::Full, Step::Resolved],
+            [Step::New, Step::Resolved, Step::Full],
+            [Step::Resolved, Step::Full, Step::New],
+            [Step::Resolved, Step::New, Step::Full],
+        ];
+        for permutation in permutations {
+            let mut progress = ReconciliationProgress::default();
+            for (index, step) in permutation.into_iter().enumerate() {
+                match step {
+                    Step::Full => progress.record_full_scan(at(30)),
+                    Step::New => progress.record_new_markets(at(20)),
+                    Step::Resolved => progress.record_resolutions(at(10)),
+                }
+                if index < 2 {
+                    assert_eq!(progress.safe_fetched_at(), None);
+                }
+            }
+            assert_eq!(progress.safe_fetched_at(), Some(at(10) - POLL_OVERLAP));
+        }
+    }
+
+    #[test]
+    fn reconciliation_progress_never_regresses() {
+        let mut progress = ReconciliationProgress::default();
+        progress.record_full_scan(at(30));
+        progress.record_new_markets(at(20));
+        progress.record_resolutions(at(15));
+        progress.record_cache_save(at(40));
+
+        progress.record_full_scan(at(29));
+        progress.record_new_markets(at(19));
+        progress.record_resolutions(at(14));
+        progress.record_cache_save(at(39));
+
+        assert_eq!(progress.full_scan_completed_at, Some(at(30)));
+        assert_eq!(progress.new_markets_through, Some(at(20)));
+        assert_eq!(progress.resolutions_through, Some(at(15)));
+        assert_eq!(progress.cache_saved_at, Some(at(40)));
+        assert_eq!(progress.safe_fetched_at(), Some(at(15) - POLL_OVERLAP));
+        assert_eq!(progress.ages_at(at(50)).full_scan_seconds, Some(20));
+        assert_eq!(progress.ages_at(at(50)).new_poll_seconds, Some(30));
+        assert_eq!(progress.ages_at(at(50)).closed_poll_seconds, Some(35));
+        assert_eq!(progress.ages_at(at(50)).cache_save_seconds, Some(10));
+    }
+
     #[tokio::test]
-    async fn cache_save_waits_for_active_and_closed_reconciliation() {
-        let (progress_tx, mut progress_rx) = watch::channel(CacheBaseline::default());
+    async fn cache_save_waits_for_full_new_and_resolved_reconciliation() {
+        let (progress_tx, mut progress_rx) = watch::channel(ReconciliationProgress::default());
         let waiter = tokio::spawn(async move { wait_for_cache_readiness(&mut progress_rx).await });
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
 
-        progress_tx.send_modify(|progress| progress.active_scan_complete = true);
+        progress_tx.send_modify(|progress| progress.record_new_markets(at(20)));
+        progress_tx.send_modify(|progress| progress.record_full_scan(at(30)));
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
 
-        progress_tx.send_modify(|progress| progress.closed_catchup_complete = true);
-        waiter.await.unwrap().unwrap();
+        progress_tx.send_modify(|progress| progress.record_resolutions(at(10)));
+        assert_eq!(waiter.await.unwrap().unwrap(), at(10) - POLL_OVERLAP);
     }
 
     #[tokio::test]
     async fn cache_save_fails_closed_without_a_complete_baseline() {
-        let (progress_tx, mut progress_rx) = watch::channel(CacheBaseline::default());
+        let (progress_tx, mut progress_rx) = watch::channel(ReconciliationProgress::default());
         drop(progress_tx);
         let error = wait_for_cache_readiness(&mut progress_rx)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("complete baseline"));
+    }
+
+    #[test]
+    fn cache_identity_includes_revision_and_safe_watermark() {
+        let saved = Some((7, at(10)));
+        assert!(!snapshot_changed(saved, (7, at(10))));
+        assert!(snapshot_changed(saved, (8, at(10))));
+        assert!(snapshot_changed(saved, (7, at(11))));
+    }
+
+    #[test]
+    fn restart_watermark_preserves_delayed_visibility_overlap() {
+        let direct_watermark = at(600);
+        let delayed_event = direct_watermark - TimeDelta::minutes(1);
+        let mut progress = ReconciliationProgress::default();
+        progress.record_full_scan(at(700));
+        progress.record_new_markets(direct_watermark);
+        progress.record_resolutions(at(650));
+
+        let restart_watermark = progress.safe_fetched_at().unwrap();
+        assert_eq!(restart_watermark, direct_watermark - POLL_OVERLAP);
+        assert!(restart_watermark <= delayed_event);
+        assert_eq!(
+            new_poll_cutoff(restart_watermark, true),
+            restart_watermark.timestamp_millis()
+        );
+    }
+
+    #[test]
+    fn cache_serialization_uses_the_safe_watermark_exactly() {
+        let safe_fetched_at = at(10) - POLL_OVERLAP;
+        let raw = serialize_snapshot(
+            ActiveMarketSnapshot {
+                revision: 7,
+                markets: vec![market("m")],
+            },
+            safe_fetched_at,
+        )
+        .unwrap();
+        let document = CacheDocument::from_json(&raw).unwrap();
+        assert_eq!(document.fetched_at(), safe_fetched_at);
+        assert_eq!(document.markets().len(), 1);
+        assert_eq!(document.markets()[0].hash, "m");
+        assert_eq!(document.markets()[0].assets, ["m-a", "m-b"]);
     }
 }

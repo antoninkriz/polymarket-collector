@@ -11,7 +11,6 @@
 //!   Polymarket WS pool ── (mpsc) ──> Redis XADD (durable event stream)
 //! ```
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -27,7 +26,7 @@ use polymarket_orderbook_rust::record::EventRecord;
 use polymarket_orderbook_rust::ws::pool::{Pool, PoolStats};
 
 use polymarket_orderbook_rust_pubsub::config::Config;
-use polymarket_orderbook_rust_pubsub::gamma_reconcile::{self, CacheBaseline, ReconciliationStats};
+use polymarket_orderbook_rust_pubsub::gamma_reconcile::{self, ReconciliationProgress};
 use polymarket_orderbook_rust_pubsub::lease::{PublisherLease, PublisherLeaseConfig};
 use polymarket_orderbook_rust_pubsub::market_lifecycle::LifecycleCoordinator;
 use polymarket_orderbook_rust_pubsub::pubsub_sink::{PubSubSink, PubSubSinkConfig};
@@ -148,54 +147,48 @@ async fn main() -> Result<()> {
         }
     }
 
-    let reconciliation_stats = Arc::new(ReconciliationStats::default());
-    let (force_cache_save_tx, force_cache_save_rx) = mpsc::channel(1);
     // Preserve the existing cache and its honest fetched_at until this process
-    // has completed both active-market and closed-market reconciliation.
-    let (cache_progress_tx, cache_progress_rx) = watch::channel(CacheBaseline::default());
+    // has completed active, new-market, and closed-market reconciliation.
+    let (progress_tx, progress_rx) = watch::channel(ReconciliationProgress::default());
     let (gamma_shutdown_tx, gamma_shutdown_rx) = watch::channel(false);
     let mut full_scan_handle: JoinHandle<Result<()>> =
         tokio::spawn(gamma_reconcile::run_full_scans(
             gamma_client.clone(),
             reconciliation_tx.clone(),
             cold_start,
-            cache_progress_tx.clone(),
-            force_cache_save_tx,
-            Arc::clone(&reconciliation_stats),
+            progress_tx.clone(),
             gamma_shutdown_rx,
         ));
     let mut new_poll_handle = tokio::spawn(gamma_reconcile::run_new_market_polls(
         gamma_client.clone(),
         reconciliation_tx.clone(),
         cache_fetched_at.unwrap_or(startup_poll_time),
-        Arc::clone(&reconciliation_stats),
+        progress_tx.clone(),
     ));
     let mut closed_poll_handle = tokio::spawn(gamma_reconcile::run_closed_market_polls(
         gamma_client,
         reconciliation_tx.clone(),
         cache_fetched_at.unwrap_or(startup_poll_time),
-        cache_progress_tx,
-        Arc::clone(&reconciliation_stats),
+        progress_tx.clone(),
     ));
     let mut cache_saver_handle = tokio::spawn(gamma_reconcile::run_cache_saver(
         reconciliation_tx.clone(),
         cfg.redis_url.clone(),
         cfg.redis_key_active_markets.clone(),
-        cache_progress_rx.clone(),
-        force_cache_save_rx,
-        Arc::clone(&reconciliation_stats),
+        progress_tx,
+        progress_rx.clone(),
     ));
 
     let stats_event_tx = event_tx.clone();
     let stats_websocket_lifecycle_tx = websocket_lifecycle_tx.clone();
     let stats_reconciliation_tx = reconciliation_tx.clone();
-    let stats_reconciliation = Arc::clone(&reconciliation_stats);
+    let stats_progress = progress_rx.clone();
     let stats_handle = tokio::spawn(async move {
         stats_loop(
             stats_event_tx,
             stats_websocket_lifecycle_tx,
             stats_reconciliation_tx,
-            stats_reconciliation,
+            stats_progress,
         )
         .await;
     });
@@ -254,19 +247,22 @@ async fn main() -> Result<()> {
         let _ = cache_saver_handle.await;
     }
 
-    let cache_ready = cache_progress_rx.borrow().is_complete();
-    if !coordinator_stopped && cache_ready {
-        if let Err(error) = gamma_reconcile::persist_final_snapshot(
-            &reconciliation_tx,
-            &cfg.redis_url,
-            &cfg.redis_key_active_markets,
-        )
-        .await
-        {
-            warn!(%error, "final market restart-cache save failed");
+    let safe_fetched_at = progress_rx.borrow().safe_fetched_at();
+    if !coordinator_stopped {
+        if let Some(safe_fetched_at) = safe_fetched_at {
+            if let Err(error) = gamma_reconcile::persist_final_snapshot(
+                &reconciliation_tx,
+                &cfg.redis_url,
+                &cfg.redis_key_active_markets,
+                safe_fetched_at,
+            )
+            .await
+            {
+                warn!(%error, "final market restart-cache save failed");
+            }
+        } else {
+            info!("skipping incomplete market restart-cache save");
         }
-    } else if !coordinator_stopped {
-        info!("skipping incomplete market restart-cache save");
     }
 
     // Stop telemetry requests before asking the coordinator to close its
@@ -429,7 +425,7 @@ async fn stats_loop(
     event_tx: mpsc::Sender<EventRecord>,
     websocket_lifecycle_tx: mpsc::Sender<MarketLifecycleObservation>,
     reconciliation_tx: mpsc::Sender<LifecycleRequest>,
-    reconciliation_stats: Arc<ReconciliationStats>,
+    reconciliation_progress: watch::Receiver<ReconciliationProgress>,
 ) {
     const SAMPLES_PER_REPORT: u64 = 60;
     const PRESSURE_THRESHOLD_PCT: f64 = 50.0;
@@ -468,7 +464,7 @@ async fn stats_loop(
                 return;
             }
         };
-        let reconciliation_ages = reconciliation_stats.ages();
+        let reconciliation_ages = reconciliation_progress.borrow().ages();
         let asset_recoveries = stats.asset_recoveries;
         let asset_recovery_latency_us = stats.asset_recovery_latency_us;
         let asset_recovery_avg_ms = if asset_recoveries > 0 {
