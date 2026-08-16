@@ -16,7 +16,7 @@ services:
       - obdata
     environment:
       CLICKHOUSE_DB: default
-      CLICKHOUSE_USER: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
       TZ: UTC

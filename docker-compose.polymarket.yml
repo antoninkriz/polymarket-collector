@@ -63,14 +63,13 @@ services:
       CLICKHOUSE_DATABASE: default
       CLICKHOUSE_TABLE: polymarket_orderbook_v3
       # WS pool
-      SKIP_ACTIVE_MARKETS_CACHE: "false"
       QUEUE_SIZE: "1000000"
       LIFECYCLE_QUEUE_SIZE: "8192"
       MAX_ASSETS_PER_CONN: "250"
       # Redis Stream publisher batching
       MAX_BATCH: "200"
       LINGER_MS: "2"
-      RUST_LOG: info,polymarket_orderbook_rust_pubsub=info
+      RUST_LOG: ${RUST_LOG:-info}
 
   obdata-polymarket-orderbook-rust-from-pubsub:
     build:
@@ -106,7 +105,7 @@ services:
       CLICKHOUSE_TABLE: polymarket_orderbook_v3
       FLUSH_BATCH_SIZE: "5000"
       FLUSH_INTERVAL_MS: "500"
-      RUST_LOG: info,polymarket_orderbook_rust_from_pubsub=info
+      RUST_LOG: ${RUST_LOG:-info}
 
   obdata-polymarket-r2-archive-exporter:
     build:

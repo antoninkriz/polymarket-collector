@@ -1,4 +1,4 @@
-# Two-stage build for the Polymarket Redis pub/sub → ClickHouse writer.
+# Two-stage build for the Polymarket Redis Stream → ClickHouse writer.
 #
 # Build context is the repo root:
 #
@@ -20,8 +20,7 @@ COPY services/polymarket/polymarket-orderbook-rust-from-pubsub/Cargo.lock ./serv
 COPY services/polymarket/polymarket-orderbook-rust-from-pubsub/src ./services/polymarket/polymarket-orderbook-rust-from-pubsub/src
 
 WORKDIR /build/services/polymarket/polymarket-orderbook-rust-from-pubsub
-RUN cargo build --release --locked \
-    && strip target/release/polymarket-orderbook-rust-from-pubsub
+RUN cargo build --release --locked
 
 
 FROM docker.io/library/debian:trixie-slim AS runtime

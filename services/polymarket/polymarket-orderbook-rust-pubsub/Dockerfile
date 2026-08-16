@@ -1,4 +1,4 @@
-# Two-stage build for the Polymarket pub/sub publisher.
+# Two-stage build for the Polymarket Redis Stream publisher.
 #
 # Build context is the repo root:
 #
@@ -20,8 +20,7 @@ COPY services/polymarket/polymarket-orderbook-rust-pubsub/Cargo.lock ./services/
 COPY services/polymarket/polymarket-orderbook-rust-pubsub/src ./services/polymarket/polymarket-orderbook-rust-pubsub/src
 
 WORKDIR /build/services/polymarket/polymarket-orderbook-rust-pubsub
-RUN cargo build --release --locked \
-    && strip target/release/polymarket-orderbook-rust-pubsub
+RUN cargo build --release --locked
 
 
 FROM docker.io/library/debian:trixie-slim AS runtime
