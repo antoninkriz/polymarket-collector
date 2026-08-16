@@ -280,9 +280,6 @@ RAM sizing assumes the ClickHouse writer is healthy. A writer outage leaves the 
 
 - [docs/DATA_MODEL.md](docs/DATA_MODEL.md) — collection guarantees, timestamps, ordering, reconnect behavior, deduplication, and replay.
 - [docs/PARQUET_EXPORT.md](docs/PARQUET_EXPORT.md) — every exported column, Arrow and Parquet type, nullability, encoding, file order, and manifest field.
-- [docs/REFACTOR.md](docs/REFACTOR.md) — current architecture decisions, accepted complexity, rejected proposals, and remaining cleanup gates.
-
-
 
 ## Thanks
 
