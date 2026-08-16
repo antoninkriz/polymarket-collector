@@ -69,7 +69,7 @@ services:
       # Redis Stream publisher batching
       MAX_BATCH: "200"
       LINGER_MS: "2"
-      RUST_LOG: ${RUST_LOG:-info}
+      RUST_LOG: info
 
   obdata-polymarket-orderbook-rust-from-pubsub:
     build:
@@ -105,7 +105,7 @@ services:
       CLICKHOUSE_TABLE: polymarket_orderbook_v3
       FLUSH_BATCH_SIZE: "5000"
       FLUSH_INTERVAL_MS: "500"
-      RUST_LOG: ${RUST_LOG:-info}
+      RUST_LOG: info
 
   obdata-polymarket-r2-archive-exporter:
     build:
@@ -135,7 +135,7 @@ services:
       R2_BUCKET: ${R2_BUCKET:-}
       R2_ACCESS_KEY: ${R2_ACCESS_KEY:-}
       R2_SECRET_KEY: ${R2_SECRET_KEY:-}
-      RUST_LOG: ${RUST_LOG:-info}
+      RUST_LOG: info
 
 networks:
   obdata:
