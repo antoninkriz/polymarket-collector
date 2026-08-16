@@ -138,9 +138,7 @@ async fn main() -> Result<()> {
         }
         let market_count = cached_markets.len();
         apply_bootstrap_batched(&reconciliation_tx, cached_markets).await?;
-        if market_count > 0 {
-            info!(markets = market_count, "pre-loaded markets");
-        }
+        info!(markets = market_count, "pre-loaded markets");
     }
 
     // Preserve the existing cache and its honest fetched_at until this process
@@ -463,26 +461,12 @@ async fn stats_loop(
         };
         let asset_recovery_max_ms = stats.asset_recovery_latency_us_max as f64 / 1_000.0;
 
-        let queue_pct = if queue_max > 0 {
-            (queue_used as f64 / queue_max as f64) * 100.0
-        } else {
-            0.0
-        };
-        let queue_high_water_pct = if queue_max > 0 {
-            (queue_high_water as f64 / queue_max as f64) * 100.0
-        } else {
-            0.0
-        };
-        let websocket_lifecycle_high_water_pct = if websocket_lifecycle_max > 0 {
-            (websocket_lifecycle_high_water as f64 / websocket_lifecycle_max as f64) * 100.0
-        } else {
-            0.0
-        };
-        let reconciliation_high_water_pct = if reconciliation_max > 0 {
-            (reconciliation_high_water as f64 / reconciliation_max as f64) * 100.0
-        } else {
-            0.0
-        };
+        let queue_pct = (queue_used as f64 / queue_max as f64) * 100.0;
+        let queue_high_water_pct = (queue_high_water as f64 / queue_max as f64) * 100.0;
+        let websocket_lifecycle_high_water_pct =
+            (websocket_lifecycle_high_water as f64 / websocket_lifecycle_max as f64) * 100.0;
+        let reconciliation_high_water_pct =
+            (reconciliation_high_water as f64 / reconciliation_max as f64) * 100.0;
 
         info!(
             queue_size = queue_used,

@@ -111,9 +111,6 @@ impl PubSubSink {
     }
 
     async fn flush(&mut self, batch: &mut Vec<EventRecord>) -> Result<()> {
-        if batch.is_empty() {
-            return Ok(());
-        }
         let batch_size = batch.len();
         let event_json: Vec<String> = batch
             .iter()
