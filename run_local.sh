@@ -14,9 +14,9 @@ COMPOSE_COMMAND=()
 INFRA_COMPOSE=()
 LOCAL_COMPOSE=()
 APPLICATION_SERVICES=(
-    obdata-polymarket-orderbook-rust-pubsub
-    obdata-polymarket-orderbook-rust-from-pubsub
-    obdata-polymarket-r2-archive-exporter
+    obdata-polymarket-collector
+    obdata-polymarket-clickhouse-writer
+    obdata-polymarket-archive-exporter
 )
 LOCAL_EXPORT_HOST_DIR="$REPOSITORY_DIR/.data/parquet"
 
@@ -158,7 +158,7 @@ start_stack() {
 
     cat <<EOF
 
-The local collector and exporter are running.
+The local collector, ClickHouse writer, and archive exporter are running.
 Parquet output: $LOCAL_EXPORT_HOST_DIR
 
 An hour is exported after it is complete and the next hour has reached

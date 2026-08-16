@@ -34,7 +34,7 @@ ORDER BY sequence;
 
 The log deliberately omits payload hashes, raw parent messages, connection identifiers, collector identifiers, transport identifiers, and schema-version columns. None is required to replay the stream observed by this collector. The non-unique Polymarket `hash` field is also removed.
 
-The Redis Stream carries the same logical row as exactly three fields: nonnegative nanosecond `timestamp_received`, unsigned `sequence`, and `data` containing one JSON object. The writer validates this exact shape and preserves the `data` text while wrapping batches as ClickHouse `JSONEachRow`; it does not import or deserialize the publisher's event types.
+The Redis Stream carries the same logical row as exactly three fields: nonnegative nanosecond `timestamp_received`, unsigned `sequence`, and `data` containing one JSON object. The writer validates this exact shape and preserves the `data` text while wrapping batches as ClickHouse `JSONEachRow`; it does not import or deserialize the collector's event types.
 
 ## Ordering across processes and restarts
 
@@ -45,13 +45,13 @@ Polymarket supplies neither an exchange sequence nor a unique public fill ID. So
 - an at-least-once retry keeps the same value; and
 - a new source observation always receives a new value.
 
-The high 16 bits hold a Redis-issued publisher generation and the low 48 bits hold process-local event order. Before opening WebSockets, the publisher reads the generation from ClickHouse's maximum sequence, compares it with `PUBLISHER_GENERATION_FLOOR`, acquires the Redis publisher lease, and advances the Redis generation above that floor. Redis AOF persistence is confirmed before collection starts.
+The high 16 bits hold a Redis-issued publisher generation and the low 48 bits hold process-local event order. Before opening WebSockets, the collector reads the generation from ClickHouse's maximum sequence, compares it with `PUBLISHER_GENERATION_FLOOR`, acquires the Redis publisher lease, and advances the Redis generation above that floor. Redis AOF persistence is confirmed before collection starts.
 
 Archive retention always preserves the newest ClickHouse partition, even when it is older than the retention interval, so ordinary restarts retain a durable sequence watermark. If Redis and ClickHouse are both lost while Parquet survives, find the greatest `max_sequence` in the hourly manifests, shift it right by 48 bits, and set `PUBLISHER_GENERATION_FLOOR` to at least that value before restarting. A lower floor could reuse an already exported sequence.
 
 ## Market discovery and subscriptions
 
-Each binary market and its two outcome assets have one authoritative WebSocket route. The publisher enables Polymarket's `custom_feature_enabled` option on every subscription and collects:
+Each binary market and its two outcome assets have one authoritative WebSocket route. The collector enables Polymarket's `custom_feature_enabled` option on every subscription and collects:
 
 - `book`
 - `price_change`
@@ -65,7 +65,7 @@ Three lifecycle listeners keep `new_market` discovery available across an indivi
 
 The lifecycle controller is the single owner of condition and asset state. It serializes WebSocket and Gamma observations, rejects conflicting asset ownership, suppresses repeated lifecycle state, and prevents a stale `new_market` observation from reactivating a resolved market.
 
-The same Rust publisher owns the reconciliation paths:
+The same collector owns the reconciliation paths:
 
 - a validated Redis cache restores the last active market set immediately;
 - complete Gamma keyset scans run every 30 minutes;
@@ -74,7 +74,7 @@ The same Rust publisher owns the reconciliation paths:
 
 On restart, a bounded recent Gamma scan first subscribes active markets missing from the cache and moves recent cached markets ahead of the paced long tail. Incremental reconciliation begins at the cache's conservative `fetched_at` watermark, so markets created while the collector was stopped are not hidden by startup time.
 
-The publisher never replaces a restart-cache snapshot until the current process has completed a full active-market scan, a successful new-market poll, and a successful resolved-market poll. Its stored `fetched_at` is the earlier of the two successful poll watermarks minus a two-minute overlap; it is never the wall-clock save time. This preserves delayed Gamma visibility and leaves the previous cache untouched if any startup reconciliation is interrupted. After the complete baseline, a changed market revision or coverage watermark is saved at most once per minute and during graceful shutdown.
+The collector never replaces a restart-cache snapshot until the current process has completed a full active-market scan, a successful new-market poll, and a successful resolved-market poll. Its stored `fetched_at` is the earlier of the two successful poll watermarks minus a two-minute overlap; it is never the wall-clock save time. This preserves delayed Gamma visibility and leaves the previous cache untouched if any startup reconciliation is interrupted. After the complete baseline, a changed market revision or coverage watermark is saved at most once per minute and during graceful shutdown.
 
 All Gamma work shares a 10 request/second limiter and bounded retry policy. WebSocket lifecycle events remain the low-latency source. Gamma adds missing subscriptions and may synthesize a missing lifecycle row only when a usable source creation or closure timestamp exists.
 
@@ -107,11 +107,11 @@ Only retries of the same collector record are collapsed. They carry the same `se
 
 Payload-based deduplication is intentionally forbidden for market-data events. `transaction_hash`, market, asset, timestamp, price, size, side, and fee do not form a unique fill identity: Polygon can settle multiple fills in one transaction, and the feed may legitimately deliver identical-looking observations. A repeated source observation therefore receives a new sequence and remains in the archive. Lifecycle state is the exception: the central controller admits each market transition once.
 
-The publisher's internal queues are bounded. Saturation is treated as a fatal data-integrity failure rather than silently dropping an admitted record:
+The collector's internal queues are bounded. Saturation is treated as a fatal data-integrity failure rather than silently dropping an admitted record:
 
 | Queue | Capacity |
 |---|---:|
-| Publisher events | 1,000,000 records |
+| Collector events | 1,000,000 records |
 | WebSocket and reconciliation lifecycle inputs | 8,192 observations each |
 
 The ClickHouse writer has no in-process handoff queues. One actor owns at most one 5,000-record batch, retains its Redis delivery IDs until ClickHouse commits, and acknowledges them directly with `XACKDEL`. While ClickHouse is unavailable it stops reading rather than accumulating a second volatile backlog; unread records remain durable in Redis. `EVENT_CONSUMER_GROUP` and `EVENT_CONSUMER_NAME` must remain stable across restarts; changing either requires explicitly migrating or claiming pending entries and cleaning up the old group when applicable. Services log 60-second high-water marks and counters for their bounded state.

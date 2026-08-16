@@ -7,15 +7,15 @@ x-default-logging: &default-logging
 
 # Polymarket orderbook stack — obdata-side, full pipeline.
 #
-#   obdata-polymarket-orderbook-rust-pubsub
+#   obdata-polymarket-collector
 #     Owns Gamma market discovery and the restart cache, subscribes to the
 #     Polymarket WS, and publishes v3 records to `polymarket:events:v3`.
 #
-#   obdata-polymarket-orderbook-rust-from-pubsub
+#   obdata-polymarket-clickhouse-writer
 #     Consumes `polymarket:events:v3` and acknowledges records only after
 #     ClickHouse commits them to `polymarket_orderbook_v3`.
 #
-#   obdata-polymarket-r2-archive-exporter
+#   obdata-polymarket-archive-exporter
 #     Reads obdata-clickhouse `polymarket_orderbook_v3` and exports one
 #     market-clustered Parquet file per event type and UTC hour.
 #
@@ -25,12 +25,12 @@ x-default-logging: &default-logging
 
 services:
 
-  obdata-polymarket-orderbook-rust-pubsub:
+  obdata-polymarket-collector:
     build:
       context: .
-      dockerfile: services/polymarket/polymarket-orderbook-rust-pubsub/Dockerfile
-    container_name: obdata-polymarket-orderbook-rust-pubsub
-    command: ["/app/polymarket-orderbook-rust-pubsub"]
+      dockerfile: services/polymarket/collector/Dockerfile
+    container_name: obdata-polymarket-collector
+    command: ["/app/polymarket-collector"]
     env_file:
       - path: .env
         required: false
@@ -47,11 +47,11 @@ services:
       REDIS_KEY_ACTIVE_MARKETS: polymarket:active_markets
       # Durable event log consumed and acknowledged by the ClickHouse writer.
       REDIS_EVENT_STREAM: polymarket:events:v3
-      # Exactly one authoritative publisher may hold this renewable lease.
+      # Exactly one authoritative collector may hold this renewable lease.
       # Every stream append is atomically fenced by the current lease token.
       PUBLISHER_LEASE_KEY: polymarket:publisher:v3:lease
       PUBLISHER_LEASE_GENERATION_KEY: polymarket:publisher:v3:generation
-      # The publisher recovers its sequence-generation floor from ClickHouse
+      # The collector recovers its sequence-generation floor from ClickHouse
       # before acquiring the lease, then fsyncs the new value to Redis AOF.
       PUBLISHER_GENERATION_PERSIST_TIMEOUT_MS: "5000"
       PUBLISHER_LEASE_TTL_MS: "15000"
@@ -66,17 +66,17 @@ services:
       QUEUE_SIZE: "1000000"
       LIFECYCLE_QUEUE_SIZE: "8192"
       MAX_ASSETS_PER_CONN: "250"
-      # Redis Stream publisher batching
+      # Redis Stream publication batching
       MAX_BATCH: "200"
       LINGER_MS: "2"
       RUST_LOG: info
 
-  obdata-polymarket-orderbook-rust-from-pubsub:
+  obdata-polymarket-clickhouse-writer:
     build:
       context: .
-      dockerfile: services/polymarket/polymarket-orderbook-rust-from-pubsub/Dockerfile
-    container_name: obdata-polymarket-orderbook-rust-from-pubsub
-    command: ["/app/polymarket-orderbook-rust-from-pubsub"]
+      dockerfile: services/polymarket/clickhouse-writer/Dockerfile
+    container_name: obdata-polymarket-clickhouse-writer
+    command: ["/app/polymarket-clickhouse-writer"]
     env_file:
       - path: .env
         required: false
@@ -90,7 +90,7 @@ services:
         soft: ${CONTAINER_NOFILE_LIMIT:-65536}
         hard: ${CONTAINER_NOFILE_LIMIT:-65536}
     environment:
-      # Same durable stream as the publisher.
+      # Same durable stream as the collector.
       REDIS_URL: redis://obdata-redis:6379
       REDIS_EVENT_STREAM: polymarket:events:v3
       EVENT_CONSUMER_GROUP: polymarket-clickhouse-v3
@@ -107,12 +107,12 @@ services:
       FLUSH_INTERVAL_MS: "500"
       RUST_LOG: info
 
-  obdata-polymarket-r2-archive-exporter:
+  obdata-polymarket-archive-exporter:
     build:
       context: .
-      dockerfile: services/r2-archive/exporter/Dockerfile
-    container_name: obdata-polymarket-r2-archive-exporter
-    command: ["/app/polymarket-r2-archive-exporter"]
+      dockerfile: services/polymarket/archive-exporter/Dockerfile
+    container_name: obdata-polymarket-archive-exporter
+    command: ["/app/polymarket-archive-exporter"]
     env_file:
       - path: .env
         required: false

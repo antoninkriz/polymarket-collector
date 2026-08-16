@@ -43,7 +43,7 @@ Key format rules:
 
 ```text
 Polymarket WS lifecycle ─┐
-Polymarket Gamma REST ───┼─▶ Rust publisher ─▶ Redis Stream ─▶ Rust writer ─▶ ClickHouse raw v3 ─▶ Rust exporter ─▶ R2/local
+Polymarket Gamma REST ───┼─▶ collector ─▶ Redis Stream ─▶ ClickHouse writer ─▶ ClickHouse raw v3 ─▶ archive exporter ─▶ R2/local
 Redis restart cache ─────┘
 ```
 
@@ -93,9 +93,9 @@ ClickHouse
 Parquet
 ```
 
-### Publisher — discovery, collection, and order
+### Collector — discovery, collection, and order
 
-[polymarket-orderbook-rust-pubsub](services/polymarket/polymarket-orderbook-rust-pubsub)
+[polymarket-collector](services/polymarket/collector)
 
 - Owns market state, authoritative WebSocket subscriptions, receive timestamps, and collector sequencing.
 - Listens for `new_market` on three lifecycle sockets and subscribes its assets immediately—important for short-lived markets.
@@ -106,14 +106,14 @@ Parquet
 ### Redis Stream — the durable handoff
 
 - Separates live WebSocket collection from ClickHouse restarts and write latency.
-- Uses a renewable lease and fencing generation so exactly one publisher can append to `polymarket:events:v3`.
+- Uses a renewable lease and fencing generation so exactly one collector can append to `polymarket:events:v3`.
 - Carries exactly `timestamp_received`, `sequence`, and normalized JSON `data` for each record.
 - Keeps records pending until ClickHouse commits; Redis AOF is enabled.
 - Absorbs short storage interruptions. It is not sized as a multi-hour RAM backlog.
 
 ### Writer and ClickHouse — a compact raw window
 
-[polymarket-orderbook-rust-from-pubsub](services/polymarket/polymarket-orderbook-rust-from-pubsub)
+[polymarket-clickhouse-writer](services/polymarket/clickhouse-writer)
 
 - Batches Redis records into `polymarket_orderbook_v3`.
 - Uses one bounded actor for Redis reads, ClickHouse commits, and Redis acknowledgements; there are no in-process handoff queues.
@@ -123,7 +123,7 @@ Parquet
 
 ### Exporter — typed, immutable hours
 
-The [Rust exporter](services/r2-archive/exporter):
+The [polymarket-archive-exporter](services/polymarket/archive-exporter):
 
 - Streams Arrow batches into event-specific Parquet without buffering an hour.
 - Writes ZSTD level 9 files and publishes `manifest.json` last.
@@ -165,7 +165,7 @@ CONTAINER_RUNTIME=docker ./run_local.sh
 | --- | --- |
 | `./run_local.sh` | Build and start the stack without recreating unchanged services. |
 | `./run_local.sh redeploy` | Rebuild and recreate every application service. |
-| `./run_local.sh logs` | Follow publisher, writer, and exporter logs. |
+| `./run_local.sh logs` | Follow collector, writer, and exporter logs. |
 | `./run_local.sh status` | Show infrastructure and application containers. |
 | `./run_local.sh down` | Stop everything while retaining collected data. |
 
@@ -234,9 +234,9 @@ The most useful signals are:
 
 | Area       | Healthy pattern                                                                                                 | Investigate when                                                                                             |
 | ---------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| Publisher  | `[QUEUE-STATS]` reports low queue depths, route health, recovery latency, and current Gamma/cache ages.          | Queue high-water repeatedly approaches capacity, Gamma ages keep growing, or `assets_down` remains elevated. |
+| Collector  | `[QUEUE-STATS]` reports low queue depths, route health, recovery latency, and current Gamma/cache ages.          | Queue high-water repeatedly approaches capacity, Gamma ages keep growing, or `assets_down` remains elevated. |
 | Reconnects | `[CONNECTION-DATA-GAP]` and `[CONN-GAP]` are followed by asset recoveries in `[QUEUE-STATS]`.                    | Recovery latency grows, connections stay down, or gaps cluster continuously.                                 |
-| Writer     | `[POLYMARKET-FROM-PUBSUB-STATS]` shows a bounded batch, zero parse failures, and advancing read, commit, and acknowledgement counts. | Redis lag grows from minute to minute or ClickHouse retries persist.                                         |
+| Writer     | `[CLICKHOUSE-WRITER-STATS]` shows a bounded batch, zero parse failures, and advancing read, commit, and acknowledgement counts. | Redis lag grows from minute to minute or ClickHouse retries persist.                                         |
 | Redis      | Stream consumer lag and `used_memory` remain bounded.                                                           | The writer is unavailable and the stream grows; current traffic can consume many GiB per hour.               |
 | Exporter   | One `completed receive-time hour` per hour, followed by safe partition cleanup.                                 | Export retries continue, no new manifest appears, or cleanup repeatedly retains a supposedly complete hour.  |
 
@@ -267,8 +267,8 @@ For an archive-level check, verify that each expected hour has a readable `manif
 | Resource         | Measured reference                                                           | Explanation                                                                                                       |
 | ---------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | CPU             | Roughly one aggregate core in steady state.                                   | ClickHouse merges, cold subscription, and hourly export are bursty; 4 vCPUs can be tight, 8 leaves nice headroom. |
-| RAM             | About 4–5 GiB of container RSS; the publisher uses roughly 1.0–1.2 GiB.        | 16 GiB supports the full pipeline; 32 GiB leaves safer page-cache, merge, export, and backlog headroom.            |
-| Open files      | The publisher holds roughly 1,250 WebSockets and ClickHouse uses many files.   | A high limit avoids failures during reconnect waves, merges, and export.                                          |
+| RAM             | About 4–5 GiB of container RSS; the collector uses roughly 1.0–1.2 GiB.        | 16 GiB supports the full pipeline; 32 GiB leaves safer page-cache, merge, export, and backlog headroom.            |
+| Open files      | The collector holds roughly 1,250 WebSockets and ClickHouse uses many files.   | A high limit avoids failures during reconnect waves, merges, and export.                                          |
 | ClickHouse disk | About 3.4–3.8 GiB per raw hour; the rolling window normally uses 15–20 GiB.   | Any reasonable SSD should be fine, we need storage for the DB and exports.                                        |
 | Parquet archive | About 0.8–0.9 GB/hour, or 20–22 GB/day.                                       | The data take around 0.65 TB per 30 days in local storage or R2.                                                  |
 | Network in      | Roughly 60–75 Mbit/s sustained, with snapshot and reconnect bursts.           | 100 Mbit/s is a minimum. More bandwidth shortens full-universe and reconnect recovery.                            |
