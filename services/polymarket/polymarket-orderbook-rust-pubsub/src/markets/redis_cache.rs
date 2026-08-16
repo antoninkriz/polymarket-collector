@@ -26,7 +26,7 @@ use crate::events::Market;
 pub const MAX_CACHE_MARKETS: usize = 500_000;
 
 /// Validated, complete restart-cache snapshot.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CacheDocument {
     fetched_at: DateTime<Utc>,
     markets: Vec<Market>,
@@ -78,17 +78,19 @@ impl CacheDocument {
         Self::new(fetched_at, markets)
     }
 
-    pub fn to_json(&self) -> Result<String> {
-        validate_markets(&self.markets)?;
+    pub fn to_json(self) -> Result<String> {
         let serialized = SerializedCacheDocument {
             fetched_at: self.fetched_at.to_rfc3339_opts(SecondsFormat::AutoSi, true),
             markets: self
                 .markets
-                .iter()
-                .map(|market| CacheEntry {
-                    market: market.hash.clone(),
-                    yes_asset_id: market.assets[0].clone(),
-                    no_asset_id: market.assets[1].clone(),
+                .into_iter()
+                .map(|market| {
+                    let [yes_asset_id, no_asset_id] = market.assets;
+                    CacheEntry {
+                        market: market.hash,
+                        yes_asset_id,
+                        no_asset_id,
+                    }
                 })
                 .collect(),
         };
