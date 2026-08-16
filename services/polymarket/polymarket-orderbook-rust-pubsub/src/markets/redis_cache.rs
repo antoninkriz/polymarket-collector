@@ -41,6 +41,19 @@ impl CacheDocument {
         })
     }
 
+    /// Build from the authoritative lifecycle state, whose invariants were
+    /// checked before it admitted each market.
+    pub(crate) fn from_lifecycle_snapshot(
+        fetched_at: DateTime<Utc>,
+        markets: Vec<Market>,
+    ) -> Result<Self> {
+        ensure_market_count(markets.len())?;
+        Ok(Self {
+            fetched_at,
+            markets,
+        })
+    }
+
     pub fn fetched_at(&self) -> DateTime<Utc> {
         self.fetched_at
     }
@@ -146,11 +159,7 @@ pub async fn save_json(redis_url: &str, key: &str, raw: String) -> Result<()> {
 }
 
 fn validate_markets(markets: &[Market]) -> Result<()> {
-    ensure!(
-        markets.len() <= MAX_CACHE_MARKETS,
-        "cache contains {} markets, maximum is {MAX_CACHE_MARKETS}",
-        markets.len()
-    );
+    ensure_market_count(markets.len())?;
 
     let mut condition_assets = HashMap::<&str, [&str; 2]>::with_capacity(markets.len());
     let mut asset_owner = HashMap::<&str, &str>::with_capacity(markets.len().saturating_mul(2));
@@ -196,6 +205,14 @@ fn validate_markets(markets: &[Market]) -> Result<()> {
             asset_owner.insert(asset.as_str(), market.hash.as_str());
         }
     }
+    Ok(())
+}
+
+fn ensure_market_count(count: usize) -> Result<()> {
+    ensure!(
+        count <= MAX_CACHE_MARKETS,
+        "cache contains {count} markets, maximum is {MAX_CACHE_MARKETS}"
+    );
     Ok(())
 }
 
@@ -297,5 +314,11 @@ mod tests {
             document.age(timestamp() - TimeDelta::seconds(1)),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn cache_market_limit_is_inclusive() {
+        assert!(ensure_market_count(MAX_CACHE_MARKETS).is_ok());
+        assert!(ensure_market_count(MAX_CACHE_MARKETS + 1).is_err());
     }
 }

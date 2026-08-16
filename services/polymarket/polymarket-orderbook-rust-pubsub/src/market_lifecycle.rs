@@ -534,9 +534,12 @@ fn complete_or_fail(
 }
 
 fn validate_market(market: &Market) -> Result<()> {
-    ensure!(!market.hash.is_empty(), "market hash must not be empty");
     ensure!(
-        market.assets.iter().all(|asset| !asset.is_empty()),
+        !market.hash.trim().is_empty(),
+        "market hash must not be empty"
+    );
+    ensure!(
+        market.assets.iter().all(|asset| !asset.trim().is_empty()),
         "market {} has an empty asset ID",
         market.hash
     );
@@ -665,6 +668,12 @@ mod tests {
         ));
         state.commit_observation(&first_observation);
         assert!(state.seen_new.contains("m"));
+    }
+
+    #[test]
+    fn whitespace_market_identity_is_rejected() {
+        assert!(validate_market(&market("   ", "a", "b")).is_err());
+        assert!(validate_market(&market("m", "   ", "b")).is_err());
     }
 
     #[test]

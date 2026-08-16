@@ -445,7 +445,7 @@ fn serialize_snapshot(
     snapshot: ActiveMarketSnapshot,
     safe_fetched_at: DateTime<Utc>,
 ) -> Result<String> {
-    CacheDocument::new(safe_fetched_at, snapshot.markets)?.to_json()
+    CacheDocument::from_lifecycle_snapshot(safe_fetched_at, snapshot.markets)?.to_json()
 }
 
 async fn request_snapshot(
