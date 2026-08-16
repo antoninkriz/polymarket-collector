@@ -43,12 +43,8 @@ Key format rules:
 
 ```text
 Polymarket WS lifecycle ─┐
-Polymarket Gamma REST ───┼─▶ Rust publisher ─▶ Redis Stream ─▶ Rust writer
-Redis restart cache ─────┘                        │              │
-                                                  │              ▼
-                                                  │         ClickHouse raw v3
-                                                  │              │
-                                                  └──────────────┴─▶ Rust exporter ─▶ R2/local
+Polymarket Gamma REST ───┼─▶ Rust publisher ─▶ Redis Stream ─▶ Rust writer ─▶ ClickHouse raw v3 ─▶ Rust exporter ─▶ R2/local
+Redis restart cache ─────┘
 ```
 
 ### Timestamps
