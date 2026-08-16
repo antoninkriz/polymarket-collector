@@ -1,9 +1,9 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::retry::RetryConfig;
@@ -54,11 +54,6 @@ fn validate_archive_key(key: &str) -> Result<()> {
         }),
         "invalid archive key: {key:?}"
     );
-    for component in Path::new(key).components() {
-        if !matches!(component, Component::Normal(_)) {
-            bail!("invalid archive key: {key:?}");
-        }
-    }
     Ok(())
 }
 
@@ -157,9 +152,6 @@ impl Archive for LocalArchive {
         staged
             .write_all(data)
             .with_context(|| format!("write staged archive object {key}"))?;
-        staged
-            .flush()
-            .with_context(|| format!("flush staged archive object {key}"))?;
         self.commit(key, staged)
     }
 
@@ -598,6 +590,7 @@ mod tests {
     use std::io::Read;
     use std::sync::Mutex;
 
+    use anyhow::bail;
     use tempfile::TempDir;
 
     use super::*;
