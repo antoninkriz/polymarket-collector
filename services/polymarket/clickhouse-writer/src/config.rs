@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-pub const DEFAULT_FLUSH_BATCH_SIZE: usize = 5_000;
-pub const DEFAULT_FLUSH_INTERVAL_MS: u64 = 500;
+pub const DEFAULT_FLUSH_BATCH_SIZE: usize = 50_000;
+pub const DEFAULT_FLUSH_INTERVAL_MS: u64 = 2_000;
 
 pub struct Config {
     pub redis_url: String,

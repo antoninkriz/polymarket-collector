@@ -114,7 +114,7 @@ The collector's internal queues are bounded. Saturation is treated as a fatal da
 | Collector events | 1,000,000 records |
 | WebSocket and reconciliation lifecycle inputs | 8,192 observations each |
 
-The ClickHouse writer has no in-process handoff queues. One actor owns at most one 5,000-record batch, retains its Redis delivery IDs until ClickHouse commits, and acknowledges them directly with `XACKDEL`. While ClickHouse is unavailable it stops reading rather than accumulating a second volatile backlog; unread records remain durable in Redis. `EVENT_CONSUMER_GROUP` and `EVENT_CONSUMER_NAME` must remain stable across restarts; changing either requires explicitly migrating or claiming pending entries and cleaning up the old group when applicable. Services log 60-second high-water marks and counters for their bounded state.
+The ClickHouse writer has no in-process handoff queues. One actor owns one bounded batch of up to the configured limit (50,000 records by default), retains its Redis delivery IDs until ClickHouse commits, and acknowledges them directly with `XACKDEL`. While ClickHouse is unavailable it stops reading rather than accumulating a second volatile backlog; unread records remain durable in Redis. `EVENT_CONSUMER_GROUP` and `EVENT_CONSUMER_NAME` must remain stable across restarts; changing either requires explicitly migrating or claiming pending entries and cleaning up the old group when applicable. Services log 60-second high-water marks and counters for their bounded state.
 
 ## Archive and replay
 

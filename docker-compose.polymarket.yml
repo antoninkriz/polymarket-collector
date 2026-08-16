@@ -103,8 +103,8 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       CLICKHOUSE_DATABASE: default
       CLICKHOUSE_TABLE: polymarket_orderbook_v3
-      FLUSH_BATCH_SIZE: "5000"
-      FLUSH_INTERVAL_MS: "500"
+      FLUSH_BATCH_SIZE: "${FLUSH_BATCH_SIZE:-50000}"
+      FLUSH_INTERVAL_MS: "${FLUSH_INTERVAL_MS:-2000}"
       RUST_LOG: info
 
   obdata-polymarket-archive-exporter:
