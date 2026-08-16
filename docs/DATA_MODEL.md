@@ -34,6 +34,8 @@ ORDER BY sequence;
 
 The log deliberately omits payload hashes, raw parent messages, connection identifiers, collector identifiers, transport identifiers, and schema-version columns. None is required to replay the stream observed by this collector. The non-unique Polymarket `hash` field is also removed.
 
+The Redis Stream carries the same logical row as exactly three fields: nonnegative nanosecond `timestamp_received`, unsigned `sequence`, and `data` containing one JSON object. The writer validates this exact shape and preserves the `data` text while wrapping batches as ClickHouse `JSONEachRow`; it does not import or deserialize the publisher's event types.
+
 ## Ordering across processes and restarts
 
 Polymarket supplies neither an exchange sequence nor a unique public fill ID. Source and receive timestamps may tie, and wall clocks can move. `sequence` is therefore the sole replay key:
@@ -59,7 +61,7 @@ Each binary market and its two outcome assets have one authoritative WebSocket r
 - `new_market`
 - `market_resolved`
 
-Three lifecycle listeners keep `new_market` discovery available across an individual socket failure. A WebSocket `new_market` observation is sent to the central lifecycle controller immediately; the controller establishes the authoritative asset subscriptions before admitting the lifecycle event. This path does not wait for a poll and is important for short-lived markets.
+Three lifecycle listeners keep `new_market` discovery available across an individual socket failure. A WebSocket `new_market` observation is sent to the central lifecycle controller immediately; the controller admits the lifecycle row before issuing the authoritative asset subscription, so the lifecycle sequence precedes any token event from the new route. This path does not wait for a poll and is important for short-lived markets.
 
 The lifecycle controller is the single owner of condition and asset state. It serializes WebSocket and Gamma observations, rejects conflicting asset ownership, suppresses repeated lifecycle state, and prevents a stale `new_market` observation from reactivating a resolved market.
 
@@ -70,9 +72,9 @@ The same Rust publisher owns the reconciliation paths:
 - incremental new-market scans run every 10 seconds; and
 - resolved-market scans run every 30 seconds.
 
-On restart, a bounded recent Gamma scan first subscribes active markets missing from the cache and moves recent cached markets ahead of the paced long tail. Incremental reconciliation begins at the cache's `fetched_at` watermark, so markets created while the collector was stopped are not hidden by startup time.
+On restart, a bounded recent Gamma scan first subscribes active markets missing from the cache and moves recent cached markets ahead of the paced long tail. Incremental reconciliation begins at the cache's conservative `fetched_at` watermark, so markets created while the collector was stopped are not hidden by startup time.
 
-The publisher never replaces a restart-cache snapshot until the current process has completed both a full active-market scan and the initial resolved-market catch-up. This preserves the previous cache and its honest `fetched_at` timestamp if either startup reconciliation is interrupted. After both complete, changed snapshots are saved periodically and during graceful shutdown.
+The publisher never replaces a restart-cache snapshot until the current process has completed a full active-market scan, a successful new-market poll, and a successful resolved-market poll. Its stored `fetched_at` is the earlier of the two successful poll watermarks minus a two-minute overlap; it is never the wall-clock save time. This preserves delayed Gamma visibility and leaves the previous cache untouched if any startup reconciliation is interrupted. After the complete baseline, a changed market revision or coverage watermark is saved at most once per minute and during graceful shutdown.
 
 All Gamma work shares a 10 request/second limiter and bounded retry policy. WebSocket lifecycle events remain the low-latency source. Gamma adds missing subscriptions and may synthesize a missing lifecycle row only when a usable source creation or closure timestamp exists.
 
@@ -105,7 +107,7 @@ Only retries of the same collector record are collapsed. They carry the same `se
 
 Payload-based deduplication is intentionally forbidden for market-data events. `transaction_hash`, market, asset, timestamp, price, size, side, and fee do not form a unique fill identity: Polygon can settle multiple fills in one transaction, and the feed may legitimately deliver identical-looking observations. A repeated source observation therefore receives a new sequence and remains in the archive. Lifecycle state is the exception: the central controller admits each market transition once.
 
-The publisher's internal queues are bounded and backpressured:
+The publisher's internal queues are bounded. Saturation is treated as a fatal data-integrity failure rather than silently dropping an admitted record:
 
 | Queue | Capacity |
 |---|---:|

@@ -40,7 +40,9 @@ services:
     # AOF preserves the durable handoff across restarts. The stream is written
     # at very high volume but normally contains only a small unacknowledged
     # tail, so Redis's 64 MiB default would rewrite the AOF every few seconds.
-    # A 4 GiB floor keeps recovery bounded while avoiding continuous forks.
+    # A 4 GiB floor keeps recovery bounded but still permits rewrites every few
+    # minutes at current traffic; monitor the cadence before increasing it,
+    # because a larger AOF also lengthens restart recovery.
     # Periodic RDB snapshots are redundant with AOF and would add another fork
     # every minute under this workload.
     command:

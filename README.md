@@ -1,6 +1,6 @@
 # Polymarket Collector
 
-This project collects live data from Polymarket across all prediction markets with periodic hourly Parquet exports. Compared to its predecessors, it should correctly handle short-lived markets such as 5-minute BTC up/down markets, preserve the original event order for correct order book reconstruction, and stores different types of market event data separately in an optimized Parquet layout.
+This repository collects Polymarket's public market WebSocket feed across active binary markets, discovers short-lived contracts such as 5-minute BTC up/down markets, preserves collector order for deterministic orderbook reconstruction, and exports each UTC receive-time hour as compact event-specific Parquet files.
 
 ## The archive structure TLDR
 
@@ -36,10 +36,8 @@ Key format rules:
 - **Common columns:** `timestamp_received`, `sequence`, source `timestamp`, and `market`; token files add `asset_id`.
 - **Exact values:** prices and sizes are decimals, and book sides are typed lists of `(price, size)` structs.
 - **Physical order:** `(market, asset_id, sequence)` for token events and `(market, sequence)` for lifecycle events.
-- **Replay order:** always `sequence` column as seqnum, even across different files.
+- **Replay order:** always merge on `sequence`, including across different files.
 - **Completion:** trust an hour only when `manifest.json` exists.
-
-
 
 ## Architecture
 
@@ -55,11 +53,10 @@ Redis restart cache ─────┘                        │              �
 
 ### Timestamps
 
-There are two kinds of timestamps in the data.
-
-First, there is the `timestamp` field, which represents Polymarket's internal timestamp. This one has only milliseconds precision and its actual source inside Polymarket's infrastructure is not discosed.
-
-Then, there is the `timestamp_received`, marking the nanosecond timestamp of the arrival of the published message into the Rust code of the collector. Somewhat accurate schema is below.
+| Timestamp | Meaning |
+|---|---|
+| `timestamp` | Polymarket's millisecond source timestamp; its exact origin inside Polymarket is not disclosed. |
+| `timestamp_received` | UTC nanoseconds sampled when the WebSocket library yields the complete text frame to the Rust collector, before parsing, expansion, sequencing, Redis, or ClickHouse. |
 
 ```text
 Polymarket infrastructure
@@ -100,27 +97,25 @@ Parquet
 
 ### Publisher — discovery, collection, and order
 
-`[polymarket-orderbook-rust-pubsub](services/polymarket/polymarket-orderbook-rust-pubsub)`
+[polymarket-orderbook-rust-pubsub](services/polymarket/polymarket-orderbook-rust-pubsub)
 
 - Owns market state, authoritative WebSocket subscriptions, receive timestamps, and collector sequencing.
 - Listens for `new_market` on three lifecycle sockets and subscribes its assets immediately—important for short-lived markets.
 - Restores known markets from a validated Redis cache after restart.
 - Reconciles through one rate-limited Gamma client: new markets every 10 seconds, resolutions every 30 seconds, and a full scan every 30 minutes.
-
-
+- Replaces the restart cache only after full, new-market, and resolved-market reconciliation establish a conservative coverage watermark.
 
 ### Redis Stream — the durable handoff
 
 - Separates live WebSocket collection from ClickHouse restarts and write latency.
 - Uses a renewable lease and fencing generation so exactly one publisher can append to `polymarket:events:v3`.
+- Carries exactly `timestamp_received`, `sequence`, and normalized JSON `data` for each record.
 - Keeps records pending until ClickHouse commits; Redis AOF is enabled.
 - Absorbs short storage interruptions. It is not sized as a multi-hour RAM backlog.
 
-
-
 ### Writer and ClickHouse — a compact raw window
 
-`[polymarket-orderbook-rust-from-pubsub](services/polymarket/polymarket-orderbook-rust-from-pubsub)`
+[polymarket-orderbook-rust-from-pubsub](services/polymarket/polymarket-orderbook-rust-from-pubsub)
 
 - Batches Redis records into `polymarket_orderbook_v3`.
 - Uses one bounded actor for Redis reads, ClickHouse commits, and Redis acknowledgements; there are no in-process handoff queues.
@@ -128,11 +123,9 @@ Parquet
 - Collapses delivery retries by `sequence`; it never deduplicates by payload.
 - Keeps ClickHouse as a short queryable export window. Validated archived partitions expire after three hours by default, while the newest is retained for sequence recovery.
 
-
-
 ### Exporter — typed, immutable hours
 
-The `[Rust exporter](services/r2-archive/exporter)`:
+The [Rust exporter](services/r2-archive/exporter):
 
 - Streams Arrow batches into event-specific Parquet without buffering an hour.
 - Writes ZSTD level 9 files and publishes `manifest.json` last.
@@ -149,9 +142,7 @@ The `[Rust exporter](services/r2-archive/exporter)`:
 - `transaction_hash` is not a fill ID: one Polygon transaction can settle multiple fills, so trade payload fields are never used for deduplication.
 - Polymarket exposes no replay cursor or source sequence. The archive faithfully records what this collector accepted, but it is not an exchange audit log and cannot recreate an event missed during an outage.
 
-The complete collection, restart, timestamp, reconnection, and replay contract is in `[docs/DATA_MODEL.md](docs/DATA_MODEL.md)`.
-
-
+The complete collection, restart, timestamp, reconnection, and replay contract is in [docs/DATA_MODEL.md](docs/DATA_MODEL.md).
 
 ## Development and operations
 
@@ -266,33 +257,32 @@ For an archive-level check, verify that each expected hour has a readable `manif
 | ---------------------------- | ---------------------- | ----------------------------------------- |
 | CPU                          | 4 modern vCPUs         | 8 modern vCPUs                            |
 | RAM                          | 16 GiB                 | 32 GiB                                    |
-| Open files (`RLIMIT_NOFILE`) | `32768`                | `262144`                                  |
+| Open files (`RLIMIT_NOFILE`) | `65536`                | `262144`                                  |
 | Local disk with R2           | 50 GiB SSD             | 100 GiB NVMe                              |
 | Network                      | 100 Mbit/s symmetric   | 200+ Mbit/s symmetric; 1 Gbit/s preferred |
 | Local archive                | Add 22 GB/day retained | Add 0.65 TB per 30 days plus headroom     |
 
 
-> **Reference workload:** measured with approximately 160,000 binary markets,
-> 320,000 assets, 1,280 WebSocket connections, and 94.5 million normalized
-> events per hour (about 26,000/s). Polymarket traffic varies.
+> **Reference workload:** measured with approximately 156,000 binary markets, 312,000 assets, 1,250 WebSocket connections, and about 100 million normalized events per hour (roughly 28,000/s). Polymarket traffic varies.
 
 
 | Resource         | Measured reference                                                           | Explanation                                                                                                       |
 | ---------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | CPU             | Roughly one aggregate core in steady state.                                   | ClickHouse merges, cold subscription, and hourly export are bursty; 4 vCPUs can be tight, 8 leaves nice headroom. |
-| RAM             | About 6–7 GiB total; the publisher used roughly 3–4 GiB.                      | 16 GiB supports a healthy full-universe pipeline; 32 GiB provides safer burst and backlog capacity.               |
-| Open files      | ClickHouse loves high `nofile` limit and we need around ~1500 WS connections. | A high limit avoids failures during reconnect waves, merges, and export.                                          |
+| RAM             | About 4–5 GiB of container RSS; the publisher uses roughly 1.0–1.2 GiB.        | 16 GiB supports the full pipeline; 32 GiB leaves safer page-cache, merge, export, and backlog headroom.            |
+| Open files      | The publisher holds roughly 1,250 WebSockets and ClickHouse uses many files.   | A high limit avoids failures during reconnect waves, merges, and export.                                          |
 | ClickHouse disk | About 3.4–3.8 GiB per raw hour; the rolling window normally uses 15–20 GiB.   | Any reasonable SSD should be fine, we need storage for the DB and exports.                                        |
 | Parquet archive | About 0.8–0.9 GB/hour, or 20–22 GB/day.                                       | The data take around 0.65 TB per 30 days in local storage or R2.                                                  |
 | Network in      | Roughly 60–75 Mbit/s sustained, with snapshot and reconnect bursts.           | 100 Mbit/s is a minimum. More bandwidth shortens full-universe and reconnect recovery.                            |
-| Network out     | Control traffic stays below 1 Mbit/s; Burst uploads of ~1 GB of data hourly.  | Faster outbound completes R2 uploads well before the next hour becomes eligible.                                  |
+| Network out     | Control traffic stays below 1 Mbit/s; burst uploads send roughly 1 GB hourly. | Faster outbound completes R2 uploads well before the next hour becomes eligible.                                  |
 
 RAM sizing assumes the ClickHouse writer is healthy. A writer outage leaves the durable Redis Stream growing at approximately the uncompressed event rate of about 30 GiB an hour before Redis overhead. Monitor lag and memory closely and consider Redis as a short term back-off rather than treating Redis as a multi-hour backlog store.
 
 ## Documentation
 
-- `[docs/DATA_MODEL.md](docs/DATA_MODEL.md)` — collection guarantees, timestamps, ordering, reconnect behavior, deduplication, and replay.
-- `[docs/PARQUET_EXPORT.md](docs/PARQUET_EXPORT.md)` — every exported column, Arrow and Parquet type, nullability, encoding, file order, and manifest field.
+- [docs/DATA_MODEL.md](docs/DATA_MODEL.md) — collection guarantees, timestamps, ordering, reconnect behavior, deduplication, and replay.
+- [docs/PARQUET_EXPORT.md](docs/PARQUET_EXPORT.md) — every exported column, Arrow and Parquet type, nullability, encoding, file order, and manifest field.
+- [docs/REFACTOR.md](docs/REFACTOR.md) — current architecture decisions, accepted complexity, rejected proposals, and remaining cleanup gates.
 
 
 
