@@ -28,8 +28,6 @@ pub struct ClickHouseConfig {
 pub struct ClickHouseSink {
     cfg: ClickHouseConfig,
     http: Client,
-    total_flushed: u64,
-    total_failures: u64,
 }
 
 impl ClickHouseSink {
@@ -39,12 +37,7 @@ impl ClickHouseSink {
             .build()
             .context("build reqwest client")?;
 
-        let sink = Self {
-            cfg,
-            http,
-            total_flushed: 0,
-            total_failures: 0,
-        };
+        let sink = Self { cfg, http };
         sink.ensure_database().await?;
         sink.ensure_table().await?;
 
@@ -71,11 +64,9 @@ impl ClickHouseSink {
             match self.send_insert(body.clone()).await {
                 Ok(()) => break,
                 Err(error) => {
-                    self.total_failures += 1;
                     error!(
                         %error,
                         count,
-                        total_failures = self.total_failures,
                         retry_delay_ms = retry_delay.as_millis() as u64,
                         "ClickHouse insert failed; retaining batch for retry",
                     );
@@ -85,16 +76,7 @@ impl ClickHouseSink {
             }
         }
 
-        self.total_flushed += count as u64;
         Ok(())
-    }
-
-    pub fn total_flushed(&self) -> u64 {
-        self.total_flushed
-    }
-
-    pub fn total_failures(&self) -> u64 {
-        self.total_failures
     }
 
     fn serialize_batch<'a>(rows: impl ExactSizeIterator<Item = &'a RawRow>) -> Result<Vec<u8>> {

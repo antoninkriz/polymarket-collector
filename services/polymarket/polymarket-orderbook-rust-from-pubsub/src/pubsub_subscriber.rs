@@ -289,11 +289,7 @@ impl Writer {
         }
 
         self.report_stats(true);
-        info!(
-            total_flushed = self.sink.total_flushed(),
-            total_failures = self.sink.total_failures(),
-            "Redis to ClickHouse writer shut down cleanly",
-        );
+        info!("Redis to ClickHouse writer shut down cleanly");
         Ok(())
     }
 

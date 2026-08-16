@@ -1,8 +1,9 @@
 //! Polymarket orderbook → ClickHouse writer fed from a durable Redis Stream.
 //!
 //! Consumes the stream written by `polymarket-orderbook-rust-pubsub`,
-//! deserializes each v3 record, and acknowledges it only after the ClickHouse
-//! sink commits. No WS pool or market lifecycle processing runs here.
+//! validates each raw v3 record, preserves its JSON text, and acknowledges it
+//! only after ClickHouse commits. No market-data decoding or WebSocket work
+//! runs here.
 //!
 //! ```text
 //!   Redis Stream ──► writer actor ──► ClickHouse commit ──► Redis acknowledgement

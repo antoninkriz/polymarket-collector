@@ -77,8 +77,6 @@ async fn sink_collapses_only_same_sequence_retry() -> Result<()> {
         row(1_757_908_892_351_123_457, first_sequence + 1, &data),
     ];
     sink.insert(batch.iter()).await?;
-    assert_eq!(sink.total_flushed(), 3);
-    assert_eq!(sink.total_failures(), 0);
 
     let final_count = query(
         &http,
