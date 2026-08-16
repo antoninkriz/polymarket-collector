@@ -25,7 +25,9 @@ const LIFECYCLE_LISTENER_CONNECTIONS: usize = 3;
 
 struct ConnHandle {
     conn_id: usize,
-    assets: HashSet<String>,
+    /// Number of assets routed here. Exact membership remains authoritative
+    /// in `Pool::asset_to_conn`.
+    asset_count: usize,
     metrics: Arc<ConnMetrics>,
     lifecycle_listener: bool,
     cmd_tx: mpsc::Sender<Command>,
@@ -132,17 +134,14 @@ impl Pool {
         let conns_down = self
             .connections
             .iter()
-            .filter(|connection| {
-                !connection.assets.is_empty() && !connection.metrics.is_connected()
-            })
+            .filter(|connection| connection.asset_count > 0 && !connection.metrics.is_connected())
             .count();
         let assets_down = self
             .connections
             .iter()
             .map(|connection| {
                 connection
-                    .assets
-                    .len()
+                    .asset_count
                     .saturating_sub(connection.metrics.ready_assets())
             })
             .sum();
@@ -240,7 +239,7 @@ impl Pool {
             // Every market consumes two slots. Once a connection has fewer
             // than two free slots, no later market in this batch can use it.
             while conn_index < self.connections.len()
-                && self.connections[conn_index].assets.len() + pending_assets[conn_index].len() + 2
+                && self.connections[conn_index].asset_count + pending_assets[conn_index].len() + 2
                     > self.max_assets_per_conn
             {
                 conn_index += 1;
@@ -266,7 +265,7 @@ impl Pool {
                 continue;
             }
             let conn_id = handle.conn_id;
-            handle.assets.extend(assets.iter().cloned());
+            handle.asset_count += assets.len();
             if let Err(error) = handle.cmd_tx.send(Command::Subscribe(assets)).await {
                 command_error.get_or_insert_with(|| {
                     anyhow!("send subscribe command to connection {conn_id}: {error}")
@@ -289,6 +288,10 @@ impl Pool {
         let Some(&conn_id) = self.market_to_conn.get(market_hash) else {
             return Ok(());
         };
+        ensure!(
+            assets[0] != assets[1],
+            "market {market_hash} cannot unsubscribe the same asset twice"
+        );
         for asset in assets {
             ensure!(
                 self.asset_to_conn.get(asset) == Some(&conn_id),
@@ -296,37 +299,46 @@ impl Pool {
             );
         }
 
+        let handle_index = self
+            .connections
+            .iter()
+            .position(|handle| handle.conn_id == conn_id)
+            .ok_or_else(|| {
+                anyhow!("market {market_hash} routes to missing connection {conn_id}")
+            })?;
+        let remaining_asset_count = self.connections[handle_index]
+            .asset_count
+            .checked_sub(assets.len())
+            .ok_or_else(|| {
+                anyhow!(
+                    "connection {conn_id} has {} assigned assets, cannot remove {} for market {market_hash}",
+                    self.connections[handle_index].asset_count,
+                    assets.len(),
+                )
+            })?;
+
         self.market_to_conn.remove(market_hash);
         for asset in assets {
             self.asset_to_conn.remove(asset);
         }
-        let mut command_error = None;
-        if let Some(handle) = self.connections.iter_mut().find(|h| h.conn_id == conn_id) {
-            for asset in assets {
-                handle.assets.remove(asset);
-            }
-            if let Err(error) = handle
+        let (command_error, remove_connection) = {
+            let handle = &mut self.connections[handle_index];
+            handle.asset_count = remaining_asset_count;
+            let command_error = handle
                 .cmd_tx
                 .send(Command::Unsubscribe(assets.to_vec()))
                 .await
-            {
-                command_error = Some(anyhow!(
-                    "send unsubscribe command to connection {conn_id}: {error}"
-                ));
-            }
-        }
-
-        let mut index = 0;
-        while index < self.connections.len() {
-            if self.connections[index].assets.is_empty()
-                && !self.connections[index].lifecycle_listener
-            {
-                let handle = self.connections.swap_remove(index);
-                drop(handle.cmd_tx);
-                handle.join.abort();
-            } else {
-                index += 1;
-            }
+                .err()
+                .map(|error| anyhow!("send unsubscribe command to connection {conn_id}: {error}"));
+            (
+                command_error,
+                handle.asset_count == 0 && !handle.lifecycle_listener,
+            )
+        };
+        if remove_connection {
+            let handle = self.connections.swap_remove(handle_index);
+            drop(handle.cmd_tx);
+            handle.join.abort();
         }
 
         if let Some(error) = command_error {
@@ -388,7 +400,7 @@ impl Pool {
         let join = tokio::spawn(connection.run(cmd_rx));
         self.connections.push(ConnHandle {
             conn_id,
-            assets: HashSet::new(),
+            asset_count: 0,
             metrics,
             lifecycle_listener,
             cmd_tx,
@@ -433,7 +445,7 @@ mod tests {
         let join = tokio::spawn(std::future::pending::<Result<()>>());
         pool.connections.push(ConnHandle {
             conn_id,
-            assets: HashSet::new(),
+            asset_count: 0,
             metrics: Arc::new(ConnMetrics::default()),
             lifecycle_listener: true,
             cmd_tx,
@@ -519,7 +531,7 @@ mod tests {
         assert_eq!(pool.market_to_conn[&subscribed.hash], 41);
         assert_eq!(pool.asset_to_conn[&subscribed.assets[0]], 41);
         assert_eq!(pool.asset_to_conn[&subscribed.assets[1]], 41);
-        assert_eq!(pool.connections[0].assets.len(), 2);
+        assert_eq!(pool.connections[0].asset_count, 2);
     }
 
     #[tokio::test]
@@ -534,7 +546,7 @@ mod tests {
 
         assert_eq!(pool.connection_count(), 2);
         for handle in &pool.connections {
-            assert!(handle.assets.len() <= 4);
+            assert!(handle.asset_count <= 4);
         }
         for market in &markets {
             assert_eq!(
@@ -581,6 +593,8 @@ mod tests {
         assert_eq!(pool.market_to_conn["m3"], first_conn);
         assert_ne!(pool.market_to_conn["m4"], first_conn);
         assert_eq!(pool.market_to_conn["m4"], pool.market_to_conn["m5"]);
+        assert_eq!(pool.connections[0].asset_count, 6);
+        assert_eq!(pool.connections[1].asset_count, 4);
     }
 
     #[tokio::test]
@@ -607,11 +621,16 @@ mod tests {
 
         assert_eq!(pool.connection_count(), 2);
         assert_eq!(pool.market_to_conn["m6"], last_conn);
-        assert!(pool.connections.iter().any(|handle| {
-            handle.conn_id == last_conn
-                && handle.assets.contains("a5y")
-                && handle.assets.contains("a6y")
-        }));
+        assert_eq!(pool.asset_to_conn["a5y"], last_conn);
+        assert_eq!(pool.asset_to_conn["a6y"], last_conn);
+        assert_eq!(
+            pool.connections
+                .iter()
+                .find(|handle| handle.conn_id == last_conn)
+                .unwrap()
+                .asset_count,
+            4,
+        );
     }
 
     #[tokio::test]
@@ -647,7 +666,7 @@ mod tests {
 
         assert_eq!(pool.connection_count(), 1);
         assert_eq!(pool.market_to_conn.len(), 1);
-        assert_eq!(pool.connections[0].assets.len(), 2);
+        assert_eq!(pool.connections[0].asset_count, 2);
     }
 
     #[tokio::test]
@@ -675,7 +694,7 @@ mod tests {
         assert_eq!(pool.market_to_conn.len(), 0);
         assert!(pool.asset_to_conn.is_empty());
         assert_eq!(pool.connection_count(), 1);
-        assert!(pool.connections[0].assets.is_empty());
+        assert_eq!(pool.connections[0].asset_count, 0);
         assert_eq!(pool.lifecycle_conn_id, Some(pool.connections[0].conn_id));
     }
 
@@ -701,7 +720,7 @@ mod tests {
         assert!(!pool.market_to_conn.contains_key(&subscribed.hash));
         assert!(!pool.asset_to_conn.contains_key(&subscribed.assets[0]));
         assert!(!pool.asset_to_conn.contains_key(&subscribed.assets[1]));
-        assert!(pool.connections[0].assets.is_empty());
+        assert_eq!(pool.connections[0].asset_count, 0);
     }
 
     #[tokio::test]
@@ -719,7 +738,52 @@ mod tests {
             .is_err());
         assert_eq!(pool.market_to_conn.len(), 1);
         assert_eq!(pool.asset_to_conn.len(), 2);
-        assert_eq!(pool.connections[0].assets.len(), 2);
+        assert_eq!(pool.connections[0].asset_count, 2);
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_rejects_asset_count_underflow_before_mutation() {
+        let mut pool = pool(2);
+        let mut commands = add_test_connection(&mut pool, 43);
+        let subscribed = market("m1", "a1y", "a1n");
+        pool.subscribe_markets(std::slice::from_ref(&subscribed))
+            .await
+            .unwrap();
+        assert!(matches!(commands.recv().await, Some(Command::Subscribe(_))));
+        pool.connections[0].asset_count = 1;
+
+        let error = pool
+            .unsubscribe_market(&subscribed.hash, &subscribed.assets)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("has 1 assigned assets"));
+        assert_eq!(pool.market_to_conn[&subscribed.hash], 43);
+        assert_eq!(pool.asset_to_conn[&subscribed.assets[0]], 43);
+        assert_eq!(pool.asset_to_conn[&subscribed.assets[1]], 43);
+        assert_eq!(pool.connections[0].asset_count, 1);
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_rejects_duplicate_assets_before_mutation() {
+        let mut pool = pool(2);
+        let subscribed = market("m1", "a1y", "a1n");
+        pool.subscribe_markets(std::slice::from_ref(&subscribed))
+            .await
+            .unwrap();
+
+        let duplicate = ["a1y".into(), "a1y".into()];
+        let error = pool
+            .unsubscribe_market(&subscribed.hash, &duplicate)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("same asset twice"));
+        assert_eq!(pool.market_to_conn[&subscribed.hash], 0);
+        assert_eq!(pool.asset_to_conn[&subscribed.assets[0]], 0);
+        assert_eq!(pool.asset_to_conn[&subscribed.assets[1]], 0);
+        assert_eq!(pool.connections[0].asset_count, 2);
     }
 
     #[tokio::test]
@@ -729,7 +793,7 @@ mod tests {
         pool.start().await;
 
         assert_eq!(pool.connection_count(), 1);
-        assert!(pool.connections[0].assets.is_empty());
+        assert_eq!(pool.connections[0].asset_count, 0);
         assert_eq!(pool.lifecycle_conn_id, Some(pool.connections[0].conn_id));
     }
 
@@ -778,7 +842,7 @@ mod tests {
         let join = tokio::spawn(std::future::pending::<Result<()>>());
         pool.connections.push(ConnHandle {
             conn_id: 0,
-            assets: HashSet::new(),
+            asset_count: 0,
             metrics: Arc::new(ConnMetrics::default()),
             lifecycle_listener: true,
             cmd_tx,
@@ -814,7 +878,7 @@ mod tests {
         let (cmd_tx, _cmd_rx) = mpsc::channel(COMMAND_CHANNEL_SIZE);
         pool.connections.push(ConnHandle {
             conn_id: 0,
-            assets: HashSet::new(),
+            asset_count: 0,
             metrics: Arc::new(ConnMetrics::default()),
             lifecycle_listener: true,
             cmd_tx,
