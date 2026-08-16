@@ -7,7 +7,7 @@ This document defines the collector's correctness contract: what is observed, ho
 | Property | Contract |
 |---|---|
 | Observation order | `sequence` is the authoritative total order assigned by this collector. |
-| Receive time | `timestamp_received` is sampled as soon as the WebSocket library yields a text frame, before parsing or queueing. |
+| Receive time | WebSocket rows are stamped when the library yields a complete text frame; Gamma-recovered lifecycle rows are stamped after the complete HTTP response arrives. |
 | Orderbook recovery | After a new connection or subscription, deltas are withheld until a fresh `book` snapshot arrives for that asset. |
 | Delivery retries | Redis and ClickHouse may retry a record without duplicating it logically because the retry retains its `sequence`. |
 | Source duplicates | Separate WebSocket observations are retained even when every public payload field is identical. |
@@ -85,7 +85,7 @@ Every exported row has two timestamps with different meanings:
 | Column | Meaning |
 |---|---|
 | `timestamp` | Millisecond timestamp supplied by Polymarket. It is source data, not a safe tie-breaker. |
-| `timestamp_received` | Nanosecond UTC wall-clock time sampled in userspace when the complete source frame becomes available to the collector. |
+| `timestamp_received` | Nanosecond UTC wall-clock time sampled in userspace when the complete WebSocket frame or Gamma HTTP response becomes available to the collector. |
 
 All normalized children of one WebSocket frame share its receive timestamp. The timestamp is taken before JSON parsing, fan-out, Redis, or ClickHouse work, but it still includes network-stack, TLS, and scheduler latency; it is not a kernel or hardware packet timestamp.
 
@@ -129,7 +129,7 @@ Physical row order is not the global replay order. To replay a complete hour:
 
 `best_bid_ask` is an independently observed top-of-book notification, not a depth mutation. Lifecycle rows are market-scoped and do not have an `asset_id`. See [`PARQUET_EXPORT.md`](PARQUET_EXPORT.md) for the complete file contract.
 
-The exporter removes an old ClickHouse partition only after validating the hour's manifest, all seven exact file entries, statistics, digests, and archive objects. Cleanup failures retain the partition for a later attempt. The newest partition is always kept.
+The exporter removes an old ClickHouse partition only after validating the hour's manifest, all seven exact file entries, statistics, digest syntax, and object existence. It does not download every Parquet object and recompute its digest during retention; archive consumers should verify the recorded SHA-256 values when reading an hour. Cleanup failures retain the partition for a later attempt. The newest partition is always kept.
 
 ## Limits of the public feed
 

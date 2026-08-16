@@ -56,9 +56,11 @@ Redis restart cache ─────┘                        │              �
 | Timestamp | Meaning |
 |---|---|
 | `timestamp` | Polymarket's millisecond source timestamp; its exact origin inside Polymarket is not disclosed. |
-| `timestamp_received` | UTC nanoseconds sampled when the WebSocket library yields the complete text frame to the Rust collector, before parsing, expansion, sequencing, Redis, or ClickHouse. |
+| `timestamp_received` | For WebSocket rows, UTC nanoseconds sampled when the library yields the complete text frame; for Gamma-recovered lifecycle rows, sampled after the complete HTTP body arrives and before decoding. |
 
 ```text
+WebSocket rows
+
 Polymarket infrastructure
 │
 ├─ Event is published
