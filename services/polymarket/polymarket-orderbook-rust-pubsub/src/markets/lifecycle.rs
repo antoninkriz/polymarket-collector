@@ -1,5 +1,6 @@
 //! Commands sent to the publisher's authoritative market lifecycle controller.
 
+use chrono::{DateTime, Utc};
 use tokio::sync::oneshot;
 
 use crate::events::{Market, MarketLifecycleObservation};
@@ -14,13 +15,14 @@ pub enum LifecycleSource {
 
 pub type LifecycleCompletion = oneshot::Sender<Result<(), String>>;
 
-#[derive(Debug, Clone)]
-pub struct ActiveMarketSnapshot {
+#[derive(Debug)]
+pub struct RestartCacheSnapshot {
     pub revision: u64,
-    pub markets: Vec<Market>,
+    pub raw: String,
 }
 
-pub type LifecycleSnapshotCompletion = oneshot::Sender<ActiveMarketSnapshot>;
+pub type LifecycleSnapshotCompletion =
+    oneshot::Sender<Result<Option<RestartCacheSnapshot>, String>>;
 pub type PoolStatsCompletion = oneshot::Sender<PoolStats>;
 
 /// Lower-priority lifecycle work. WebSocket observations use their own
@@ -37,6 +39,8 @@ pub enum LifecycleRequest {
         completion: LifecycleCompletion,
     },
     Snapshot {
+        fetched_at: DateTime<Utc>,
+        unchanged_revision: Option<u64>,
         completion: LifecycleSnapshotCompletion,
     },
     PoolStats {

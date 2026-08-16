@@ -41,19 +41,6 @@ impl CacheDocument {
         })
     }
 
-    /// Build from the authoritative lifecycle state, whose invariants were
-    /// checked before it admitted each market.
-    pub(crate) fn from_lifecycle_snapshot(
-        fetched_at: DateTime<Utc>,
-        markets: Vec<Market>,
-    ) -> Result<Self> {
-        ensure_market_count(markets.len())?;
-        Ok(Self {
-            fetched_at,
-            markets,
-        })
-    }
-
     pub fn fetched_at(&self) -> DateTime<Utc> {
         self.fetched_at
     }
@@ -124,6 +111,40 @@ struct CacheEntry {
     no_asset_id: String,
 }
 
+#[derive(Serialize)]
+struct BorrowedCacheDocument<'a> {
+    fetched_at: String,
+    markets: Vec<BorrowedCacheEntry<'a>>,
+}
+
+#[derive(Serialize)]
+struct BorrowedCacheEntry<'a> {
+    market: &'a str,
+    yes_asset_id: &'a str,
+    no_asset_id: &'a str,
+}
+
+/// Serialize the authoritative lifecycle state without cloning its IDs.
+pub(crate) fn serialize_lifecycle_document<'a>(
+    fetched_at: DateTime<Utc>,
+    markets: impl ExactSizeIterator<Item = (&'a str, &'a [String; 2])>,
+) -> Result<String> {
+    ensure_market_count(markets.len())?;
+    let mut entries: Vec<_> = markets
+        .map(|(market, assets)| BorrowedCacheEntry {
+            market,
+            yes_asset_id: &assets[0],
+            no_asset_id: &assets[1],
+        })
+        .collect();
+    entries.sort_unstable_by(|left, right| left.market.cmp(right.market));
+    serde_json::to_string(&BorrowedCacheDocument {
+        fetched_at: fetched_at.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+        markets: entries,
+    })
+    .context("serialize cache JSON")
+}
+
 /// Load and validate a complete restart-cache document.
 pub async fn load_document(redis_url: &str, key: &str) -> Result<Option<CacheDocument>> {
     let client = redis::Client::open(redis_url).context("open redis client")?;
@@ -147,8 +168,7 @@ pub async fn load_document(redis_url: &str, key: &str) -> Result<Option<CacheDoc
     Ok(Some(document))
 }
 
-/// Atomically store JSON previously produced by [`CacheDocument::to_json`].
-/// This split lets callers move serialization to `spawn_blocking`.
+/// Atomically store a serialized restart-cache JSON document.
 pub async fn save_json(redis_url: &str, key: &str, raw: String) -> Result<()> {
     let client = redis::Client::open(redis_url).context("open redis client")?;
     let mut conn = client
@@ -320,5 +340,41 @@ mod tests {
     fn cache_market_limit_is_inclusive() {
         assert!(ensure_market_count(MAX_CACHE_MARKETS).is_ok());
         assert!(ensure_market_count(MAX_CACHE_MARKETS + 1).is_err());
+    }
+
+    #[test]
+    fn lifecycle_serialization_matches_owned_document_and_sorts_markets() {
+        let mut markets = vec![
+            market("z\nmarket", "z\\yes", "z\"no"),
+            market("a-market", "a-yes", "a-no"),
+        ];
+        let raw = serialize_lifecycle_document(
+            timestamp(),
+            markets
+                .iter()
+                .map(|market| (market.hash.as_str(), &market.assets)),
+        )
+        .unwrap();
+
+        markets.sort_unstable_by(|left, right| left.hash.cmp(&right.hash));
+        let owned = CacheDocument::new(timestamp(), markets)
+            .unwrap()
+            .to_json()
+            .unwrap();
+        assert_eq!(raw, owned);
+        assert_eq!(
+            raw,
+            r#"{"fetched_at":"2026-08-14T12:34:56Z","markets":[{"market":"a-market","yes_asset_id":"a-yes","no_asset_id":"a-no"},{"market":"z\nmarket","yes_asset_id":"z\\yes","no_asset_id":"z\"no"}]}"#
+        );
+    }
+
+    #[test]
+    fn lifecycle_serialization_rejects_more_than_the_cache_limit() {
+        let assets = ["yes".to_string(), "no".to_string()];
+        let markets = std::iter::repeat_n(("market", &assets), MAX_CACHE_MARKETS + 1);
+        let error = serialize_lifecycle_document(timestamp(), markets)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("maximum is 500000"), "{error}");
     }
 }

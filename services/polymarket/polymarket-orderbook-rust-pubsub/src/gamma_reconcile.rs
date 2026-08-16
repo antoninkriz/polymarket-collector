@@ -10,8 +10,8 @@ use tracing::{info, warn};
 
 use crate::events::{Event, Market, MarketLifecycleObservation};
 use crate::markets::gamma::{GammaClient, GammaMarket};
-use crate::markets::lifecycle::{ActiveMarketSnapshot, LifecycleRequest, LifecycleSource};
-use crate::markets::redis_cache::{self, CacheDocument};
+use crate::markets::lifecycle::{LifecycleRequest, LifecycleSource, RestartCacheSnapshot};
+use crate::markets::redis_cache;
 
 const FULL_SCAN_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const FULL_SCAN_RETRY_INTERVAL: Duration = Duration::from_secs(30);
@@ -424,41 +424,43 @@ async fn persist_snapshot(
     safe_fetched_at: DateTime<Utc>,
     saved_snapshot: &mut Option<(u64, DateTime<Utc>)>,
 ) -> Result<bool> {
-    let snapshot = request_snapshot(lifecycle_tx).await?;
-    let identity = (snapshot.revision, safe_fetched_at);
-    if !snapshot_changed(*saved_snapshot, identity) {
+    let unchanged_revision = matching_saved_revision(*saved_snapshot, safe_fetched_at);
+    let Some(snapshot) =
+        request_snapshot(lifecycle_tx, safe_fetched_at, unchanged_revision).await?
+    else {
         return Ok(false);
-    }
-    let raw = tokio::task::spawn_blocking(move || serialize_snapshot(snapshot, safe_fetched_at))
-        .await
-        .context("cache serialization task failed")??;
-    redis_cache::save_json(redis_url, key, raw).await?;
+    };
+    let identity = (snapshot.revision, safe_fetched_at);
+    redis_cache::save_json(redis_url, key, snapshot.raw).await?;
     *saved_snapshot = Some(identity);
     Ok(true)
 }
 
-fn snapshot_changed(saved: Option<(u64, DateTime<Utc>)>, candidate: (u64, DateTime<Utc>)) -> bool {
-    saved != Some(candidate)
-}
-
-fn serialize_snapshot(
-    snapshot: ActiveMarketSnapshot,
-    safe_fetched_at: DateTime<Utc>,
-) -> Result<String> {
-    CacheDocument::from_lifecycle_snapshot(safe_fetched_at, snapshot.markets)?.to_json()
+fn matching_saved_revision(
+    saved: Option<(u64, DateTime<Utc>)>,
+    fetched_at: DateTime<Utc>,
+) -> Option<u64> {
+    saved.and_then(|(revision, saved_at)| (saved_at == fetched_at).then_some(revision))
 }
 
 async fn request_snapshot(
     lifecycle_tx: &mpsc::Sender<LifecycleRequest>,
-) -> Result<ActiveMarketSnapshot> {
+    fetched_at: DateTime<Utc>,
+    unchanged_revision: Option<u64>,
+) -> Result<Option<RestartCacheSnapshot>> {
     let (completion, completed) = oneshot::channel();
     lifecycle_tx
-        .send(LifecycleRequest::Snapshot { completion })
+        .send(LifecycleRequest::Snapshot {
+            fetched_at,
+            unchanged_revision,
+            completion,
+        })
         .await
         .context("lifecycle coordinator stopped before snapshot")?;
     completed
         .await
-        .context("lifecycle coordinator dropped snapshot")
+        .context("lifecycle coordinator dropped snapshot")?
+        .map_err(anyhow::Error::msg)
 }
 
 async fn send_observation(
@@ -795,11 +797,10 @@ mod tests {
     }
 
     #[test]
-    fn cache_identity_includes_revision_and_safe_watermark() {
+    fn saved_revision_is_reused_only_for_the_same_safe_watermark() {
         let saved = Some((7, at(10)));
-        assert!(!snapshot_changed(saved, (7, at(10))));
-        assert!(snapshot_changed(saved, (8, at(10))));
-        assert!(snapshot_changed(saved, (7, at(11))));
+        assert_eq!(matching_saved_revision(saved, at(10)), Some(7));
+        assert_eq!(matching_saved_revision(saved, at(11)), None);
     }
 
     #[test]
@@ -818,23 +819,5 @@ mod tests {
             new_poll_cutoff(restart_watermark, true),
             restart_watermark.timestamp_millis()
         );
-    }
-
-    #[test]
-    fn cache_serialization_uses_the_safe_watermark_exactly() {
-        let safe_fetched_at = at(10) - POLL_OVERLAP;
-        let raw = serialize_snapshot(
-            ActiveMarketSnapshot {
-                revision: 7,
-                markets: vec![market("m")],
-            },
-            safe_fetched_at,
-        )
-        .unwrap();
-        let document = CacheDocument::from_json(&raw).unwrap();
-        assert_eq!(document.fetched_at(), safe_fetched_at);
-        assert_eq!(document.markets().len(), 1);
-        assert_eq!(document.markets()[0].hash, "m");
-        assert_eq!(document.markets()[0].assets, ["m-a", "m-b"]);
     }
 }

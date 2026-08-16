@@ -9,7 +9,8 @@ use tracing::{info, warn};
 use crate::events::{Market, MarketLifecycle, MarketLifecycleObservation};
 use crate::markets;
 use crate::markets::gamma::GammaMarket;
-use crate::markets::lifecycle::{ActiveMarketSnapshot, LifecycleRequest, LifecycleSource};
+use crate::markets::lifecycle::{LifecycleRequest, LifecycleSource, RestartCacheSnapshot};
+use crate::markets::redis_cache;
 use crate::ws::pool::Pool;
 
 #[derive(Debug, Clone)]
@@ -265,19 +266,24 @@ impl LifecycleState {
         }
     }
 
-    fn snapshot(&self) -> ActiveMarketSnapshot {
-        let mut markets: Vec<_> = self
-            .active
-            .iter()
-            .map(|(market, assets)| {
-                Market::new(market.clone(), assets[0].clone(), assets[1].clone())
-            })
-            .collect();
-        markets.sort_unstable_by(|left, right| left.hash.cmp(&right.hash));
-        ActiveMarketSnapshot {
-            revision: self.revision,
-            markets,
+    fn restart_cache_snapshot(
+        &self,
+        fetched_at: chrono::DateTime<chrono::Utc>,
+        unchanged_revision: Option<u64>,
+    ) -> Result<Option<RestartCacheSnapshot>> {
+        if unchanged_revision == Some(self.revision) {
+            return Ok(None);
         }
+        let raw = redis_cache::serialize_lifecycle_document(
+            fetched_at,
+            self.active
+                .iter()
+                .map(|(market, assets)| (market.as_str(), assets)),
+        )?;
+        Ok(Some(RestartCacheSnapshot {
+            revision: self.revision,
+            raw,
+        }))
     }
 
     fn bump_revision(&mut self) {
@@ -381,8 +387,16 @@ impl LifecycleCoordinator {
                 let result = self.apply_observation(source, observation).await;
                 complete_or_fail(completion, result)
             }
-            LifecycleRequest::Snapshot { completion } => {
-                if completion.send(self.state.snapshot()).is_err() {
+            LifecycleRequest::Snapshot {
+                fetched_at,
+                unchanged_revision,
+                completion,
+            } => {
+                let result = self
+                    .state
+                    .restart_cache_snapshot(fetched_at, unchanged_revision)
+                    .map_err(|error| error.to_string());
+                if completion.send(result).is_err() {
                     warn!("lifecycle snapshot requester stopped before receiving snapshot");
                 }
                 Ok(())
@@ -816,7 +830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinator_snapshot_request_is_sorted_and_cloned() {
+    async fn coordinator_snapshot_request_is_sorted_and_serialized() {
         let (event_tx, _event_rx) = mpsc::channel(8);
         let pool = Pool::new(2, event_tx);
         let (_websocket_tx, websocket_rx) = mpsc::channel(8);
@@ -833,28 +847,50 @@ mod tests {
             .unwrap();
         coordinator.state.commit_bootstrap(&planned);
 
+        let fetched_at: chrono::DateTime<chrono::Utc> = "2026-08-14T12:34:56Z".parse().unwrap();
         let (completion, completed) = tokio::sync::oneshot::channel();
         coordinator
-            .apply_request(LifecycleRequest::Snapshot { completion })
+            .apply_request(LifecycleRequest::Snapshot {
+                fetched_at,
+                unchanged_revision: None,
+                completion,
+            })
             .await
             .unwrap();
-        let snapshot = completed.await.unwrap();
-
+        let snapshot = completed.await.unwrap().unwrap().unwrap();
+        let document = redis_cache::CacheDocument::from_json(&snapshot.raw).unwrap();
+        assert_eq!(snapshot.revision, coordinator.state.revision);
+        assert_eq!(document.fetched_at(), fetched_at);
         assert_eq!(
-            snapshot
-                .markets
+            document
+                .markets()
                 .iter()
                 .map(|market| market.hash.as_str())
                 .collect::<Vec<_>>(),
             ["a", "z"]
         );
-        assert_eq!(snapshot.markets[1].assets, ["z-yes", "z-no"]);
+        assert_eq!(document.markets()[1].assets, ["z-yes", "z-no"]);
 
         let resolution = resolved("a");
         let plan = coordinator.state.plan_observation(&resolution).unwrap();
         coordinator.state.commit_observation(&plan);
         assert_eq!(coordinator.state.active.len(), 1);
-        assert_eq!(snapshot.markets.len(), 2);
+        assert_eq!(document.markets().len(), 2);
+    }
+
+    #[test]
+    fn unchanged_cache_revision_skips_serialization() {
+        let mut state = LifecycleState::default();
+        let planned = state.plan_bootstrap(vec![market("m", "a", "b")]).unwrap();
+        state.commit_bootstrap(&planned);
+
+        let snapshot = state
+            .restart_cache_snapshot(
+                "2026-08-14T12:34:56Z".parse().unwrap(),
+                Some(state.revision),
+            )
+            .unwrap();
+        assert!(snapshot.is_none());
     }
 
     #[tokio::test]
