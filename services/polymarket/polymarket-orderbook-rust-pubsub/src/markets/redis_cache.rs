@@ -77,34 +77,15 @@ impl CacheDocument {
             .collect();
         Self::new(fetched_at, markets)
     }
-
-    pub fn to_json(self) -> Result<String> {
-        let serialized = SerializedCacheDocument {
-            fetched_at: self.fetched_at.to_rfc3339_opts(SecondsFormat::AutoSi, true),
-            markets: self
-                .markets
-                .into_iter()
-                .map(|market| {
-                    let [yes_asset_id, no_asset_id] = market.assets;
-                    CacheEntry {
-                        market: market.hash,
-                        yes_asset_id,
-                        no_asset_id,
-                    }
-                })
-                .collect(),
-        };
-        serde_json::to_string(&serialized).context("serialize cache JSON")
-    }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct SerializedCacheDocument {
     fetched_at: String,
     markets: Vec<CacheEntry>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct CacheEntry {
     market: String,
     yes_asset_id: String,
@@ -259,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn python_document_round_trips_without_changing_asset_order() {
+    fn python_document_loads_without_changing_asset_order() {
         let raw = r#"{
             "fetched_at": "2026-08-14T12:34:56Z",
             "markets": [
@@ -272,11 +253,8 @@ mod tests {
         assert_eq!(document.markets()[0].hash, "0xabc");
         assert_eq!(document.markets()[0].assets, ["z", "a"]);
 
-        let round_trip = CacheDocument::from_json(&document.to_json().unwrap()).unwrap();
-        assert_eq!(round_trip.fetched_at(), timestamp());
-        assert_eq!(round_trip.markets()[0].assets, ["z", "a"]);
         assert_eq!(
-            round_trip.age(timestamp() + TimeDelta::seconds(65)),
+            document.age(timestamp() + TimeDelta::seconds(65)),
             Duration::from_secs(65)
         );
     }
@@ -343,8 +321,8 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_serialization_matches_owned_document_and_sorts_markets() {
-        let mut markets = vec![
+    fn lifecycle_serialization_is_exact_and_sorts_markets() {
+        let markets = [
             market("z\nmarket", "z\\yes", "z\"no"),
             market("a-market", "a-yes", "a-no"),
         ];
@@ -356,12 +334,6 @@ mod tests {
         )
         .unwrap();
 
-        markets.sort_unstable_by(|left, right| left.hash.cmp(&right.hash));
-        let owned = CacheDocument::new(timestamp(), markets)
-            .unwrap()
-            .to_json()
-            .unwrap();
-        assert_eq!(raw, owned);
         assert_eq!(
             raw,
             r#"{"fetched_at":"2026-08-14T12:34:56Z","markets":[{"market":"a-market","yes_asset_id":"a-yes","no_asset_id":"a-no"},{"market":"z\nmarket","yes_asset_id":"z\\yes","no_asset_id":"z\"no"}]}"#
