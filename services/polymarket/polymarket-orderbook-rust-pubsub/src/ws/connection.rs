@@ -296,10 +296,6 @@ impl Connection {
                     log_connection_gap(index, &mut sub);
                     fast_reconnect_reason = Some("session ended");
                 }
-                SessionOutcome::ChannelClosed => {
-                    sub.stop();
-                    return Ok(());
-                }
                 SessionOutcome::Shutdown => {
                     sub.stop();
                     return Ok(());
@@ -498,9 +494,7 @@ enum SessionOutcome {
     HeartbeatTimeout,
     /// Session ended due to a remote close or read EOF. Reconnect immediately.
     Closed,
-    /// Event channel closed (sink died). Connection should shut down.
-    ChannelClosed,
-    /// The pool dropped the command channel.
+    /// The sink or pool dropped its channel. Connection should shut down.
     Shutdown,
     /// Some other error during the session — reconnect with backoff.
     Error(anyhow::Error),
@@ -591,7 +585,7 @@ async fn run_session(
                                         std::process::exit(1);
                                     }
                                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        return SessionOutcome::ChannelClosed;
+                                        return SessionOutcome::Shutdown;
                                     }
                                 }
                             }
