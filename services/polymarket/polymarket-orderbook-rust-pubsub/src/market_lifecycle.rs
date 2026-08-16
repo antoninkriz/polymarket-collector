@@ -38,8 +38,8 @@ struct PlannedGammaPage {
 
 #[derive(Default)]
 struct LifecycleState {
-    active: HashMap<String, Market>,
-    asset_owner: HashMap<String, String>,
+    active: HashMap<String, [String; 2]>,
+    active_assets: HashSet<String>,
     seen_new: HashSet<String>,
     seen_resolved: HashSet<String>,
     revision: u64,
@@ -48,7 +48,7 @@ struct LifecycleState {
 impl LifecycleState {
     fn plan_bootstrap(&self, markets: Vec<Market>) -> Result<Vec<Market>> {
         let mut batch = HashMap::<String, [String; 2]>::new();
-        let mut batch_asset_owner = HashMap::<String, String>::new();
+        let mut batch_assets = HashSet::<String>::new();
         let mut planned = Vec::new();
         for market in markets {
             if self.seen_resolved.contains(&market.hash) {
@@ -57,7 +57,7 @@ impl LifecycleState {
             validate_market(&market)?;
             let assets = canonical_assets(&market.assets);
             if let Some(existing) = self.active.get(&market.hash) {
-                let existing_assets = canonical_assets(&existing.assets);
+                let existing_assets = canonical_assets(existing);
                 ensure!(
                     existing_assets == assets,
                     "market {} changed assets from {:?} to {:?}",
@@ -78,22 +78,17 @@ impl LifecycleState {
                 continue;
             }
             for asset in &assets {
-                if let Some(owner) = self.asset_owner.get(asset) {
-                    ensure!(
-                        owner == &market.hash,
-                        "asset {asset} is already owned by market {owner}, cannot assign it to {}",
-                        market.hash
-                    );
-                }
-                if let Some(owner) = batch_asset_owner.get(asset) {
-                    ensure!(
-                        owner == &market.hash,
-                        "asset {asset} is already owned by market {owner}, cannot assign it to {}",
-                        market.hash
-                    );
-                }
-                batch_asset_owner.insert(asset.clone(), market.hash.clone());
+                ensure!(
+                    !self.active_assets.contains(asset),
+                    "asset {asset} is already assigned to another active market, cannot assign it to {}",
+                    market.hash
+                );
+                ensure!(
+                    !batch_assets.contains(asset),
+                    "asset {asset} is assigned to multiple markets in one bootstrap batch"
+                );
             }
+            batch_assets.extend(assets.iter().cloned());
             batch.insert(market.hash.clone(), assets);
             planned.push(market);
         }
@@ -102,11 +97,9 @@ impl LifecycleState {
 
     fn commit_bootstrap(&mut self, markets: &[Market]) {
         for market in markets {
-            let assets = canonical_assets(&market.assets);
-            for asset in &assets {
-                self.asset_owner.insert(asset.clone(), market.hash.clone());
-            }
-            self.active.insert(market.hash.clone(), market.clone());
+            self.active_assets.extend(market.assets.iter().cloned());
+            self.active
+                .insert(market.hash.clone(), market.assets.clone());
         }
         if !markets.is_empty() {
             self.bump_revision();
@@ -144,7 +137,7 @@ impl LifecycleState {
                 validate_market(&subscription)?;
                 let assets = canonical_assets(&subscription.assets);
                 if let Some(existing) = self.active.get(&market) {
-                    let existing_assets = canonical_assets(&existing.assets);
+                    let existing_assets = canonical_assets(existing);
                     ensure!(
                         existing_assets == assets,
                         "market {market} changed assets from {:?} to {:?}",
@@ -154,12 +147,10 @@ impl LifecycleState {
                     return Ok(PlannedObservation::AdmitExisting { market });
                 }
                 for asset in &assets {
-                    if let Some(owner) = self.asset_owner.get(asset) {
-                        ensure!(
-                            owner == &market,
-                            "asset {asset} is already owned by market {owner}, cannot assign it to {market}"
-                        );
-                    }
+                    ensure!(
+                        !self.active_assets.contains(asset),
+                        "asset {asset} is already assigned to another active market, cannot assign it to {market}"
+                    );
                 }
                 Ok(PlannedObservation::Subscribe {
                     market: subscription,
@@ -173,7 +164,7 @@ impl LifecycleState {
                 if self.seen_resolved.contains(&market) {
                     return Ok(PlannedObservation::Duplicate);
                 }
-                let active_assets = self.active.get(&market).map(|active| active.assets.clone());
+                let active_assets = self.active.get(&market).cloned();
                 Ok(PlannedObservation::Resolve {
                     market,
                     active_assets,
@@ -188,7 +179,7 @@ impl LifecycleState {
         cold_start: bool,
     ) -> Result<PlannedGammaPage> {
         let mut batch = HashMap::<String, [String; 2]>::new();
-        let mut batch_asset_owner = HashMap::<String, String>::new();
+        let mut batch_assets = HashSet::<String>::new();
         let mut observations = Vec::new();
         let mut bootstrap = Vec::new();
         for market in markets {
@@ -198,8 +189,7 @@ impl LifecycleState {
             );
             if let Some(existing) = self.active.get(&market.condition_id) {
                 ensure!(
-                    canonical_asset_refs(&existing.assets)
-                        == canonical_asset_refs(&market.assets_ids),
+                    canonical_asset_refs(existing) == canonical_asset_refs(&market.assets_ids),
                     "Gamma changed assets for {}",
                     market.condition_id
                 );
@@ -221,22 +211,17 @@ impl LifecycleState {
                 continue;
             }
             for asset in &assets {
-                if let Some(owner) = self.asset_owner.get(asset) {
-                    ensure!(
-                        owner == &subscription.hash,
-                        "asset {asset} is already owned by market {owner}, cannot assign it to {}",
-                        subscription.hash
-                    );
-                }
-                if let Some(owner) = batch_asset_owner.get(asset) {
-                    ensure!(
-                        owner == &subscription.hash,
-                        "asset {asset} is already owned by market {owner}, cannot assign it to {}",
-                        subscription.hash
-                    );
-                }
-                batch_asset_owner.insert(asset.clone(), subscription.hash.clone());
+                ensure!(
+                    !self.active_assets.contains(asset),
+                    "asset {asset} is already assigned to another active market, cannot assign it to {}",
+                    subscription.hash
+                );
+                ensure!(
+                    !batch_assets.contains(asset),
+                    "Gamma page assigns asset {asset} to multiple markets"
+                );
             }
+            batch_assets.extend(assets.iter().cloned());
             batch.insert(subscription.hash.clone(), assets);
             if !cold_start {
                 if let Some(observation) = market.new_market_observation() {
@@ -262,18 +247,16 @@ impl LifecycleState {
                 self.seen_new.insert(market.clone());
             }
             PlannedObservation::Subscribe { market } => {
-                let assets = canonical_assets(&market.assets);
-                for asset in &assets {
-                    self.asset_owner.insert(asset.clone(), market.hash.clone());
-                }
-                self.active.insert(market.hash.clone(), market.clone());
+                self.active_assets.extend(market.assets.iter().cloned());
+                self.active
+                    .insert(market.hash.clone(), market.assets.clone());
                 self.bump_revision();
                 self.seen_new.insert(market.hash.clone());
             }
             PlannedObservation::Resolve { market, .. } => {
-                if let Some(active_market) = self.active.remove(market) {
-                    for asset in active_market.assets {
-                        self.asset_owner.remove(&asset);
+                if let Some(active_assets) = self.active.remove(market) {
+                    for asset in active_assets {
+                        self.active_assets.remove(&asset);
                     }
                     self.bump_revision();
                 }
@@ -283,7 +266,13 @@ impl LifecycleState {
     }
 
     fn snapshot(&self) -> ActiveMarketSnapshot {
-        let mut markets: Vec<_> = self.active.values().cloned().collect();
+        let mut markets: Vec<_> = self
+            .active
+            .iter()
+            .map(|(market, assets)| {
+                Market::new(market.clone(), assets[0].clone(), assets[1].clone())
+            })
+            .collect();
         markets.sort_unstable_by(|left, right| left.hash.cmp(&right.hash));
         ActiveMarketSnapshot {
             revision: self.revision,
@@ -664,7 +653,7 @@ mod tests {
         assert_eq!(planned.len(), 1);
         state.commit_bootstrap(&planned);
         assert_eq!(state.active.len(), 1);
-        assert_eq!(state.asset_owner.len(), 2);
+        assert_eq!(state.active_assets.len(), 2);
         assert!(state.seen_new.is_empty());
         assert!(state.seen_resolved.is_empty());
 
@@ -724,7 +713,10 @@ mod tests {
             .plan_observation(&new_market("second", ["a", "c"]))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("already owned by market first"), "{error}");
+        assert!(
+            error.contains("already assigned to another active market"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -735,7 +727,10 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("already owned by market first"), "{error}");
+        assert!(
+            error.contains("multiple markets in one bootstrap batch"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -777,7 +772,7 @@ mod tests {
         ));
         state.commit_observation(&resolution);
         assert!(state.active.is_empty());
-        assert!(state.asset_owner.is_empty());
+        assert!(state.active_assets.is_empty());
 
         let duplicate = state.plan_observation(&observation).unwrap();
         assert!(matches!(duplicate, PlannedObservation::Duplicate));
@@ -801,7 +796,7 @@ mod tests {
         state.commit_observation(&suppressed);
 
         assert!(state.active.is_empty());
-        assert!(state.asset_owner.is_empty());
+        assert!(state.active_assets.is_empty());
         assert!(state.seen_new.contains("m"));
         assert!(state.seen_resolved.contains("m"));
 
