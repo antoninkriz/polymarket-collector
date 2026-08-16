@@ -10,7 +10,6 @@ use std::fmt::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use polymarket_orderbook_rust::record::EventRecord;
 use polymarket_orderbook_rust::sink::{Sink, SinkConfig};
 use polymarket_orderbook_rust_from_pubsub::pubsub_subscriber::{Writer, WriterConfig};
 use reqwest::Client;
@@ -38,25 +37,6 @@ fn data() -> String {
         "new_tick_size": "0.001",
     })
     .to_string()
-}
-
-fn payload(sequence: u64) -> String {
-    serde_json::json!({
-        "timestamp_received_ns": timestamp_received(sequence),
-        "sequence": sequence,
-        "event_type": "tick_size_change",
-        "market": "0xmarket",
-        "asset_id": "asset",
-        "timestamp": "1757908892351",
-        "old_tick_size": "0.01",
-        "new_tick_size": "0.001",
-    })
-    .to_string()
-}
-
-fn committed_legacy_data(sequence: u64) -> String {
-    let record = serde_json::from_str::<EventRecord>(&payload(sequence)).unwrap();
-    serde_json::to_string(&record.event).unwrap()
 }
 
 fn hex(value: &str) -> String {
@@ -128,8 +108,12 @@ async fn writer_drains_pending_and_flushes_before_shutdown_ack() -> Result<()> {
     let _: String = redis::cmd("XADD")
         .arg(&stream)
         .arg("*")
-        .arg("payload")
-        .arg(payload(100))
+        .arg("timestamp_received")
+        .arg(timestamp_received(100))
+        .arg("sequence")
+        .arg(100_u64)
+        .arg("data")
+        .arg(data())
         .query_async(&mut conn)
         .await?;
     let _: String = redis::cmd("XADD")
@@ -238,7 +222,7 @@ async fn writer_drains_pending_and_flushes_before_shutdown_ack() -> Result<()> {
     let expected = format!(
         "100\t{}\t{}\n101\t{}\t{}\n102\t{}\t{}",
         timestamp_received(100),
-        hex(&committed_legacy_data(100)),
+        hex(&raw_data),
         timestamp_received(101),
         hex(&raw_data),
         timestamp_received(102),

@@ -14,7 +14,6 @@ use serde_json::value::RawValue;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use polymarket_orderbook_rust::record::EventRecord;
 use polymarket_orderbook_rust::sink::{Sink, SinkItem};
 
 const READ_COUNT: usize = 1_000;
@@ -426,33 +425,14 @@ fn parse_stream_entry(entry: &StreamId, stats: &mut WriterStats) -> Result<SinkI
 }
 
 fn parse_stream_entry_fields(entry: &StreamId) -> Result<SinkItem> {
-    // Transitional compatibility for entries published before the three-field
-    // stream contract. Remove it after the old stream and PEL have drained.
-    let legacy = entry.map.len() == 1 && entry.map.contains_key("payload");
-    let raw = entry.map.len() == 3
+    let has_raw_fields = entry.map.len() == 3
         && entry.map.contains_key("timestamp_received")
         && entry.map.contains_key("sequence")
         && entry.map.contains_key("data");
     anyhow::ensure!(
-        legacy || raw,
-        "expected exactly legacy field `payload` or raw fields `timestamp_received`, `sequence`, `data`"
+        has_raw_fields,
+        "expected exactly fields `timestamp_received`, `sequence`, `data`"
     );
-
-    if legacy {
-        let payload = stream_field(entry, "payload")?;
-        let record =
-            serde_json::from_str::<EventRecord>(payload).context("parse legacy payload")?;
-        anyhow::ensure!(
-            record.timestamp_received_ns >= 0,
-            "timestamp_received must be a non-negative i64 epoch nanosecond value"
-        );
-        return Ok(SinkItem {
-            timestamp_received: record.timestamp_received_ns,
-            sequence: record.sequence,
-            data: serde_json::to_string(&record.event).context("serialize legacy event")?,
-            delivery_id: entry.id.clone(),
-        });
-    }
 
     let timestamp_received = stream_field(entry, "timestamp_received")?
         .parse::<i64>()
@@ -548,7 +528,6 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use anyhow::Result;
-    use polymarket_orderbook_rust::record::EventRecord;
     use redis::streams::StreamId;
     use redis::Value;
 
@@ -573,42 +552,6 @@ mod tests {
                 .collect(),
             ..StreamId::default()
         }
-    }
-
-    fn legacy_payload_fields(timestamp_received: &str, sequence: &str) -> String {
-        format!(
-            r#"{{"timestamp_received_ns":{timestamp_received},"sequence":{sequence},"event_type":"tick_size_change","market":"0xmarket","asset_id":"asset","timestamp":"1757908892351","old_tick_size":"0.01","new_tick_size":"0.001"}}"#
-        )
-    }
-
-    fn legacy_payload(timestamp_received: i64, sequence: u64) -> String {
-        legacy_payload_fields(&timestamp_received.to_string(), &sequence.to_string())
-    }
-
-    #[test]
-    fn legacy_and_raw_entries_produce_the_same_committed_row() {
-        let timestamp_received = 1_757_908_892_351_123_456_i64;
-        let sequence = 42_u64;
-        let payload = legacy_payload(timestamp_received, sequence);
-        let record = serde_json::from_str::<EventRecord>(&payload).unwrap();
-        let data = serde_json::to_string(&record.event).unwrap();
-        let timestamp_received_text = timestamp_received.to_string();
-        let sequence_text = sequence.to_string();
-        let legacy = stream_entry(&[("payload", &payload)]);
-        let raw = stream_entry(&[
-            ("timestamp_received", &timestamp_received_text),
-            ("sequence", &sequence_text),
-            ("data", &data),
-        ]);
-        let mut stats = WriterStats::default();
-
-        let legacy = parse_stream_entry(&legacy, &mut stats).unwrap();
-        let raw = parse_stream_entry(&raw, &mut stats).unwrap();
-
-        assert_eq!(legacy.timestamp_received, raw.timestamp_received);
-        assert_eq!(legacy.sequence, raw.sequence);
-        assert_eq!(legacy.data, raw.data);
-        assert_eq!(stats.parse_failures, 0);
     }
 
     #[test]
@@ -671,39 +614,24 @@ mod tests {
     }
 
     #[test]
-    fn negative_received_timestamp_is_rejected_for_legacy_and_raw_entries() {
-        let legacy_payload = legacy_payload(-1, 2);
-        let entries = [
-            stream_entry(&[("payload", &legacy_payload)]),
-            stream_entry(&[
-                ("timestamp_received", "-1"),
-                ("sequence", "2"),
-                ("data", "{}"),
-            ]),
-        ];
+    fn negative_received_timestamp_is_rejected() {
+        let entry = stream_entry(&[
+            ("timestamp_received", "-1"),
+            ("sequence", "2"),
+            ("data", "{}"),
+        ]);
         let mut stats = WriterStats::default();
 
-        for entry in &entries {
-            let error = parse_stream_entry(entry, &mut stats).unwrap_err();
-            let message = format!("{error:#}");
-            assert!(message.contains("must be a non-negative i64"), "{message}");
-        }
-        assert_eq!(stats.parse_failures, entries.len() as u64);
+        let error = parse_stream_entry(&entry, &mut stats).unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("must be a non-negative i64"), "{message}");
+        assert_eq!(stats.parse_failures, 1);
     }
 
     #[test]
     fn overflowing_i64_timestamp_and_u64_sequence_are_rejected() {
-        let legacy_timestamp = legacy_payload_fields("9223372036854775808", "2");
-        let legacy_sequence = legacy_payload_fields("1", "18446744073709551616");
         let entries = [
-            (
-                stream_entry(&[("payload", &legacy_timestamp)]),
-                "expected i64",
-            ),
-            (
-                stream_entry(&[("payload", &legacy_sequence)]),
-                "expected u64",
-            ),
             (
                 stream_entry(&[
                     ("timestamp_received", "9223372036854775808"),
@@ -732,12 +660,12 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_ambiguous_and_extra_field_sets_are_rejected() {
-        let payload = legacy_payload(1, 2);
+    fn unsupported_incomplete_and_extra_field_sets_are_rejected() {
         let entries = [
+            stream_entry(&[("payload", r#"{"sequence":2}"#)]),
             stream_entry(&[("timestamp_received", "1"), ("sequence", "2")]),
             stream_entry(&[
-                ("payload", &payload),
+                ("payload", r#"{"sequence":2}"#),
                 ("timestamp_received", "1"),
                 ("sequence", "2"),
                 ("data", "{}"),
@@ -761,9 +689,8 @@ mod tests {
     }
 
     #[test]
-    fn malformed_legacy_numeric_and_json_fields_are_rejected() {
+    fn malformed_numeric_and_json_fields_are_rejected() {
         let entries = [
-            (stream_entry(&[("payload", "not-json")]), "not-json"),
             (
                 stream_entry(&[
                     ("timestamp_received", "later"),
@@ -821,6 +748,24 @@ mod tests {
         assert!(ack_delete_counts(&[0], 1).is_err());
     }
 
+    async fn xadd_raw_entry(
+        conn: &mut redis::aio::MultiplexedConnection,
+        stream: &str,
+        sequence: usize,
+    ) -> Result<String> {
+        Ok(redis::cmd("XADD")
+            .arg(stream)
+            .arg("*")
+            .arg("timestamp_received")
+            .arg("1")
+            .arg("sequence")
+            .arg(sequence)
+            .arg("data")
+            .arg("{}")
+            .query_async(conn)
+            .await?)
+    }
+
     #[tokio::test]
     #[ignore]
     async fn committed_cleanup_is_exact_and_group_safe() -> Result<()> {
@@ -843,14 +788,8 @@ mod tests {
 
         const BULK_ENTRY_COUNT: usize = 2_000;
         let mut first_ids = Vec::with_capacity(BULK_ENTRY_COUNT);
-        for _ in 0..BULK_ENTRY_COUNT {
-            let id: String = redis::cmd("XADD")
-                .arg(&cfg.stream)
-                .arg("*")
-                .arg("payload")
-                .arg("{}")
-                .query_async(&mut conn)
-                .await?;
+        for sequence in 0..BULK_ENTRY_COUNT {
+            let id = xadd_raw_entry(&mut conn, &cfg.stream, sequence).await?;
             first_ids.push(id);
         }
         let _: redis::Value = redis::cmd("XREADGROUP")
@@ -887,16 +826,8 @@ mod tests {
         assert_eq!(stats.events_acked, BULK_ENTRY_COUNT as u64);
 
         let mut ordered_ids = Vec::new();
-        for _ in 0..3 {
-            ordered_ids.push(
-                redis::cmd("XADD")
-                    .arg(&cfg.stream)
-                    .arg("*")
-                    .arg("payload")
-                    .arg("{}")
-                    .query_async::<String>(&mut conn)
-                    .await?,
-            );
+        for sequence in 0..3 {
+            ordered_ids.push(xadd_raw_entry(&mut conn, &cfg.stream, sequence).await?);
         }
         let _: redis::Value = redis::cmd("XREADGROUP")
             .arg("GROUP")
@@ -935,13 +866,7 @@ mod tests {
             .arg("0")
             .query_async(&mut conn)
             .await?;
-        let second_id: String = redis::cmd("XADD")
-            .arg(&cfg.stream)
-            .arg("*")
-            .arg("payload")
-            .arg("{}")
-            .query_async(&mut conn)
-            .await?;
+        let second_id = xadd_raw_entry(&mut conn, &cfg.stream, 0).await?;
         let _: redis::Value = redis::cmd("XREADGROUP")
             .arg("GROUP")
             .arg(&cfg.group)
