@@ -233,6 +233,7 @@ Production notes:
 
 - Redis, ClickHouse, and all Rust services share the private `obdata` bridge. Redis and ClickHouse publish no host ports.
 - Keep `RLIMIT_NOFILE` high. The supplied configuration requests 262,144 open files through `CONTAINER_NOFILE_LIMIT`; 65,536 is a practical minimum for the full market universe. Rootless Podman cannot request more than `ulimit -Hn`, so lower the setting to that host limit when necessary.
+- ClickHouse retains internal metrics at 10-second resolution and writes `system.metric_log` as Compact parts to avoid descriptor-heavy merges. When these table settings first take effect after a restart, ClickHouse preserves the previous table as a read-only `system.metric_log_N`.
 - Container stdout and stderr are capped at 100 MB per service by default; change `CONTAINER_LOG_MAX_SIZE` if the host has a different log-retention policy.
 - Use a host firewall with default-deny inbound rules and allow only required management traffic—normally SSH or a VPN. Docker manages its own iptables/nftables rules, so verify the effective exposure after deployment instead of relying only on a firewall frontend.
 - Services use `restart: unless-stopped`.

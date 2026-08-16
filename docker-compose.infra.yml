@@ -23,6 +23,7 @@ services:
     volumes:
       - .data/clickhouse-data/lib:/var/lib/clickhouse
       - .data/clickhouse-data/log:/var/log/clickhouse-server
+      - ./config/clickhouse/metric-log.xml:/etc/clickhouse-server/config.d/metric-log.xml:ro
     ulimits:
       nofile:
         soft: ${CONTAINER_NOFILE_LIMIT:-262144}

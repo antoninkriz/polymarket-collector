@@ -1,0 +1,8 @@
+<clickhouse>
+    <!-- Keep the wide internal metrics schema from exhausting file descriptors. -->
+    <metric_log>
+        <settings replace="replace">min_bytes_for_wide_part = 1000000000000, min_rows_for_wide_part = 1000000000</settings>
+        <collect_interval_milliseconds replace="replace">10000</collect_interval_milliseconds>
+        <flush_interval_milliseconds replace="replace">60000</flush_interval_milliseconds>
+    </metric_log>
+</clickhouse>
