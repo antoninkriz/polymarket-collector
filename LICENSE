@@ -1,0 +1,53 @@
+LICENSING NOTICE
+
+This repository contains material with different licensing status.
+
+Covered Contributions
+---------------------
+
+"Covered Contributions" means only the copyrightable additions and
+modifications first introduced after commit cb0f6631556bf460d03594fe20f9bbd020b47d19.
+Covered Contributions exclude the Original Code and separately identified
+third-party material.
+
+For purposes of the following license, "this software" means only the
+Covered Contributions:
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+Original Code
+-------------
+
+"Original Code" means the material present in the initial commit
+cb0f6631556bf460d03594fe20f9bbd020b47d19, authored by Samuel EF.
+Tinnerholm and originally published at:
+
+https://github.com/pmxt-dev/polymarket-orderbook-collector
+
+The Original Code is not licensed under 0BSD by this notice. No license
+or permission for the Original Code is asserted or granted here. It
+remains subject to the rights of its copyright holder or holders and to
+whatever license, if any, they grant.
+
+A later modification may contain both Original Code and Covered
+Contributions. The 0BSD grant for Covered Contributions does not grant
+rights in the Original Code.
+
+The upstream licensing request and its current status are recorded at:
+
+https://github.com/pmxt-dev/polymarket-orderbook-collector/issues/1
+
+Third-Party Material
+--------------------
+
+Dependencies and any separately identified third-party material remain
+subject to their respective licenses.

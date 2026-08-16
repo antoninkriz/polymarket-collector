@@ -292,3 +292,7 @@ This project builds on the shoulders of giants from [PMXT](https://www.pmxt.dev/
 ## Vibecoded
 
 This project has been extensively ✨vibecoded✨ step by step with *some* human reviews in the process, with all its drawbacks and benefits. Please keep that in mind.
+
+## License
+
+Copyrightable additions and modifications made in this fork are licensed under [0BSD](LICENSE). Code inherited from the original PMXT repository is not covered by that grant and remains subject to its copyright holder's rights and any license they may grant. See [upstream licensing issue #1](https://github.com/pmxt-dev/polymarket-orderbook-collector/issues/1) for the licensing discussion.
