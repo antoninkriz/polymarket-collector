@@ -37,7 +37,6 @@ const CACHE_BOOTSTRAP_BATCH_INTERVAL: Duration = Duration::from_millis(100);
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() -> Result<()> {
-    let _ = dotenvy::dotenv();
     init_tracing();
     let cfg = Config::from_env().context("load config from env")?;
     let clickhouse_generation_floor = clickhouse_generation_floor(&cfg)

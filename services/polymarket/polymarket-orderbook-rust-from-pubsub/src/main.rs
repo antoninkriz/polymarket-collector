@@ -21,7 +21,6 @@ use polymarket_orderbook_rust_from_pubsub::pubsub_subscriber::{Writer, WriterCon
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
-    let _ = dotenvy::dotenv();
     init_tracing();
     let cfg = Config::from_env().context("load config from env")?;
 
