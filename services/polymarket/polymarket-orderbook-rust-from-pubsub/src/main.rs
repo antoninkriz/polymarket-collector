@@ -94,18 +94,10 @@ fn init_tracing() {
 }
 
 async fn wait_for_shutdown() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => info!("received SIGINT"),
-            _ = sigterm.recv() => info!("received SIGTERM"),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-        info!("received SIGINT");
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => info!("received SIGINT"),
+        _ = sigterm.recv() => info!("received SIGTERM"),
     }
 }

@@ -573,21 +573,13 @@ pub async fn run(cfg: Config) -> Result<()> {
 }
 
 async fn shutdown_signal() -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .context("listen for SIGTERM")?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result.context("listen for Ctrl-C")?,
-            _ = terminate.recv() => {}
-        }
-        Ok(())
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("listen for SIGTERM")?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.context("listen for Ctrl-C")?,
+        _ = terminate.recv() => {}
     }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await.context("listen for Ctrl-C")
-    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -640,14 +640,11 @@ mod tests {
         assert!(archive.put_bytes("date//outside", b"bad").is_err());
         assert!(archive.put_bytes("date\\outside", b"bad").is_err());
 
-        #[cfg(unix)]
-        {
-            fs::write(directory.path().join("outside"), b"outside").unwrap();
-            std::os::unix::fs::symlink(directory.path(), archive.root.join("escape")).unwrap();
-            assert!(archive.put_bytes("escape/outside", b"bad").is_err());
-            assert!(archive.exists("escape/outside").is_err());
-            assert!(archive.get("escape/outside", 32).is_err());
-        }
+        fs::write(directory.path().join("outside"), b"outside").unwrap();
+        std::os::unix::fs::symlink(directory.path(), archive.root.join("escape")).unwrap();
+        assert!(archive.put_bytes("escape/outside", b"bad").is_err());
+        assert!(archive.exists("escape/outside").is_err());
+        assert!(archive.get("escape/outside", 32).is_err());
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
