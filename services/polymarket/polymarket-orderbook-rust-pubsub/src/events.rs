@@ -437,16 +437,6 @@ impl Market {
             assets: [yes_asset, no_asset],
         }
     }
-
-    #[cfg(test)]
-    pub fn yes(&self) -> &str {
-        &self.assets[0]
-    }
-
-    #[cfg(test)]
-    pub fn no(&self) -> &str {
-        &self.assets[1]
-    }
 }
 
 // =====================================================================

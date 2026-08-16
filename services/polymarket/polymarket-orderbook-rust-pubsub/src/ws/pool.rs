@@ -65,16 +65,9 @@ pub struct Pool {
 }
 
 impl Pool {
-    pub fn new(max_assets_per_conn: usize, event_tx: mpsc::Sender<EventRecord>) -> Self {
-        Self::new_with_publisher_generation(max_assets_per_conn, event_tx, 0)
-    }
-
-    pub fn new_with_publisher_generation(
-        max_assets_per_conn: usize,
-        event_tx: mpsc::Sender<EventRecord>,
-        publisher_generation: u64,
-    ) -> Self {
-        Self::build(max_assets_per_conn, event_tx, publisher_generation, None)
+    #[cfg(test)]
+    pub(crate) fn new(max_assets_per_conn: usize, event_tx: mpsc::Sender<EventRecord>) -> Self {
+        Self::build(max_assets_per_conn, event_tx, 0, None)
     }
 
     pub fn new_with_lifecycle(
