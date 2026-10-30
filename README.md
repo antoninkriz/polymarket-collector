@@ -2,6 +2,7 @@
 
 This repository collects Polymarket's public market WebSocket feed across active binary markets, discovers short-lived contracts such as 5-minute BTC up/down markets, preserves collector order for deterministic orderbook reconstruction, and exports each UTC receive-time hour as compact event-specific Parquet files.
 
+Latest Polymarket data collected using (some variant) of the code from this repository can be found in the [PendulumFlow Archive](https://archive.pendulumflow.com/) (operated by a third party, I am not an owner or running the archive).
 
 ## How is this collector different?
 
